@@ -87,7 +87,7 @@ async function sendOrderReceived(phoneNumber, orderNumber, clientName, publicCod
 }
 
 // ── Mensaje 2: Al confirmar (con desglose completo) ────────────────────────
-async function sendOrderConfirmation(phoneNumber, orderNumber, clientName, total, items, paymentMethod, couponCode, discountAmount, transferAlias, publicCode) {
+async function sendOrderConfirmation(phoneNumber, orderNumber, clientName, total, items, paymentMethod, couponCode, discountAmount, transferAlias, publicCode, confirmedMinutes) {
   const displayCode = publicCode || orderNumber;
   const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
 
@@ -117,9 +117,14 @@ async function sendOrderConfirmation(phoneNumber, orderNumber, clientName, total
     paymentLine = `\n🏦 *Enviá el comprobante de ${fmt(total)} por este chat.*${aliasText}`;
   }
 
+  // Tiempo estimado confirmado por cocina
+  const timeLine = confirmedMinutes
+    ? `\n⏱️ *Tiempo estimado: ${confirmedMinutes} minutos.*`
+    : '';
+
   const message =
     `¡Hola ${clientName}! 🔥\n\n` +
-    `Tu pedido *${displayCode}* fue *confirmado por la cocina* y ya está en preparación.\n\n` +
+    `Tu pedido *${displayCode}* fue *confirmado por la cocina* y ya está en preparación.\n${timeLine}\n\n` +
     `*Detalle del pedido:*\n${itemLines}${couponLine}\n\n` +
     `💰 *Total: ${fmt(total)}*\n` +
     `${paymentLine}\n\n` +

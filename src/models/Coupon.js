@@ -22,7 +22,8 @@ const couponSchema = new mongoose.Schema({
     usedAt: { type: Date, default: Date.now }
   }],
   totalUses: { type: Number, default: 0 },
-  unlimited: { type: Boolean, default: false }, // cupones admin — sin límite de usos
+  unlimited: { type: Boolean, default: false },
+  singleUse: { type: Boolean, default: false }, // 1 uso total, 1 cliente máximo
   active: { type: Boolean, default: true }
 }, { timestamps: true });
 

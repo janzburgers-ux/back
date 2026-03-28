@@ -71,6 +71,9 @@ const orderSchema = new mongoose.Schema({
   stockDeducted: { type: Boolean, default: false },
   whatsappSent: { type: Boolean, default: false },
   // Tiempos
+  estimatedMinutes: { type: Number, default: null },
+  confirmedMinutes: { type: Number, default: null },
+  deliveryMinutes:  { type: Number, default: null }, // tiempo de delivery de la zona
   receivedAt: { type: Date },
   confirmedAt: { type: Date },
   preparingAt: { type: Date },

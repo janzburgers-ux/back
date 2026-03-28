@@ -50,35 +50,30 @@ async function getCurrentLoad() {
 }
 
 // Estimar tiempo de espera para un nuevo pedido
-async function estimateWaitTime(newOrderItems, scheduledFor = null) {
+async function estimateWaitTime(newOrderItems, scheduledFor = null, deliveryMinutes = 15) {
   const load = await getCurrentLoad();
   const newLoad = calcOrderLoad(newOrderItems);
 
-  // Si hay lugar en ambas → entra directo
   const fitsInPlancha = newLoad.medallones <= load.planchaFree;
   const fitsInFreidora = newLoad.papas <= load.freidoraFree;
 
   let waitMinutes = 0;
 
   if (!fitsInPlancha || !fitsInFreidora) {
-    // No entra todo junto — hay que esperar lotes
-    // Estimamos que el lote actual se libera en TOTAL_COOK_TIME / 2 (ya llevan un rato)
     waitMinutes = Math.ceil(TOTAL_COOK_TIME / 2);
   }
 
-  const cookTime = Math.max(TOTAL_COOK_TIME, FRY_TIME); // cuello de botella
-  const totalMinutes = waitMinutes + cookTime;
+  const cookTime = Math.max(TOTAL_COOK_TIME, FRY_TIME);
+  const totalMinutes = waitMinutes + cookTime + deliveryMinutes;
 
   const now = new Date();
-  const readyAt = new Date(now.getTime() + totalMinutes * 60000);
-
-  // Sumar tiempo de delivery estimado (15 min default)
-  const deliveryTime = 15;
-  const deliveryAt = new Date(readyAt.getTime() + deliveryTime * 60000);
+  const readyAt = new Date(now.getTime() + (waitMinutes + cookTime) * 60000);
+  const deliveryAt = new Date(readyAt.getTime() + deliveryMinutes * 60000);
 
   return {
     waitMinutes,
     cookMinutes: cookTime,
+    deliveryMinutes,
     totalMinutes,
     readyAt,
     deliveryAt,

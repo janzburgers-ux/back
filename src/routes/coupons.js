@@ -73,7 +73,35 @@ router.post('/admin', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
-// PATCH toggle activo/inactivo
+// POST crear cupón de un solo uso (asignado al admin, 1 uso por cliente, 1 cliente total)
+router.post('/single-use', auth, adminOnly, async (req, res) => {
+  try {
+    const { code, discountForUser, label } = req.body;
+    if (!code) return res.status(400).json({ message: 'Código requerido' });
+
+    const User = require('../models/User');
+    let adminClient = await Client.findOne({ name: { $regex: /admin/i } });
+    if (!adminClient) {
+      adminClient = await new Client({ name: 'Admin', phone: '0000000000' }).save();
+    }
+
+    const existing = await Coupon.findOne({ code: code.toUpperCase() });
+    if (existing) return res.status(400).json({ message: 'Ya existe un cupón con ese código' });
+
+    const coupon = new Coupon({
+      code: code.toUpperCase(),
+      owner: adminClient._id,
+      ownerName: label || 'Admin',
+      discountForUser: discountForUser || 10,
+      rewardPerUse: 0,
+      unlimited: false,
+      singleUse: true,
+      active: true
+    });
+    await coupon.save();
+    res.status(201).json(coupon);
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
 router.patch('/:id/toggle', auth, adminOnly, async (req, res) => {
   try {
     const coupon = await Coupon.findById(req.params.id);
@@ -114,10 +142,14 @@ router.post('/validate', async (req, res) => {
     const coupon = await Coupon.findOne({ code: code.toUpperCase(), active: true });
     if (!coupon) return res.status(404).json({ message: 'Cupón inválido o inactivo' });
 
-    // Verificar uso previo (excepto cupones admin/ilimitados)
+    // Verificar uso previo
     if (!coupon.unlimited) {
       const alreadyUsed = coupon.uses.some(u => u.whatsapp === whatsapp);
       if (alreadyUsed) return res.status(400).json({ message: 'Ya usaste este cupón anteriormente' });
+      // Cupón de uso único: verificar que nadie lo haya usado todavía
+      if (coupon.singleUse && coupon.totalUses >= 1) {
+        return res.status(400).json({ message: 'Este cupón ya fue utilizado' });
+      }
     }
 
     res.json({

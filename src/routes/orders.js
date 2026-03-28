@@ -3,7 +3,7 @@ const router = express.Router();
 const { Order } = require('../models/Order');
 const { Client } = require('../models/Order');
 const Config = require('../models/Config');
-const { auth, kitchenOrAdmin } = require('../middleware/auth');
+const { auth, kitchenOrAdmin, adminOnly } = require('../middleware/auth');
 const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateProductAvailability } = require('../services/stock.service');
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled } = require('../services/whatsapp');
@@ -155,6 +155,11 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
     // ── pending → confirmed ───────────────────────────────────────────────
     if (status === 'confirmed' && prevStatus === 'pending') {
       order.confirmedAt = new Date();
+
+      // Guardar el tiempo confirmado por cocina (puede venir del body o usar el estimado)
+      const confirmedMinutes = req.body.confirmedMinutes || order.estimatedMinutes || null;
+      if (confirmedMinutes) order.confirmedMinutes = confirmedMinutes;
+
       if (!order.stockDeducted) {
         // Fallback: si por alguna razón no se descontó al recibir, descontar ahora
         stockResults = await deductStockForOrder(order.items);
@@ -173,7 +178,8 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           order.couponCode,
           order.discountAmount,
           alias,
-          order.publicCode
+          order.publicCode,
+          confirmedMinutes
         );
         order.whatsappSent = whatsappResult.success;
       }
@@ -198,8 +204,8 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
             $inc: { totalUses: 1 }
           });
 
-          // Si es cupón de fidelización → desactivar después del primer uso
-          if (coupon.type === 'loyalty') {
+          // Si es cupón de fidelización o de uso único → desactivar después del primer uso
+          if (coupon.type === 'loyalty' || coupon.singleUse) {
             await Coupon.findByIdAndUpdate(coupon._id, { active: false });
           }
 
@@ -212,7 +218,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       }
 
       // Prode: sumar puntos por compra si el período está activo
-      addProdePointsForOrder(order.client._id, order._id, order.total, order.items || [])
+      addProdePointsForOrder(order.client._id, order._id, order.total)
         .catch(e => console.error('Prode points error:', e.message));
     }
 
@@ -312,34 +318,21 @@ router.put('/:id', auth, async (req, res) => {
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
-// DELETE pedido (requiere contraseña de seguridad)
-router.delete('/:id', auth, async (req, res) => {
+
+// ── DELETE pedido con contraseña ──────────────────────────────────────────────
+router.delete('/:id', auth, adminOnly, async (req, res) => {
   try {
     const { password } = req.body;
-    if (!password) return res.status(400).json({ message: 'Contraseña requerida' });
-
-    // Verificar contraseña configurada
+    const Config = require('../models/Config');
     const cfg = await Config.findOne({ key: 'deleteOrderPassword' });
-    const storedPassword = cfg?.value;
-    if (!storedPassword) return res.status(400).json({ message: 'No hay contraseña configurada para eliminar pedidos. Configurala en Ajustes.' });
-    if (password !== storedPassword) return res.status(401).json({ message: 'Contraseña incorrecta' });
-
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
-
-    // Devolver stock si el pedido tenía stock descontado
-    if (order.stockDeducted) {
-      await returnStockForOrder(order).catch(e => console.error('Error devolviendo stock:', e.message));
+    const deletePassword = cfg?.value || 'janz2024';
+    if (password !== deletePassword) {
+      return res.status(401).json({ message: 'Contraseña incorrecta' });
     }
-
-    await Order.findByIdAndDelete(req.params.id);
-
-    // Notificar por socket
-    const io = req.app.get('io');
-    if (io) io.emit('order_deleted', { orderId: req.params.id });
-
-    res.json({ message: 'Pedido eliminado', orderId: req.params.id });
-  } catch (err) { res.status(400).json({ message: err.message }); }
+    const order = await Order.findByIdAndDelete(req.params.id);
+    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+    res.json({ message: 'Pedido eliminado' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 module.exports = router;

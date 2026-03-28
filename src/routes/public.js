@@ -7,6 +7,7 @@ const Coupon = require('../models/Coupon');
 const Config = require('../models/Config');
 const { sendOrderReceived } = require('../services/whatsapp');
 const { calcPackagingCost, deductStockForOrder, autoUpdateProductAvailability } = require('../services/stock.service');
+const { estimateWaitTime } = require('../services/kitchen-capacity');
 
 // Horario desde Config
 async function isOpen() {
@@ -151,12 +152,22 @@ router.post('/order', async (req, res) => {
 
     // Costo de delivery de la zona
     let deliveryCost = 0;
-    let zoneData = null;  // declarar fuera del if para que sea accesible después
+    let zoneData = null;
+    let deliveryMinutes = 15; // fallback default
     if (zone && deliveryType === 'delivery') {
       const zonesCfg = await Config.findOne({ key: 'zones' });
       const zones = zonesCfg?.value || [];
       zoneData = zones.find(z => z.id === zone || z.name === zone);
-      if (zoneData) deliveryCost = zoneData.cost || 0;
+      if (zoneData) {
+        deliveryCost = zoneData.cost || 0;
+        deliveryMinutes = zoneData.deliveryMinutes || 15;
+      }
+    } else if (deliveryType === 'takeaway') {
+      // Para takeaway usar la zona más cercana como referencia, o el mínimo disponible
+      const zonesCfg = await Config.findOne({ key: 'zones' });
+      const zones = zonesCfg?.value || [];
+      const minZone = zones.reduce((min, z) => (!min || (z.deliveryMinutes || 99) < (min.deliveryMinutes || 99)) ? z : min, null);
+      deliveryMinutes = minZone?.deliveryMinutes || 10;
     }
 
 
@@ -186,8 +197,9 @@ router.post('/order', async (req, res) => {
       paymentMethod: paymentMethod || 'efectivo',
       deliveryType: deliveryType || 'delivery',
       deliveryAddress: `${clientData.address || ''}${clientData.floor ? ` ${clientData.floor}` : ''}${clientData.neighborhood ? `, ${clientData.neighborhood}` : ''}`,
-      zone: zoneData ? zoneData.name : (zone || ''),  // guardar nombre legible
+      zone: zoneData ? zoneData.name : (zone || ''),
       deliveryCost,
+      deliveryMinutes,
       notes,
       coupon: couponDoc ? couponDoc._id : null,
       couponCode: couponDoc ? couponDoc.code : (hourlyDiscountApplied ? `HORARIO ${hDisc.fromHour}-${hDisc.toHour}` : null),
@@ -199,6 +211,12 @@ router.post('/order', async (req, res) => {
     try {
       const { cost: packagingCost } = await calcPackagingCost(orderItems);
       order.packagingCost = packagingCost;
+    } catch {}
+
+    // Estimación de tiempo de cocina (cocción + delivery de la zona)
+    try {
+      const estimate = await estimateWaitTime(orderItems, null, deliveryMinutes);
+      order.estimatedMinutes = estimate.totalMinutes;
     } catch {}
 
     await order.save();
@@ -248,6 +266,7 @@ router.post('/order', async (req, res) => {
       couponCode: order.couponCode || null,
       deliveryCost: order.deliveryCost || 0,
       items: order.items,
+      estimatedMinutes: order.estimatedMinutes || null,
       message: `¡Pedido recibido! Tu código es ${order.publicCode || order.orderNumber}`
     });
 

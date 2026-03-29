@@ -62,7 +62,8 @@ router.get('/menu', async (req, res) => {
       acc[p.name].push({
         _id: p._id, name: p.name, variant: p.variant,
         salePrice: p.salePrice, available: p.available,
-        image: p.image, description: p.description
+        image: p.image, description: p.description,
+        productType: p.productType || 'burger'
       });
       return acc;
     }, {});
@@ -94,7 +95,7 @@ router.post('/order', async (req, res) => {
       }
     }
 
-    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone } = req.body;
+    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone, scheduledFor, isScheduled } = req.body;
 
     // Validar cupón
     let couponDoc = null;
@@ -204,7 +205,17 @@ router.post('/order', async (req, res) => {
       coupon: couponDoc ? couponDoc._id : null,
       couponCode: couponDoc ? couponDoc.code : (hourlyDiscountApplied ? `HORARIO ${hDisc.fromHour}-${hDisc.toHour}` : null),
       discountPercent,
-      status: 'pending'
+      status: 'pending',
+      scheduledFor: isScheduled && scheduledFor ? (() => {
+  if (typeof scheduledFor === 'string' && /^\d{2}:\d{2}$/.test(scheduledFor)) {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+    const [h, m] = scheduledFor.split(':');
+    now.setHours(Number(h), Number(m), 0, 0);
+    return now;
+  }
+  return new Date(scheduledFor);
+})() : null,
+      isScheduled: !!isScheduled
     });
 
     // Packaging automático

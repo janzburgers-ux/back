@@ -26,6 +26,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 // POST create additional
+// Acepta: name, description, price, emoji, category, appliesTo
 router.post('/', auth, adminOnly, async (req, res) => {
   try {
     const additional = new Additional(req.body);
@@ -37,9 +38,14 @@ router.post('/', auth, adminOnly, async (req, res) => {
 });
 
 // PUT update additional
+// Acepta todos los campos incluyendo appliesTo
 router.put('/:id', auth, adminOnly, async (req, res) => {
   try {
-    const additional = await Additional.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const additional = await Additional.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true, runValidators: true }
+    );
     if (!additional) return res.status(404).json({ message: 'Adicional no encontrado' });
     res.json(additional);
   } catch (err) {

@@ -123,7 +123,7 @@ orderSchema.pre('save', async function(next) {
   if (this.discountPercent > 0) {
     this.discountAmount = Math.round(subtotal * this.discountPercent / 100);
   }
-  this.total = Math.max(0, subtotal - (this.discountAmount || 0));
+  this.total = Math.max(0, subtotal - (this.discountAmount || 0) + (this.deliveryCost || 0));
   
   next();
 });

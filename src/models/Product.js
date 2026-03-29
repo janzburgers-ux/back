@@ -34,7 +34,12 @@ const productSchema = new mongoose.Schema({
   active: { type: Boolean, default: true },
   available: { type: Boolean, default: true },
   image: { type: String },
-  description: { type: String }
+  description: { type: String },
+  // Tipo de producto: controla qué adicionales se muestran al cliente al personalizar
+  // 'burger' → adicionales de hamburguesa + papas + salsas
+  // 'papas'  → solo adicionales de papas + salsas
+  // 'otro'   → todos los adicionales
+  productType: { type: String, enum: ['burger', 'papas', 'otro'], default: 'burger' }
 }, { timestamps: true });
 
 const Recipe = mongoose.model('Recipe', recipeSchema);

@@ -10,19 +10,21 @@ const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCance
 const { addPointsForOrder, notifyReferralOwner, getReferralConfig } = require('../services/loyalty');
 const { addProdePointsForOrder } = require('../services/prode.service');
 
-// Horario operativo usando Config (fallback a env)
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function nowAR() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+}
+
 async function isOpen() {
   try {
     const cfg = await Config.findOne({ key: 'schedule' });
     const schedule = cfg?.value || { days: [5, 6, 0], openHour: 19, closeHour: 23 };
-    // Ajustar a zona horaria de Argentina (UTC-3)
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+    const now = nowAR();
     const day = now.getDay();
     const hour = now.getHours();
     return schedule.days.map(Number).includes(day) && hour >= Number(schedule.openHour) && hour < Number(schedule.closeHour);
   } catch {
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
-    return [5, 6, 0].includes(now.getDay());
+    return [5, 6, 0].includes(nowAR().getDay());
   }
 }
 
@@ -33,6 +35,14 @@ async function getTransferAlias() {
   } catch { return ''; }
 }
 
+// Parsear fecha en timezone Argentina
+function parseARDate(dateStr) {
+  // dateStr format: 'YYYY-MM-DD'
+  return {
+    start: new Date(dateStr + 'T00:00:00-03:00'),
+    end:   new Date(dateStr + 'T23:59:59.999-03:00')
+  };
+}
 
 // GET carga actual de cocina
 router.get('/kitchen-load', auth, async (req, res) => {
@@ -42,7 +52,7 @@ router.get('/kitchen-load', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// GET estimación de tiempo para un nuevo pedido
+// GET estimación de tiempo
 router.post('/estimate', auth, async (req, res) => {
   try {
     const { items } = req.body;
@@ -64,20 +74,24 @@ router.get('/', auth, async (req, res) => {
   try {
     const { status, date, limit = 50 } = req.query;
     const filter = {};
+
     if (status) {
       const statuses = status.split(',').map(s => s.trim());
       filter.status = statuses.length > 1 ? { $in: statuses } : status;
     }
+
     if (date) {
-      const start = new Date(date); start.setHours(0, 0, 0, 0);
-      const end = new Date(date); end.setHours(23, 59, 59, 999);
+      // Filtrar por fecha en timezone Argentina — evita el bug del cambio de día a las 21hs (UTC)
+      const { start, end } = parseARDate(date);
       filter.createdAt = { $gte: start, $lte: end };
     }
+
     const orders = await Order.find(filter)
       .populate('client', 'name phone whatsapp')
       .populate('items.product', 'name variant salePrice')
       .sort({ createdAt: -1 })
       .limit(parseInt(limit));
+
     res.json(orders);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -85,7 +99,7 @@ router.get('/', auth, async (req, res) => {
 // GET estado del sistema (para /pedido público)
 router.get('/system/status', async (req, res) => {
   const open = await isOpen();
-  const today = new Date().getDay();
+  const today = nowAR().getDay();
   const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
   res.json({
     open,
@@ -113,25 +127,188 @@ router.post('/', auth, async (req, res) => {
 
     const order = new Order(req.body);
 
-    // Calcular costo de packaging automáticamente
     try {
       const { cost: packagingCost } = await calcPackagingCost(req.body.items || []);
       order.packagingCost = packagingCost;
     } catch {}
 
     await order.save();
-
     await Client.findByIdAndUpdate(req.body.client, { $inc: { totalOrders: 1 } });
 
     const populated = await Order.findById(order._id)
       .populate('client', 'name phone whatsapp')
       .populate('items.product', 'name variant');
 
-    // Emitir a cocina via Socket.io
     const io = req.app.get('io');
     if (io) io.emit('new_order', populated);
 
     res.status(201).json(populated);
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
+// POST crear pedido desde admin (equivalente a public/order pero con auth)
+// Para tomar pedidos de clientes por WhatsApp
+router.post('/admin-create', auth, adminOnly, async (req, res) => {
+  try {
+    const { Product } = require('../models/Product');
+    const Additional = require('../models/Additional');
+    const Coupon = require('../models/Coupon');
+    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone } = req.body;
+
+    // Cupón
+    let couponDoc = null;
+    let discountPercent = 0;
+    let discountType = 'order';
+    let discountAmount = 0;
+    let applicableProductId = null;
+
+    if (couponCode) {
+      couponDoc = await Coupon.findOne({ code: couponCode.toUpperCase(), active: true });
+      if (couponDoc) {
+        discountPercent = couponDoc.discountForUser;
+        if (couponDoc.applicableProduct) {
+          discountType = 'product';
+          applicableProductId = couponDoc.applicableProduct.toString();
+        }
+      }
+    }
+
+    // Encontrar/crear cliente
+    let client = await Client.findOne({ whatsapp: clientData.whatsapp, active: true });
+    if (!client) {
+      client = new Client({
+        name: clientData.name,
+        phone: clientData.phone || clientData.whatsapp,
+        whatsapp: clientData.whatsapp,
+        address: clientData.address,
+        floor: clientData.floor,
+        neighborhood: clientData.neighborhood,
+        references: clientData.references,
+        notes: clientData.notes
+      });
+      await client.save();
+    } else {
+      Object.assign(client, {
+        address: clientData.address || client.address,
+        floor: clientData.floor || client.floor,
+        neighborhood: clientData.neighborhood || client.neighborhood,
+        references: clientData.references || client.references
+      });
+      await client.save();
+    }
+
+    // Construir ítems
+    const orderItems = [];
+    for (const item of items) {
+      const product = await Product.findById(item.product);
+      if (!product) continue;
+      const resolvedAdditionals = [];
+      for (const a of (item.additionals || [])) {
+        const add = await Additional.findById(a.additional);
+        if (!add) continue;
+        resolvedAdditionals.push({ additional: add._id, name: add.name, unitPrice: add.price, quantity: a.quantity || 1 });
+      }
+      orderItems.push({
+        product: product._id, productName: product.name, variant: product.variant,
+        quantity: item.quantity, unitPrice: product.salePrice,
+        additionals: resolvedAdditionals,
+        notes: item.notes || ''
+      });
+    }
+
+    const subtotalBruto = orderItems.reduce((sum, item) => {
+      const addsCost = (item.additionals || []).reduce((s, a) => s + a.unitPrice * (a.quantity || 1), 0);
+      return sum + (item.unitPrice * item.quantity) + addsCost;
+    }, 0);
+
+    if (discountType === 'product' && applicableProductId && discountPercent > 0) {
+      const applicableItems = orderItems.filter(i => i.product.toString() === applicableProductId);
+      const appSubtotal = applicableItems.reduce((sum, item) => {
+        const addsCost = (item.additionals || []).reduce((s, a) => s + a.unitPrice * (a.quantity || 1), 0);
+        return sum + (item.unitPrice * item.quantity) + addsCost;
+      }, 0);
+      discountAmount = Math.round(appSubtotal * discountPercent / 100);
+    } else if (discountPercent > 0) {
+      discountAmount = Math.round(subtotalBruto * discountPercent / 100);
+    }
+
+    const subtotalConDescuento = subtotalBruto - discountAmount;
+
+    let deliveryCost = 0;
+    let zoneData = null;
+    let deliveryMinutes = 15;
+    if (zone && deliveryType === 'delivery') {
+      const zonesCfg = await Config.findOne({ key: 'zones' });
+      const zones = zonesCfg?.value || [];
+      zoneData = zones.find(z => z.id === zone || z.name === zone);
+      if (zoneData) {
+        deliveryMinutes = zoneData.deliveryMinutes || 15;
+        const isFree = zoneData.freeFrom > 0 && subtotalConDescuento >= zoneData.freeFrom;
+        deliveryCost = isFree ? 0 : (zoneData.cost || 0);
+      }
+    }
+
+    const order = new Order({
+      client: client._id,
+      items: orderItems,
+      paymentMethod: paymentMethod || 'efectivo',
+      deliveryType: deliveryType || 'delivery',
+      deliveryAddress: `${clientData.address || ''}${clientData.floor ? ` ${clientData.floor}` : ''}${clientData.neighborhood ? `, ${clientData.neighborhood}` : ''}`,
+      zone: zoneData ? zoneData.name : (zone || ''),
+      deliveryCost,
+      deliveryMinutes,
+      notes,
+      coupon: couponDoc ? couponDoc._id : null,
+      couponCode: couponDoc ? couponDoc.code : null,
+      discountPercent,
+      discountAmount,
+      discountType,
+      status: 'pending',
+      bypassOperationalCheck: true
+    });
+
+    try {
+      const { cost: packagingCost } = await calcPackagingCost(orderItems);
+      order.packagingCost = packagingCost;
+    } catch {}
+
+    try {
+      const estimate = await estimateWaitTime(orderItems, null, deliveryMinutes);
+      order.estimatedMinutes = estimate.totalMinutes;
+    } catch {}
+
+    await order.save();
+
+    try {
+      await deductStockForOrder(order.items);
+      await Order.findByIdAndUpdate(order._id, { stockDeducted: true });
+      autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+    } catch (e) { console.error('Error descontando stock:', e.message); }
+
+    await Client.findByIdAndUpdate(client._id, { $inc: { totalOrders: 1 } });
+
+    if (client.whatsapp) {
+      sendOrderReceived(client.whatsapp, order.orderNumber, client.name, order.publicCode)
+        .catch(err => console.error('Error WA received:', err.message));
+    }
+
+    const populated = await Order.findById(order._id)
+      .populate('client', 'name phone whatsapp')
+      .populate('items.product', 'name variant');
+
+    const io = req.app.get('io');
+    if (io) io.emit('new_order', populated);
+
+    res.status(201).json({
+      success: true,
+      orderNumber: order.orderNumber,
+      publicCode: order.publicCode,
+      total: order.total,
+      discountAmount: order.discountAmount || 0,
+      deliveryCost: order.deliveryCost || 0,
+      items: order.items,
+      message: `Pedido creado. Código: ${order.publicCode}`
+    });
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
@@ -152,16 +329,14 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
     let whatsappResult = null;
     const alias = await getTransferAlias();
 
-    // ── pending → confirmed ───────────────────────────────────────────────
+    // ── pending → confirmed ───────────────────────────────────────────────────
     if (status === 'confirmed' && prevStatus === 'pending') {
       order.confirmedAt = new Date();
 
-      // Guardar el tiempo confirmado por cocina (puede venir del body o usar el estimado)
       const confirmedMinutes = req.body.confirmedMinutes || order.estimatedMinutes || null;
       if (confirmedMinutes) order.confirmedMinutes = confirmedMinutes;
 
       if (!order.stockDeducted) {
-        // Fallback: si por alguna razón no se descontó al recibir, descontar ahora
         stockResults = await deductStockForOrder(order.items);
         order.stockDeducted = true;
         autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
@@ -184,27 +359,31 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         order.whatsappSent = whatsappResult.success;
       }
 
-      // Notificar al dueño del cupón de referido (si aplica)
-      if (order.couponCode) {
+      // Registrar uso del cupón SOLO en confirmación
+      if (order.coupon) {
         const Coupon = require('../models/Coupon');
-        const coupon = await Coupon.findOne({ code: order.couponCode });
+        const coupon = await Coupon.findById(order.coupon);
         if (coupon) {
-          await Coupon.findByIdAndUpdate(coupon._id, {
-            $push: {
-              uses: {
-                client: order.client._id,
-                clientName: order.client.name,
-                whatsapp: order.client.whatsapp,
-                order: order._id,
-                orderNumber: order.orderNumber,
-                discountApplied: order.discountAmount,
-                usedAt: new Date()
-              }
-            },
-            $inc: { totalUses: 1 }
-          });
+          // Solo agregar si no estaba ya registrado (idempotente)
+          const alreadyRecorded = coupon.uses.some(u => u.order?.toString() === order._id.toString());
+          if (!alreadyRecorded) {
+            await Coupon.findByIdAndUpdate(coupon._id, {
+              $push: {
+                uses: {
+                  client: order.client._id,
+                  clientName: order.client.name,
+                  whatsapp: order.client.whatsapp,
+                  order: order._id,
+                  orderNumber: order.orderNumber,
+                  discountApplied: order.discountAmount,
+                  usedAt: new Date()
+                }
+              },
+              $inc: { totalUses: 1, ownerPendingDiscount: coupon.rewardPerUse || 0 }
+            });
+          }
 
-          // Si es cupón de fidelización o de uso único → desactivar después del primer uso
+          // Cupón de 1 uso → desactivar
           if (coupon.type === 'loyalty' || coupon.singleUse) {
             await Coupon.findByIdAndUpdate(coupon._id, { active: false });
           }
@@ -217,38 +396,30 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         }
       }
 
-      // Prode: sumar puntos por compra si el período está activo
       addProdePointsForOrder(order.client._id, order._id, order.total)
         .catch(e => console.error('Prode points error:', e.message));
     }
 
-    // ── preparing: guardar timestamp ─────────────────────────────────────
+    // ── preparing ─────────────────────────────────────────────────────────────
     if (status === 'preparing' && prevStatus === 'confirmed') {
       order.preparingAt = new Date();
     }
 
-    // ── ready → Mensaje 3 ─────────────────────────────────────────────────
+    // ── ready ─────────────────────────────────────────────────────────────────
     if (status === 'ready' && prevStatus !== 'ready') {
       order.readyAt = new Date();
       if (order.client?.whatsapp) {
         sendOrderReady(
-          order.client.whatsapp,
-          order.orderNumber,
-          order.client.name,
-          order.deliveryType,
-          order.total,
-          order.paymentMethod,
-          alias,
-          order.publicCode
+          order.client.whatsapp, order.orderNumber, order.client.name,
+          order.deliveryType, order.total, order.paymentMethod, alias, order.publicCode
         ).catch(err => console.error('Error WA ready:', err.message));
       }
     }
 
-    // ── cancelled: devolver stock + registrar rechazo + WA ───────────────
+    // ── cancelled: devolver stock + revertir cupón + registrar rechazo ────────
     if (status === 'cancelled') {
       order.status = 'cancelled';
 
-      // Devolver stock si ya había sido descontado
       if (order.stockDeducted) {
         try {
           await returnStockForOrder(order.items);
@@ -257,12 +428,33 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         } catch (e) { console.error('Error devolviendo stock:', e.message); }
       }
 
+      // ── REVERTIR USO DEL CUPÓN ────────────────────────────────────────────
+      if (order.coupon) {
+        try {
+          const Coupon = require('../models/Coupon');
+          const coupon = await Coupon.findById(order.coupon);
+          if (coupon) {
+            const hadUse = coupon.uses.some(u => u.order?.toString() === order._id.toString());
+            if (hadUse) {
+              // Quitar el registro de uso de este pedido
+              await Coupon.findByIdAndUpdate(coupon._id, {
+                $pull: { uses: { order: order._id } },
+                $inc: { totalUses: -1 }
+              });
+              // Si era de 1 uso y fue desactivado, re-activar
+              if ((coupon.singleUse || coupon.type === 'loyalty') && !coupon.active) {
+                await Coupon.findByIdAndUpdate(coupon._id, { active: true });
+              }
+            }
+          }
+        } catch (e) { console.error('Error revirtiendo cupón:', e.message); }
+      }
+
       await order.save();
 
-      // Registrar en hoja de rechazados
       try {
         const RejectedOrder = require('../models/RejectedOrder');
-        const { reason, notes, missingStock } = req.body;
+        const { reason, notes: rNotes, missingStock } = req.body;
         await new RejectedOrder({
           orderNumber: order.orderNumber,
           publicCode: order.publicCode,
@@ -270,7 +462,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           items: order.items.map(i => ({ productName: i.productName, variant: i.variant, quantity: i.quantity })),
           total: order.total,
           reason: reason || 'sin_stock',
-          notes: notes || '',
+          notes: rNotes || '',
           missingStock: missingStock || []
         }).save();
       } catch (e) { console.error('Error guardando rechazo:', e.message); }
@@ -279,24 +471,22 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         sendOrderCancelled(order.client.whatsapp, order.client.name, order.publicCode, order.orderNumber)
           .catch(err => console.error('Error WA cancelado:', err.message));
       }
+
       const io = req.app.get('io');
       if (io) io.to(`order_${order.orderNumber}`).emit('order_status', { status: 'cancelled', order });
       return res.json({ order, cancelled: true });
     }
 
-    // ── delivered ─────────────────────────────────────────────────────────
+    // ── delivered ─────────────────────────────────────────────────────────────
     if (status === 'delivered') {
       order.deliveredAt = new Date();
       await Client.findByIdAndUpdate(order.client._id, { $inc: { totalSpent: order.total } });
-
-      // Sumar puntos de fidelización
       addPointsForOrder(order.client._id, order.total)
         .catch(e => console.error('Error puntos fidelización:', e.message));
     }
 
     await order.save();
 
-    // Emitir actualización por Socket.io (cocina + cliente)
     const io = req.app.get('io');
     if (io) {
       io.emit('order_updated', { orderId: order._id, status, order });
@@ -318,12 +508,10 @@ router.put('/:id', auth, async (req, res) => {
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
-
-// ── DELETE pedido con contraseña ──────────────────────────────────────────────
+// DELETE pedido con contraseña
 router.delete('/:id', auth, adminOnly, async (req, res) => {
   try {
     const { password } = req.body;
-    const Config = require('../models/Config');
     const cfg = await Config.findOne({ key: 'deleteOrderPassword' });
     const deletePassword = cfg?.value || 'janz2024';
     if (password !== deletePassword) {

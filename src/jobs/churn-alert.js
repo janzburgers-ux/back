@@ -20,7 +20,7 @@ async function getChurnConfig() {
 
 // ── Generar cupón de reactivación ─────────────────────────────────────────────
 async function generateReactivationCoupon(client, percent) {
-  const code = `VOLVISTE-${client.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6)}-${Math.floor(Math.random() * 900) + 100}`;
+  const code = `HOLA-${client.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6)}-${Math.floor(Math.random() * 900) + 100}`;
 
   // Verificar que no exista uno activo para este cliente
   const existing = await Coupon.findOne({ owner: client._id, active: true, code: { $regex: 'VOLVISTE' } });

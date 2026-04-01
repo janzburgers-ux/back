@@ -158,10 +158,20 @@ router.put('/:id', auth, adminOnly, async (req, res) => {
   }
 });
 
-// DELETE product
+// DELETE product (soft-delete: active: false)
+// También llama a autoUpdateProductAvailability para que el stock
+// no quede desalineado con productos que ya no existen en el menú.
 router.delete('/:id', auth, adminOnly, async (req, res) => {
   try {
-    await Product.findByIdAndUpdate(req.params.id, { active: false });
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' });
+
+    await Product.findByIdAndUpdate(req.params.id, { active: false, available: false });
+
+    // Actualizar disponibilidad de los demás productos sin afectar el stock
+    const { autoUpdateProductAvailability } = require('../services/stock.service');
+    autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+
     res.json({ message: 'Producto eliminado' });
   } catch (err) {
     res.status(500).json({ message: err.message });

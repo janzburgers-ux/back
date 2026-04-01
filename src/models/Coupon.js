@@ -2,16 +2,31 @@ const mongoose = require('mongoose');
 
 const couponSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true, trim: true, uppercase: true },
-  // Cliente estrella al que pertenece el cupón
+
+  // Cliente dueño del cupón (referido)
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
-  ownerName: { type: String }, // cache para mostrarlo fácil en el panel
-  // Descuento que recibe quien usa el cupón (%)
+  ownerName: { type: String },
+
+  // Tipo de cupón
+  // 'referral'  → cupón de referido (cliente recomienda a otro)
+  // 'admin'     → cupón genérico creado por admin (uso ilimitado)
+  // 'loyalty'   → cupón de fidelización (1 uso, lo genera el sistema)
+  // 'product'   → descuento sobre una hamburguesa específica
+  type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product'], default: 'referral' },
+
+  // ── Descuento ─────────────────────────────────────────────────────────────
+  // discountForUser: % de descuento que recibe quien usa el cupón
   discountForUser: { type: Number, default: 10 },
-  // Descuento acumulado para el dueño del cupón (% por cada uso)
-  rewardPerUse: { type: Number, default: 5 }, // 5% por cada pedido referido
-  // Descuento acumulado disponible para el dueño
+
+  // Producto específico al que aplica el descuento (null = todo el pedido)
+  applicableProduct: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null },
+  applicableProductName: { type: String, default: null }, // cache legible
+
+  // ── Recompensa para el dueño del cupón ────────────────────────────────────
+  rewardPerUse: { type: Number, default: 5 },
   ownerPendingDiscount: { type: Number, default: 0 },
-  // Historial de usos
+
+  // ── Historial de usos ─────────────────────────────────────────────────────
   uses: [{
     client: { type: mongoose.Schema.Types.ObjectId, ref: 'Client' },
     clientName: { type: String },
@@ -22,9 +37,14 @@ const couponSchema = new mongoose.Schema({
     usedAt: { type: Date, default: Date.now }
   }],
   totalUses: { type: Number, default: 0 },
+
+  // ── Opciones ──────────────────────────────────────────────────────────────
   unlimited: { type: Boolean, default: false },
-  singleUse: { type: Boolean, default: false }, // 1 uso total, 1 cliente máximo
-  active: { type: Boolean, default: true }
+  singleUse: { type: Boolean, default: false }, // 1 uso total en total
+  active: { type: Boolean, default: true },
+
+  // Validez
+  expiresAt: { type: Date, default: null }
 }, { timestamps: true });
 
 // Código siempre en mayúsculas

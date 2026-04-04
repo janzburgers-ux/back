@@ -105,11 +105,13 @@ router.get('/', auth, adminOnly, async (req, res) => {
 // ── GET config pública ─────────────────────────────────────────────────────
 router.get('/public', async (req, res) => {
   try {
-    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder'];
+    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder', 'max-orders-per-slot'];
+    // Normalizar la key con guiones a camelCase para el frontend
+    const keyMap = { 'max-orders-per-slot': 'maxOrdersPerSlot' };
     const configs = await Config.find({ key: { $in: keys } });
     const result = {};
-    keys.forEach(k => { result[k] = DEFAULTS[k]; });
-    configs.forEach(c => { result[c.key] = c.value; });
+    keys.forEach(k => { const mapped = keyMap[k] || k; result[mapped] = DEFAULTS[k] !== undefined ? DEFAULTS[k] : null; });
+    configs.forEach(cfg => { const k = keyMap[cfg.key] || cfg.key; result[k] = cfg.value; });
     res.json(result);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

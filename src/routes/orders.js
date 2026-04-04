@@ -18,11 +18,17 @@ function nowAR() {
 async function isOpen() {
   try {
     const cfg = await Config.findOne({ key: 'schedule' });
-    const schedule = cfg?.value || { days: [5, 6, 0], openHour: 19, closeHour: 23 };
+    const schedule = cfg?.value || { days: [5, 6, 0], openHour: '19:00', closeHour: '23:00' };
     const now = nowAR();
     const day = now.getDay();
-    const hour = now.getHours();
-    return schedule.days.map(Number).includes(day) && hour >= Number(schedule.openHour) && hour < Number(schedule.closeHour);
+    const nowStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const toTimeStr = v => {
+      if (typeof v === 'string' && v.includes(':')) return v;
+      return `${String(Number(v) || 0).padStart(2, '0')}:00`;
+    };
+    const openHour  = toTimeStr(schedule.openHour);
+    const closeHour = toTimeStr(schedule.closeHour);
+    return schedule.days.map(Number).includes(day) && nowStr >= openHour && nowStr < closeHour;
   } catch {
     return [5, 6, 0].includes(nowAR().getDay());
   }

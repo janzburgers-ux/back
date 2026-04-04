@@ -68,8 +68,9 @@ router.get('/rfm', auth, adminOnly, async (req, res) => {
     const segmentCounts = {};
     scored.forEach(c => {
       const key = c.segment.label;
-      segmentCounts[key] = (segmentCounts[key] || { label: key, color: c.segment.color, emoji: c.segment.emoji, count: 0 });
+      segmentCounts[key] = (segmentCounts[key] || { label: key, color: c.segment.color, emoji: c.segment.emoji, count: 0, revenue: 0 });
       segmentCounts[key].count++;
+      segmentCounts[key].revenue += c.monetary || 0;
     });
     res.json({ clients: scored.sort((a, b) => b.rfmScore - a.rfmScore), segments: Object.values(segmentCounts).sort((a, b) => b.count - a.count), summary: { total: scored.length, avgRecency: Math.round(recencies.reduce((s, v) => s + v, 0) / recencies.length), avgFrequency: Math.round(freqs.reduce((s, v) => s + v, 0) / freqs.length * 10) / 10, avgMonetary: Math.round(moneys.reduce((s, v) => s + v, 0) / moneys.length) } });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -79,8 +80,6 @@ router.get('/rfm', auth, adminOnly, async (req, res) => {
 router.get('/churn', auth, adminOnly, async (req, res) => {
   try {
     const now = new Date();
-    const cutoff21 = new Date(now - 21 * 24 * 60 * 60 * 1000);
-    const cutoff14 = new Date(now - 14 * 24 * 60 * 60 * 1000);
     const lastOrders = await Order.aggregate([
       { $match: { status: { $ne: 'cancelled' } } },
       { $group: { _id: '$client', lastOrder: { $max: '$createdAt' }, totalOrders: { $sum: 1 }, totalSpent: { $sum: '$total' } } }
@@ -89,15 +88,41 @@ router.get('/churn', auth, adminOnly, async (req, res) => {
     const clients = await Client.find({ _id: { $in: clientIds }, active: true });
     const clientMap = {};
     clients.forEach(c => { clientMap[c._id.toString()] = c; });
-    const churnRisk = lastOrders.map(o => {
+
+    const atRisk = lastOrders.map(o => {
       const c = clientMap[o._id.toString()];
       if (!c) return null;
-      const daysSince = Math.round((now - new Date(o.lastOrder)) / (1000 * 60 * 60 * 24));
-      const riskLevel = daysSince >= 21 ? 'high' : daysSince >= 14 ? 'medium' : null;
+      const daysSinceLastOrder = Math.round((now - new Date(o.lastOrder)) / (1000 * 60 * 60 * 24));
+      // alto: +45d | medio: 30-45d | bajo: 21-30d
+      const riskLevel = daysSinceLastOrder >= 45 ? 'alto'
+                      : daysSinceLastOrder >= 30 ? 'medio'
+                      : daysSinceLastOrder >= 21 ? 'bajo'
+                      : null;
       if (!riskLevel || o.totalOrders < 2) return null;
-      return { _id: c._id, name: c.name, whatsapp: c.whatsapp, lastOrder: o.lastOrder, daysSince, totalOrders: o.totalOrders, totalSpent: o.totalSpent, riskLevel };
-    }).filter(Boolean).sort((a, b) => b.daysSince - a.daysSince);
-    res.json({ high: churnRisk.filter(c => c.riskLevel === 'high'), medium: churnRisk.filter(c => c.riskLevel === 'medium'), total: churnRisk.length });
+      return {
+        clientId: c._id,
+        name: c.name,
+        whatsapp: c.whatsapp,
+        lastOrder: o.lastOrder,
+        daysSinceLastOrder,
+        totalOrders: o.totalOrders,
+        totalSpent: o.totalSpent,
+        riskLevel
+      };
+    }).filter(Boolean).sort((a, b) => b.daysSinceLastOrder - a.daysSinceLastOrder);
+
+    const totalRevenueAtRisk = atRisk.reduce((s, c) => s + (c.totalSpent || 0), 0);
+
+    res.json({
+      atRisk,
+      summary: {
+        total: atRisk.length,
+        high:   atRisk.filter(c => c.riskLevel === 'alto').length,
+        medium: atRisk.filter(c => c.riskLevel === 'medio').length,
+        low:    atRisk.filter(c => c.riskLevel === 'bajo').length,
+        totalRevenueAtRisk
+      }
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

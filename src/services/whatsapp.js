@@ -1,6 +1,6 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode');
+const Config = require('../models/Config');
 
 let client = null;
 let isReady = false;
@@ -9,7 +9,6 @@ let currentQR = null;
 function getCurrentQR() { return currentQR; }
 function getWhatsAppStatus() { return { connected: isReady }; }
 
-// Normalizar número argentino
 function normalizePhone(phoneNumber) {
   let clean = phoneNumber.replace(/\D/g, '');
   if (clean.startsWith('0')) clean = clean.substring(1);
@@ -35,26 +34,10 @@ function initWhatsApp() {
     qrcode.generate(qr, { small: true });
   });
 
-  client.on('ready', () => {
-    isReady = true;
-    currentQR = null;
-    console.log('✅ WhatsApp conectado y listo');
-  });
-
-  client.on('disconnected', (reason) => {
-    isReady = false;
-    console.log('⚠️ WhatsApp desconectado:', reason);
-    setTimeout(initWhatsApp, 5000);
-  });
-
-  client.on('auth_failure', () => {
-    isReady = false;
-    console.log('❌ Error de autenticación WhatsApp');
-  });
-
-  client.initialize().catch(err => {
-    console.error('❌ Error iniciando WhatsApp:', err.message);
-  });
+  client.on('ready', () => { isReady = true; currentQR = null; console.log('✅ WhatsApp conectado y listo'); });
+  client.on('disconnected', (reason) => { isReady = false; console.log('⚠️ WhatsApp desconectado:', reason); setTimeout(initWhatsApp, 5000); });
+  client.on('auth_failure', () => { isReady = false; console.log('❌ Error de autenticación WhatsApp'); });
+  client.initialize().catch(err => console.error('❌ Error iniciando WhatsApp:', err.message));
 }
 
 initWhatsApp();
@@ -75,108 +58,86 @@ async function sendMessage(phoneNumber, message) {
   }
 }
 
-// ── Mensaje 1: Al recibir el pedido (automático, inmediato) ────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
+
+// Obtener template de DB o usar default
+async function getTemplate(key, defaultTemplate) {
+  try {
+    const cfg = await Config.findOne({ key: 'whatsappTemplates' });
+    return cfg?.value?.[key] || defaultTemplate;
+  } catch {
+    return defaultTemplate;
+  }
+}
+
+// Reemplazar variables en un template
+function fillTemplate(template, vars) {
+  return Object.entries(vars).reduce((msg, [key, val]) => msg.replace(new RegExp(`\\{${key}\\}`, 'g'), val ?? ''), template);
+}
+
+// ── Mensaje 1: Al recibir el pedido ──────────────────────────────────────────
 async function sendOrderReceived(phoneNumber, orderNumber, clientName, publicCode) {
   const displayCode = publicCode || orderNumber;
-  const message =
-    `¡Hola ${clientName}! 👋\n\n` +
-    `Recibimos tu pedido *${displayCode}* ✅\n\n` +
-    `En breve te confirmamos cuando la cocina lo apruebe.\n\n` +
-    `_Janz Burgers_ 🍔`;
+  const defaultTpl = `¡Hola {nombre}! 👋\n\nRecibimos tu pedido *{codigo}* ✅\n\nEn breve te confirmamos cuando la cocina lo apruebe.\n\n_Janz Burgers_ 🍔`;
+  const tpl = await getTemplate('orderReceived', defaultTpl);
+  const message = fillTemplate(tpl, { nombre: clientName, codigo: displayCode });
   return sendMessage(phoneNumber, message);
 }
 
-// ── Mensaje 2: Al confirmar (con desglose completo) ────────────────────────
+// ── Mensaje 2: Al confirmar ───────────────────────────────────────────────────
 async function sendOrderConfirmation(phoneNumber, orderNumber, clientName, total, items, paymentMethod, couponCode, discountAmount, transferAlias, publicCode, confirmedMinutes) {
   const displayCode = publicCode || orderNumber;
-  const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
 
-  // Desglose de items con adicionales
   const itemLines = items.map(item => {
     let line = `  • *${item.productName} ${item.variant}* ×${item.quantity} — ${fmt(item.unitPrice * item.quantity)}`;
-    if (item.additionals?.length) {
-      item.additionals.forEach(a => {
-        line += `\n      ↳ ${a.name} ×${a.quantity || 1} — ${fmt(a.unitPrice * (a.quantity || 1))}`;
-      });
-    }
+    if (item.additionals?.length) item.additionals.forEach(a => { line += `\n      ↳ ${a.name} ×${a.quantity || 1} — ${fmt(a.unitPrice * (a.quantity || 1))}`; });
     if (item.notes) line += `\n      📝 _${item.notes}_`;
     return line;
   }).join('\n');
 
-  // Cupón
-  const couponLine = couponCode && discountAmount > 0
-    ? `\n🎟️ Cupón *${couponCode}*: -${fmt(discountAmount)}`
-    : '';
-
-  // Instrucción de pago
+  const couponLine = couponCode && discountAmount > 0 ? `\n🎟️ Cupón *${couponCode}*: -${fmt(discountAmount)}` : '';
   let paymentLine = '';
-  if (paymentMethod === 'efectivo') {
-    paymentLine = `\n💵 *Tené listo ${fmt(total)} en efectivo* para el delivery.`;
-  } else if (paymentMethod === 'transferencia') {
-    const aliasText = transferAlias ? `\nAlias: *${transferAlias}*` : '';
-    paymentLine = `\n🏦 *Enviá el comprobante de ${fmt(total)} por este chat.*${aliasText}`;
-  }
+  if (paymentMethod === 'efectivo') paymentLine = `\n💵 *Tené listo ${fmt(total)} en efectivo* para el delivery.`;
+  else if (paymentMethod === 'transferencia') paymentLine = `\n🏦 *Enviá el comprobante de ${fmt(total)} por este chat.*${transferAlias ? `\nAlias: *${transferAlias}*` : ''}`;
+  const timeLine = confirmedMinutes ? `\n⏱️ *Tiempo estimado: ${confirmedMinutes} minutos.*` : '';
 
-  // Tiempo estimado confirmado por cocina
-  const timeLine = confirmedMinutes
-    ? `\n⏱️ *Tiempo estimado: ${confirmedMinutes} minutos.*`
-    : '';
-
-  const message =
-    `¡Hola ${clientName}! 🔥\n\n` +
-    `Tu pedido *${displayCode}* fue *confirmado por la cocina* y ya está en preparación.\n${timeLine}\n\n` +
-    `*Detalle del pedido:*\n${itemLines}${couponLine}\n\n` +
-    `💰 *Total: ${fmt(total)}*\n` +
-    `${paymentLine}\n\n` +
-    `_Janz Burgers_ 🍔`;
-
+  const defaultTpl = `¡Hola {nombre}! 🔥\n\nTu pedido *{codigo}* fue *confirmado por la cocina* y ya está en preparación.{tiempoEstimado}\n\n*Detalle del pedido:*\n{items}{descuento}\n\n💰 *Total: {total}*\n{metodoPago}\n\n_Janz Burgers_ 🍔`;
+  const tpl = await getTemplate('orderConfirmed', defaultTpl);
+  const message = fillTemplate(tpl, {
+    nombre: clientName, codigo: displayCode, total: fmt(total),
+    items: itemLines, descuento: couponLine, metodoPago: paymentLine,
+    alias: transferAlias || '', tiempoEstimado: timeLine
+  });
   return sendMessage(phoneNumber, message);
 }
 
-// ── Mensaje 3: Al estar listo / en camino ─────────────────────────────────
+// ── Mensaje 3: Listo / en camino ─────────────────────────────────────────────
 async function sendOrderReady(phoneNumber, orderNumber, clientName, deliveryType, total, paymentMethod, transferAlias, publicCode) {
   const displayCode = publicCode || orderNumber;
-  const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
 
   let paymentReminder = '';
-  if (paymentMethod === 'efectivo') {
-    paymentReminder = `\n💵 Recordá tener *${fmt(total)} en efectivo*.`;
-  } else if (paymentMethod === 'transferencia') {
-    const aliasText = transferAlias ? ` al alias *${transferAlias}*` : '';
-    paymentReminder = `\n🏦 Si no enviaste el comprobante, transferí *${fmt(total)}*${aliasText} por este chat.`;
-  }
+  if (paymentMethod === 'efectivo') paymentReminder = `\n💵 Recordá tener *${fmt(total)} en efectivo*.`;
+  else if (paymentMethod === 'transferencia') paymentReminder = `\n🏦 Si no enviaste el comprobante, transferí *${fmt(total)}*${transferAlias ? ` al alias *${transferAlias}*` : ''} por este chat.`;
 
-  const message = deliveryType === 'takeaway'
-    ? `¡Hola ${clientName}! 🥡\n\nTu pedido *${displayCode}* está *listo para retirar*. ✅\n\nPodés pasar a buscarlo. ¡Te esperamos!\n${paymentReminder}\n\n_Janz Burgers_ 🍔`
-    : `¡Hola ${clientName}! 🛵\n\nTu pedido *${displayCode}* está *en camino*. ✅\n\nEn instantes llega a tu puerta.\n${paymentReminder}\n\n_Janz Burgers_ 🍔`;
+  const defaultTplDelivery  = `¡Hola {nombre}! 🛵\n\nTu pedido *{codigo}* está *en camino*. ✅\n\nEn instantes llega a tu puerta.\n{metodoPago}\n\n_Janz Burgers_ 🍔`;
+  const defaultTplTakeaway  = `¡Hola {nombre}! 🥡\n\nTu pedido *{codigo}* está *listo para retirar*. ✅\n\nPodés pasar a buscarlo. ¡Te esperamos!\n{metodoPago}\n\n_Janz Burgers_ 🍔`;
 
+  const tpl = await getTemplate('orderReady', deliveryType === 'takeaway' ? defaultTplTakeaway : defaultTplDelivery);
+  const message = fillTemplate(tpl, {
+    nombre: clientName, codigo: displayCode, total: fmt(total),
+    metodoPago: paymentReminder, alias: transferAlias || '', tipoEntrega: deliveryType
+  });
   return sendMessage(phoneNumber, message);
 }
 
-
-// ── Mensaje 4: Pedido cancelado por falta de stock ────────────────────────
+// ── Mensaje 4: Cancelado ──────────────────────────────────────────────────────
 async function sendOrderCancelled(phoneNumber, clientName, publicCode, orderNumber) {
   const displayCode = publicCode || orderNumber;
-  const message =
-    `¡Hola ${clientName}! 😔
-
-` +
-    `Te avisamos que tu pedido *${displayCode}* fue cancelado porque en este momento no contamos con stock suficiente para prepararlo.
-
-` +
-    `Disculpá las molestias. Podés volver a pedir en nuestra próxima jornada.
-
-` +
-    `_Janz Burgers_ 🍔`;
+  const defaultTpl = `¡Hola {nombre}! 😔\n\nTe avisamos que tu pedido *{codigo}* fue cancelado porque en este momento no contamos con stock suficiente para prepararlo.\n\nDisculpá las molestias. Podés volver a pedir en nuestra próxima jornada.\n\n_Janz Burgers_ 🍔`;
+  const tpl = await getTemplate('orderCancelled', defaultTpl);
+  const message = fillTemplate(tpl, { nombre: clientName, codigo: displayCode });
   return sendMessage(phoneNumber, message);
 }
 
-module.exports = {
-  sendMessage,
-  sendOrderReceived,
-  sendOrderCancelled,
-  sendOrderConfirmation,
-  sendOrderReady,
-  getWhatsAppStatus,
-  getCurrentQR
-};
+module.exports = { sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, getWhatsAppStatus, getCurrentQR };

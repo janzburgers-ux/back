@@ -17,18 +17,14 @@ const io = new Server(server, {
   }
 });
 
-// Exportar io para usarlo en rutas
 app.set('io', io);
 
 io.on('connection', (socket) => {
   console.log('🔌 Socket conectado:', socket.id);
-
-  // El cliente se une a una sala de seguimiento de su pedido
   socket.on('track_order', (orderNumber) => {
     socket.join(`order_${orderNumber}`);
     console.log(`📦 Cliente siguiendo pedido: ${orderNumber}`);
   });
-
   socket.on('disconnect', () => {
     console.log('🔌 Socket desconectado:', socket.id);
   });
@@ -42,33 +38,50 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database connection
+// Database
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/janzburgers')
   .then(() => console.log('✅ MongoDB conectado'))
   .catch(err => console.error('❌ Error MongoDB:', err));
 
-// Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/ingredients', require('./routes/ingredients'));
-app.use('/api/products', require('./routes/products'));
-app.use('/api/orders', require('./routes/orders'));
-app.use('/api/stock', require('./routes/stock'));
-app.use('/api/clients', require('./routes/clients'));
-app.use('/api/dashboard', require('./routes/dashboard'));
-app.use('/api/shopping', require('./routes/shopping'));
-app.use('/api/additionals', require('./routes/additionals'));
-app.use('/api/coupons', require('./routes/coupons'));
-app.use('/api/config', require('./routes/config'));
-app.use('/api/upload', require('./routes/upload'));
-app.use('/api/public', require('./routes/public'));
-app.use('/api/finance', require('./routes/finance'));
-app.use('/api/analytics', require('./routes/analytics'));
-app.use('/api/churn-job', require('./routes/churn-job'));
-app.use('/api/rejected-orders', require('./routes/rejected-orders'));
-app.use('/api/expenses', require('./routes/expenses'));
-app.use('/api/prode', require('./routes/prode'));
+// ── Registrar modelos de Push (necesario para que Mongoose los reconozca) ─────
+require('./models/PushModels');
 
-// ── Jobs automáticos ───────────────────────────────────────────────────────────
+const slotsRouter             = require('./routes/slots');
+const whatsappTemplatesRouter = require('./routes/whatsapp-templates');
+const pushRouter              = require('./routes/push');
+
+// Routes existentes
+app.use('/api/auth',            require('./routes/auth'));
+app.use('/api/ingredients',     require('./routes/ingredients'));
+app.use('/api/products',        require('./routes/products'));
+app.use('/api/orders',          require('./routes/orders'));
+app.use('/api/stock',           require('./routes/stock'));
+app.use('/api/clients',         require('./routes/clients'));
+app.use('/api/dashboard',       require('./routes/dashboard'));
+app.use('/api/shopping',        require('./routes/shopping'));
+app.use('/api/additionals',     require('./routes/additionals'));
+app.use('/api/coupons',         require('./routes/coupons'));
+app.use('/api/config',          require('./routes/config'));
+app.use('/api/upload',          require('./routes/upload'));
+app.use('/api/finance',         require('./routes/finance'));
+app.use('/api/analytics',       require('./routes/analytics'));
+app.use('/api/churn-job',       require('./routes/churn-job'));
+app.use('/api/rejected-orders', require('./routes/rejected-orders'));
+app.use('/api/expenses',        require('./routes/expenses'));
+app.use('/api/prode',           require('./routes/prode'));
+app.use('/api/cash-movements',  require('./routes/cash-movements'));
+
+// /api/public — primero el router principal, luego los slots
+// Ambos se montan en /api/public — Express los procesa en orden,
+// el primero que matchee la ruta responde.
+app.use('/api/public', require('./routes/public'));
+app.use('/api/public', require('./routes/slots'));     // agrega /api/public/slots-availability
+
+// Nuevas rutas
+app.use('/api/whatsapp-templates', require('./routes/whatsapp-templates'));
+app.use('/api/push',               require('./routes/push'));
+
+// ── Jobs automáticos ──────────────────────────────────────────────────────────
 const { startChurnJob } = require('./jobs/churn-alert');
 mongoose.connection.once('open', () => {
   startChurnJob().catch(err => console.error('❌ Error iniciando churn job:', err.message));

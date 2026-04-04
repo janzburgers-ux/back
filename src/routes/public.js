@@ -272,9 +272,8 @@ router.post('/order', async (req, res) => {
     if (isScheduled && scheduledFor) {
       if (typeof scheduledFor === 'string' && /^\d{2}:\d{2}$/.test(scheduledFor)) {
         const ar = nowAR();
-        const [h, m] = scheduledFor.split(':');
-        ar.setHours(Number(h), Number(m), 0, 0);
-        scheduledDate = ar;
+        const dateStr = `${ar.getFullYear()}-${String(ar.getMonth() + 1).padStart(2, '0')}-${String(ar.getDate()).padStart(2, '0')}`;
+        scheduledDate = new Date(`${dateStr}T${scheduledFor}:00-03:00`);
       } else {
         scheduledDate = new Date(scheduledFor);
       }

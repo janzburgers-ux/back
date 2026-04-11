@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { Order, Client } = require('../models/Order');
 const { auth, adminOnly } = require('../middleware/auth');
+const { nowAR, arHour, monthRangeAR, yearRangeAR } = require('../utils/arDate');
 
 function scoreRFM(value, thresholds) {
   if (value <= thresholds[0]) return 5;
@@ -36,7 +37,8 @@ function getRFMSegment(r, f, m) {
 // ── 1. RFM Segmentation ────────────────────────────────────────────────────
 router.get('/rfm', auth, adminOnly, async (req, res) => {
   try {
-    const now = new Date();
+    const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+    const now = nowAR();
     const clients = await Client.find({ active: true, totalOrders: { $gt: 0 } });
     if (clients.length === 0) return res.json({ segments: [], clients: [], summary: {} });
     const lastOrders = await Order.aggregate([
@@ -79,7 +81,8 @@ router.get('/rfm', auth, adminOnly, async (req, res) => {
 // ── 2. Churn Detection ─────────────────────────────────────────────────────
 router.get('/churn', auth, adminOnly, async (req, res) => {
   try {
-    const now = new Date();
+    const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+    const now = nowAR();
     const lastOrders = await Order.aggregate([
       { $match: { status: { $ne: 'cancelled' } } },
       { $group: { _id: '$client', lastOrder: { $max: '$createdAt' }, totalOrders: { $sum: 1 }, totalSpent: { $sum: '$total' } } }
@@ -129,13 +132,14 @@ router.get('/churn', auth, adminOnly, async (req, res) => {
 // ── 3. Demand Forecast ─────────────────────────────────────────────────────
 router.get('/forecast', auth, adminOnly, async (req, res) => {
   try {
-    const since = new Date(); since.setDate(since.getDate() - 56);
+    const arNow56 = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
+    const since = new Date(arNow56); since.setDate(since.getDate() - 56);
     const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } });
     const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
     const byDow = {};
     days.forEach((d, i) => { byDow[i] = { name: d, orders: [], revenue: [], items: {} }; });
     orders.forEach(o => {
-      const dow = new Date(o.createdAt).getDay();
+      const dow = arHour ? new Date(new Date(o.createdAt).toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' })).getDay() : new Date(o.createdAt).getDay();
       byDow[dow].orders.push(o.total);
       byDow[dow].revenue.push(o.total);
       o.items.forEach(item => {
@@ -189,11 +193,12 @@ router.get('/crosssell', auth, adminOnly, async (req, res) => {
 // ── 5. Hourly Profitability ────────────────────────────────────────────────
 router.get('/hourly', auth, adminOnly, async (req, res) => {
   try {
-    const since = new Date(); since.setDate(since.getDate() - 30);
+    const arNow30 = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
+    const since = new Date(arNow30); since.setDate(since.getDate() - 30);
     const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } });
     const hourly = {};
     for (let h = 0; h < 24; h++) hourly[h] = { hour: h, orders: 0, revenue: 0 };
-    orders.forEach(o => { const h = new Date(o.createdAt).getHours(); hourly[h].orders++; hourly[h].revenue += o.total; });
+    orders.forEach(o => { const h = arHour(new Date(o.createdAt)); hourly[h].orders++; hourly[h].revenue += o.total; });
     const result = Object.values(hourly).filter(h => h.orders > 0).map(h => ({ ...h, label: `${String(h.hour).padStart(2, '0')}:00`, avgTicket: h.orders > 0 ? Math.round(h.revenue / h.orders) : 0 }));
     const peakHour = result.reduce((max, h) => h.revenue > (max?.revenue || 0) ? h : max, null);
     res.json({ hourly: result, peakHour, daysAnalyzed: 30 });
@@ -203,7 +208,8 @@ router.get('/hourly', auth, adminOnly, async (req, res) => {
 // ── 6. Smart Alerts ────────────────────────────────────────────────────────
 router.get('/alerts', auth, adminOnly, async (req, res) => {
   try {
-    const alerts = []; const now = new Date();
+    const alerts = []; const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+    const now = nowAR();
     const churnCount = await Order.aggregate([
       { $match: { status: { $ne: 'cancelled' } } },
       { $group: { _id: '$client', lastOrder: { $max: '$createdAt' }, totalOrders: { $sum: 1 } } },
@@ -240,7 +246,8 @@ router.get('/ingredient-usage', auth, adminOnly, async (req, res) => {
       start = new Date(Number(year), Number(month) - 1, 1, 0, 0, 0);
       end   = new Date(Number(year), Number(month), 0, 23, 59, 59, 999);
     } else {
-      const now = new Date();
+      const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+    const now = nowAR();
       start = new Date(now.getFullYear(), now.getMonth(), 1);
       end   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
     }

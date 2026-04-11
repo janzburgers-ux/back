@@ -6,7 +6,7 @@ const Config = require('../models/Config');
 const { auth, kitchenOrAdmin, adminOnly } = require('../middleware/auth');
 const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateProductAvailability } = require('../services/stock.service');
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
-const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled } = require('../services/whatsapp');
+const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
 const { addPointsForOrder, notifyReferralOwner, getReferralConfig } = require('../services/loyalty');
 const { addProdePointsForOrder } = require('../services/prode.service');
 
@@ -489,6 +489,42 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       await Client.findByIdAndUpdate(order.client._id, { $inc: { totalSpent: order.total } });
       addPointsForOrder(order.client._id, order.total)
         .catch(e => console.error('Error puntos fidelización:', e.message));
+
+      // ── Solicitar reseña con delay (configurable desde Config) ────────────
+      if (order.client?.whatsapp && order.publicCode) {
+        (async () => {
+          try {
+            const reviewCfg = await Config.findOne({ key: 'reviewSettings' });
+            const settings  = reviewCfg?.value || {};
+            if (settings.enabled !== false) {
+              const waitMs = ((settings.waitMinutes ?? 10) * 60 * 1000);
+              setTimeout(async () => {
+                try {
+                  // Verificar que no se haya enviado ya
+                  const Review = require('../models/Review');
+                  const existing = await Review.findOne({ order: order._id });
+                  if (!existing) {
+                    await Review.create({
+                      order:       order._id,
+                      orderNumber: order.orderNumber,
+                      publicCode:  order.publicCode,
+                      client:      order.client._id,
+                      clientName:  order.client.name,
+                      clientWhatsapp: order.client.whatsapp,
+                      stars: 0,
+                      requestSent: true
+                    });
+                  }
+                  if (!existing?.requestSent) {
+                    await sendReviewRequest(order.client.whatsapp, order.client.name, order.publicCode);
+                    await Review.findOneAndUpdate({ order: order._id }, { requestSent: true });
+                  }
+                } catch (e) { console.error('Error enviando request de reseña:', e.message); }
+              }, waitMs);
+            }
+          } catch (e) { console.error('Error configurando review request:', e.message); }
+        })();
+      }
     }
 
     await order.save();

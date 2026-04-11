@@ -1,4 +1,6 @@
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const http = require('http');
@@ -30,6 +32,21 @@ io.on('connection', (socket) => {
   });
 });
 
+// ── Seguridad ─────────────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
+const publicLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { message: 'Demasiadas solicitudes. Intentá en unos minutos.' },
+  standardHeaders: true, legacyHeaders: false,
+});
+const orderLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  message: { message: 'Límite de pedidos alcanzado. Esperá unos minutos.' },
+});
+
 // Middleware
 app.use(cors({
   origin: process.env.FRONTEND_URL.split(','),
@@ -45,6 +62,7 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/janzburge
 
 // ── Registrar modelos de Push (necesario para que Mongoose los reconozca) ─────
 require('./models/PushModels');
+require('./models/Review');
 
 const slotsRouter             = require('./routes/slots');
 const whatsappTemplatesRouter = require('./routes/whatsapp-templates');
@@ -74,12 +92,15 @@ app.use('/api/cash-movements',  require('./routes/cash-movements'));
 // /api/public — primero el router principal, luego los slots
 // Ambos se montan en /api/public — Express los procesa en orden,
 // el primero que matchee la ruta responde.
+app.use('/api/public', publicLimiter);
+app.use('/api/public/order', orderLimiter);
 app.use('/api/public', require('./routes/public'));
 app.use('/api/public', require('./routes/slots'));     // agrega /api/public/slots-availability
 
 // Nuevas rutas
 app.use('/api/whatsapp-templates', require('./routes/whatsapp-templates'));
 app.use('/api/push',               require('./routes/push'));
+app.use('/api/reviews',            require('./routes/reviews'));
 
 // ── Jobs automáticos ──────────────────────────────────────────────────────────
 const { startChurnJob } = require('./jobs/churn-alert');

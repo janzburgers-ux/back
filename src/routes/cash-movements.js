@@ -197,6 +197,38 @@ router.get('/summary', auth, adminOnly, async (req, res) => {
       return { ...member, entitled, withdrawn, available };
     });
 
+    // ── Métricas operativas para Objetivos de Caja ──────────────────────────
+    const { Order: OrderModel } = require('../models/Order');
+    const { Client: ClientModel } = require('../models/Order');
+
+    // Pedidos totales no cancelados en el período
+    const periodOrders = await OrderModel.find({
+      createdAt: { $gte: start, $lte: end },
+      status: { $ne: 'cancelled' }
+    }).select('items coupon client createdAt total');
+
+    const ordersCount  = periodOrders.length;
+    const burgersCount = periodOrders.reduce((sum, o) =>
+      sum + o.items.reduce((s, i) => s + (i.quantity || 0), 0), 0
+    );
+    const avgTicket    = ordersCount > 0 ? Math.round(sales.total / ordersCount) : 0;
+    const couponsCount = periodOrders.filter(o => o.coupon).length;
+
+    // Clientes nuevos y recurrentes en el período
+    const newClientsCount = await ClientModel.countDocuments({
+      createdAt: { $gte: start, $lte: end }
+    });
+
+    // Clientes recurrentes: ordenaron al menos 2 veces en total Y tuvieron orden en este período
+    const clientsWithOrdersInPeriod = [...new Set(periodOrders.map(o => o.client?.toString()).filter(Boolean))];
+    let returningCount = 0;
+    if (clientsWithOrdersInPeriod.length > 0) {
+      returningCount = await ClientModel.countDocuments({
+        _id: { $in: clientsWithOrdersInPeriod },
+        totalOrders: { $gte: 2 }
+      });
+    }
+
     res.json({
       period: { view, ref, start, end },
       sales: {
@@ -212,7 +244,16 @@ router.get('/summary', auth, adminOnly, async (req, res) => {
       netProfit,
       balanceEfectivo,
       balanceDigital,
-      membersStatus
+      membersStatus,
+      // ── Métricas operativas ─────────────────────────────────────────────
+      metrics: {
+        ordersCount,
+        burgersCount,
+        avgTicket,
+        couponsCount,
+        newClients:       newClientsCount,
+        returningClients: returningCount
+      }
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });

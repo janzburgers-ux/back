@@ -140,4 +140,15 @@ async function sendOrderCancelled(phoneNumber, clientName, publicCode, orderNumb
   return sendMessage(phoneNumber, message);
 }
 
-module.exports = { sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, getWhatsAppStatus, getCurrentQR };
+module.exports = { sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
+
+
+// ── Mensaje 5: Solicitud de reseña (post-entrega) ─────────────────────────────
+async function sendReviewRequest(phoneNumber, clientName, publicCode, frontendUrl) {
+  const baseUrl = frontendUrl || (process.env.FRONTEND_URL || 'https://janzburgers.vercel.app').split(',')[0];
+  const reviewUrl = `${baseUrl}/resena/${publicCode}`;
+  const defaultTpl = `¡Hola {nombre}! 🍔\n\n¿Cómo estuvo tu pedido de hoy?\n\nContanos qué te pareció y *te regalamos algo para la próxima* 🎁\n\n👉 {link}\n\n¡Solo tarda 30 segundos!\n\n_Janz Burgers_ 🍔`;
+  const tpl = await getTemplate('reviewRequest', defaultTpl);
+  const message = fillTemplate(tpl, { nombre: clientName, link: reviewUrl, codigo: publicCode });
+  return sendMessage(phoneNumber, message);
+}

@@ -36,7 +36,48 @@ const DEFAULTS = {
   orderLimits: {
     enabled: false,
     dailyMax: 50
-  } 
+  },
+  // Objetivos de Caja Global
+  cajaGoals: {
+    dia:   { money: 0, burgers: 0, orders: 0, newClients: 0, returningClients: 0, avgTicket: 0, coupons: 0 },
+    finde: { money: 0, burgers: 0, orders: 0, newClients: 0, returningClients: 0, avgTicket: 0, coupons: 0 },
+    mes:   { money: 0, burgers: 0, orders: 0, newClients: 0, returningClients: 0, avgTicket: 0, coupons: 0 },
+    año:   { money: 0, burgers: 0, orders: 0, newClients: 0, returningClients: 0, avgTicket: 0, coupons: 0 }
+  },
+  // Configuración del sistema de reseñas
+  reviewSettings: {
+    enabled:          true,
+    incentiveType:    'discount',   // 'discount' | 'product' | 'none'
+    discountPercent:  10,
+    productId:        null,
+    productName:      'Papas fritas',
+    validDays:        30,
+    waitMinutes:      10,
+    messageText:      ''
+  },
+  // Hamburguesa del día (promo con countdown)
+  dailyDeal: {
+    enabled:         false,
+    name:            '',
+    description:     '',
+    originalPrice:   0,
+    discountPrice:   0,
+    discountPercent: 0,
+    fromHour:        '19:00',
+    toHour:          '21:00',
+    image:           '',
+    productId:       null
+  },
+  // Hamburguesa del mes
+  monthlyBurger: {
+    enabled:     false,
+    name:        '',
+    description: '',
+    price:       0,
+    image:       '',
+    badge:       '🏆 Del mes',
+    month:       ''
+  }
 };
 
 async function upsert(key, value, label = '') {

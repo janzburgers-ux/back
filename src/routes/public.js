@@ -3,9 +3,10 @@ const router = express.Router();
 const { Product } = require('../models/Product');
 const { Client, Order } = require('../models/Order');
 const Additional = require('../models/Additional');
-const Coupon = require('../models/Coupon');
 const Config = require('../models/Config');
 const { sendOrderReceived } = require('../services/whatsapp');
+const Review = require('../models/Review');
+const Coupon = require('../models/Coupon');
 const { calcPackagingCost, deductStockForOrder, autoUpdateProductAvailability } = require('../services/stock.service');
 const { estimateWaitTime } = require('../services/kitchen-capacity');
 
@@ -78,7 +79,24 @@ router.get('/menu', async (req, res) => {
       return acc;
     }, {});
 
-    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp });
+    // ── Hamburguesa del día y del mes ──────────────────────────────────────
+    const dailyDealCfg  = await Config.findOne({ key: 'dailyDeal' });
+    const monthlyBurgerCfg = await Config.findOne({ key: 'monthlyBurger' });
+    const dailyDeal     = dailyDealCfg?.value  || { enabled: false };
+    const monthlyBurger = monthlyBurgerCfg?.value || { enabled: false };
+
+    // Verificar si el deal diario está vigente
+    let activeDailyDeal = null;
+    if (dailyDeal.enabled) {
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+      const nowStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      if ((!dailyDeal.fromHour || nowStr >= dailyDeal.fromHour) &&
+          (!dailyDeal.toHour   || nowStr <= dailyDeal.toHour)) {
+        activeDailyDeal = dailyDeal;
+      }
+    }
+
+    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: monthlyBurger.enabled ? monthlyBurger : null });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -357,6 +375,131 @@ router.post('/order', async (req, res) => {
     });
 
   } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
+
+// ── GET reseña pendiente (verifica que el pedido existe y no fue reseñado aún) ──
+router.get('/review/:publicCode', async (req, res) => {
+  try {
+    const { Order: OrderModel } = require('../models/Order');
+    const order = await OrderModel.findOne({ publicCode: req.params.publicCode })
+      .populate('client', 'name');
+
+    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+    if (order.status !== 'delivered') return res.status(400).json({ message: 'El pedido todavía no fue entregado' });
+
+    // Verificar si ya dejó reseña
+    const existing = await Review.findOne({ order: order._id, stars: { $gt: 0 } });
+    if (existing) return res.json({ alreadyReviewed: true, stars: existing.stars });
+
+    // Config de incentivo
+    const reviewCfg = await Config.findOne({ key: 'reviewSettings' });
+    const settings  = reviewCfg?.value || {};
+
+    res.json({
+      alreadyReviewed: false,
+      orderNumber: order.orderNumber,
+      clientName:  order.client?.name || '',
+      incentive: {
+        type:        settings.incentiveType  || 'none',
+        percent:     settings.discountPercent || 10,
+        productName: settings.productName     || '',
+        validDays:   settings.validDays       || 30
+      }
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST guardar reseña y generar incentivo ────────────────────────────────────
+router.post('/review/:publicCode', async (req, res) => {
+  try {
+    const { Order: OrderModel, Client: ClientModel } = require('../models/Order');
+    const { stars, burgerRating, tempRating, onTime, comment } = req.body;
+
+    if (!stars || stars < 1 || stars > 5) return res.status(400).json({ message: 'Calificación inválida' });
+
+    const order = await OrderModel.findOne({ publicCode: req.params.publicCode })
+      .populate('client', 'name whatsapp');
+    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
+
+    // Idempotente: si ya reseñó, no duplicar
+    const existing = await Review.findOne({ order: order._id, stars: { $gt: 0 } });
+    if (existing) return res.json({ alreadyReviewed: true });
+
+    // Config de incentivo
+    const reviewCfg = await Config.findOne({ key: 'reviewSettings' });
+    const settings  = reviewCfg?.value || {};
+
+    // Crear o actualizar la reseña
+    let review = await Review.findOne({ order: order._id });
+    const reviewData = {
+      order:          order._id,
+      orderNumber:    order.orderNumber,
+      publicCode:     order.publicCode,
+      client:         order.client?._id,
+      clientName:     order.client?.name,
+      clientWhatsapp: order.client?.whatsapp,
+      stars: Number(stars),
+      burgerRating: burgerRating || '',
+      tempRating:   tempRating   || '',
+      onTime:       onTime != null ? Boolean(onTime) : null,
+      comment:      comment       || '',
+      requestSent:  true
+    };
+
+    // Generar incentivo si corresponde
+    let couponCode = null;
+    let couponDoc  = null;
+    if (settings.incentiveType && settings.incentiveType !== 'none') {
+      const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+      const suffix = Array.from({ length: 5 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+      couponCode = `GRACIAS-${suffix}`;
+
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + (settings.validDays || 30));
+
+      const couponData = {
+        code: couponCode,
+        type: 'review_reward',
+        active: true,
+        unlimited: false,
+        singleUse: true,
+        expiresAt,
+        discountForUser: settings.incentiveType === 'discount' ? (settings.discountPercent || 10) : 100,
+        description: 'Premio por reseña',
+        applicableProduct: settings.incentiveType === 'product' && settings.productId
+          ? settings.productId
+          : null,
+        uses: []
+      };
+
+      try {
+        couponDoc = await Coupon.create(couponData);
+        reviewData.incentiveType   = settings.incentiveType;
+        reviewData.couponGenerated = couponCode;
+        reviewData.couponId        = couponDoc._id;
+        reviewData.incentiveSent   = true;
+      } catch (e) { console.error('Error creando cupón de reseña:', e.message); }
+    }
+
+    if (review) {
+      Object.assign(review, reviewData);
+      await review.save();
+    } else {
+      review = await Review.create(reviewData);
+    }
+
+    res.json({
+      success: true,
+      stars: review.stars,
+      incentive: couponCode ? {
+        code:      couponCode,
+        type:      settings.incentiveType,
+        percent:   settings.discountPercent || 10,
+        validDays: settings.validDays || 30
+      } : null
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 module.exports = router;

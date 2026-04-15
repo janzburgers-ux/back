@@ -431,7 +431,6 @@ router.post('/review/:publicCode', async (req, res) => {
     const settings  = reviewCfg?.value || {};
 
     // Crear o actualizar la reseña
-    let review = await Review.findOne({ order: order._id });
     const reviewData = {
       order:          order._id,
       orderNumber:    order.orderNumber,
@@ -482,12 +481,13 @@ router.post('/review/:publicCode', async (req, res) => {
       } catch (e) { console.error('Error creando cupón de reseña:', e.message); }
     }
 
-    if (review) {
-      Object.assign(review, reviewData);
-      await review.save();
-    } else {
-      review = await Review.create(reviewData);
-    }
+    // Usar findOneAndUpdate + upsert para evitar errores de validacion
+    // con registros placeholder que puedan tener stars fuera del rango valido.
+    const review = await Review.findOneAndUpdate(
+      { order: order._id },
+      { $set: reviewData },
+      { upsert: true, new: true, runValidators: true }
+    );
 
     res.json({
       success: true,

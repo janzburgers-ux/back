@@ -504,16 +504,24 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                   const Review = require('../models/Review');
                   const existing = await Review.findOne({ order: order._id });
                   if (!existing) {
-                    await Review.create({
-                      order:       order._id,
-                      orderNumber: order.orderNumber,
-                      publicCode:  order.publicCode,
-                      client:      order.client._id,
-                      clientName:  order.client.name,
-                      clientWhatsapp: order.client.whatsapp,
-                      stars: 0,
-                      requestSent: true
-                    });
+                    // No pre-crear con stars:0 (viola validación min:1).
+                    // Solo registrar que se envió la solicitud via findOneAndUpdate+upsert
+                    await Review.findOneAndUpdate(
+                      { order: order._id },
+                      {
+                        $setOnInsert: {
+                          order:          order._id,
+                          orderNumber:    order.orderNumber,
+                          publicCode:     order.publicCode,
+                          client:         order.client._id,
+                          clientName:     order.client.name,
+                          clientWhatsapp: order.client.whatsapp,
+                          stars:          1,   // valor mínimo válido; se sobreescribe al completar la reseña
+                          requestSent:    true
+                        }
+                      },
+                      { upsert: true, new: true }
+                    );
                   }
                   if (!existing?.requestSent) {
                     await sendReviewRequest(order.client.whatsapp, order.client.name, order.publicCode);

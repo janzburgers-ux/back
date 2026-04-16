@@ -388,8 +388,8 @@ router.get('/review/:publicCode', async (req, res) => {
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
     if (order.status !== 'delivered') return res.status(400).json({ message: 'El pedido todavía no fue entregado' });
 
-    // Verificar si ya dejó reseña
-    const existing = await Review.findOne({ order: order._id, stars: { $gt: 0 } });
+    // Verificar si ya dejó reseña (completed=true para no confundir con el placeholder de requestSent)
+    const existing = await Review.findOne({ order: order._id, completed: true });
     if (existing) return res.json({ alreadyReviewed: true, stars: existing.stars });
 
     // Config de incentivo
@@ -422,8 +422,8 @@ router.post('/review/:publicCode', async (req, res) => {
       .populate('client', 'name whatsapp');
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
 
-    // Idempotente: si ya reseñó, no duplicar
-    const existing = await Review.findOne({ order: order._id, stars: { $gt: 0 } });
+    // Idempotente: si ya completó la reseña, no duplicar
+    const existing = await Review.findOne({ order: order._id, completed: true });
     if (existing) return res.json({ alreadyReviewed: true });
 
     // Config de incentivo
@@ -443,7 +443,8 @@ router.post('/review/:publicCode', async (req, res) => {
       tempRating:   tempRating   || '',
       onTime:       onTime != null ? Boolean(onTime) : null,
       comment:      comment       || '',
-      requestSent:  true
+      requestSent:  true,
+      completed:    true  // marca que el cliente completó el formulario (diferencia del placeholder)
     };
 
     // Generar incentivo si corresponde

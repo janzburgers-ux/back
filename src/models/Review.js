@@ -30,6 +30,7 @@ const reviewSchema = new mongoose.Schema({
   incentiveSent:   { type: Boolean, default: false },
 
   // Estado
+  completed:   { type: Boolean, default: false }, // el cliente completó el formulario
   reviewed:    { type: Boolean, default: false }, // admin la marcó como leída
   requestSent: { type: Boolean, default: false }, // si ya se envió el WhatsApp de pedido de reseña
 }, { timestamps: true });
@@ -38,5 +39,6 @@ const reviewSchema = new mongoose.Schema({
 reviewSchema.index({ createdAt: -1 });
 reviewSchema.index({ stars: 1 });
 reviewSchema.index({ client: 1 });
+reviewSchema.index({ completed: 1 });
 
 module.exports = mongoose.model('Review', reviewSchema);

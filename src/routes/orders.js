@@ -496,39 +496,53 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           try {
             const reviewCfg = await Config.findOne({ key: 'reviewSettings' });
             const settings  = reviewCfg?.value || {};
-            if (settings.enabled !== false) {
-              const waitMs = ((settings.waitMinutes ?? 10) * 60 * 1000);
-              setTimeout(async () => {
-                try {
-                  // Verificar que no se haya enviado ya
-                  const Review = require('../models/Review');
-                  const existing = await Review.findOne({ order: order._id });
-                  if (!existing) {
-                    // No pre-crear con stars:0 (viola validación min:1).
-                    // Solo registrar que se envió la solicitud via findOneAndUpdate+upsert
-                    await Review.findOneAndUpdate(
-                      { order: order._id },
-                      {
-                        $setOnInsert: {
-                          order:          order._id,
-                          orderNumber:    order.orderNumber,
-                          publicCode:     order.publicCode,
-                          client:         order.client._id,
-                          clientName:     order.client.name,
-                          clientWhatsapp: order.client.whatsapp,
-                          stars:          1,   // valor mínimo válido; se sobreescribe al completar la reseña
-                          requestSent:    true
-                        }
-                      },
-                      { upsert: true, new: true }
-                    );
-                  }
-                  if (!existing?.requestSent) {
-                    await sendReviewRequest(order.client.whatsapp, order.client.name, order.publicCode);
-                    await Review.findOneAndUpdate({ order: order._id }, { requestSent: true });
-                  }
-                } catch (e) { console.error('Error enviando request de reseña:', e.message); }
-              }, waitMs);
+            // sendMode: 'auto' (default) | 'manual'
+            // orderInterval: cada cuántos pedidos enviar (0 = todos, default 1)
+            if (settings.enabled !== false && settings.sendMode !== 'manual') {
+              // ── Verificar intervalo de pedidos ────────────────────────────
+              const orderInterval = settings.orderInterval || 1;
+              let shouldSend = true;
+              if (orderInterval > 1) {
+                // Contar pedidos entregados de este cliente
+                const deliveredCount = await Order.countDocuments({
+                  client: order.client._id,
+                  status: 'delivered'
+                });
+                shouldSend = (deliveredCount % orderInterval === 0);
+              }
+
+              if (shouldSend) {
+                const waitMs = ((settings.waitMinutes ?? 10) * 60 * 1000);
+                setTimeout(async () => {
+                  try {
+                    const Review = require('../models/Review');
+                    // Verificar que no se haya enviado ya el request para este pedido
+                    const existing = await Review.findOne({ order: order._id });
+                    if (!existing?.requestSent) {
+                      // Crear placeholder SIN completed:true para no bloquear el formulario
+                      await Review.findOneAndUpdate(
+                        { order: order._id },
+                        {
+                          $setOnInsert: {
+                            order:          order._id,
+                            orderNumber:    order.orderNumber,
+                            publicCode:     order.publicCode,
+                            client:         order.client._id,
+                            clientName:     order.client.name,
+                            clientWhatsapp: order.client.whatsapp,
+                            stars:          1,        // mínimo requerido por schema
+                            requestSent:    true,
+                            completed:      false     // NO completada aún por el cliente
+                          }
+                        },
+                        { upsert: true, new: true }
+                      );
+                      await sendReviewRequest(order.client.whatsapp, order.client.name, order.publicCode);
+                      await Review.findOneAndUpdate({ order: order._id }, { requestSent: true });
+                    }
+                  } catch (e) { console.error('Error enviando request de reseña:', e.message); }
+                }, waitMs);
+              }
             }
           } catch (e) { console.error('Error configurando review request:', e.message); }
         })();

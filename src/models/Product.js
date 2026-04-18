@@ -33,6 +33,9 @@ const productSchema = new mongoose.Schema({
   suggestedPrice: { type: Number, default: 0 },
   active: { type: Boolean, default: true },
   available: { type: Boolean, default: true },
+  // visible: controla si aparece en el menú público /pedido.
+  // active=false → eliminado del sistema. visible=false → oculto solo del menú público.
+  visible: { type: Boolean, default: true },
   image: { type: String },
   description: { type: String },
   // Tipo de producto: controla qué adicionales se muestran al cliente al personalizar

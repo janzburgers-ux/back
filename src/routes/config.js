@@ -77,7 +77,9 @@ const DEFAULTS = {
     image:       '',
     badge:       '🏆 Del mes',
     month:       ''
-  }
+  },
+  // Templates de mensajes WhatsApp (null = usa el hardcoded del servicio)
+  whatsappTemplates: null
 };
 
 async function upsert(key, value, label = '') {
@@ -146,7 +148,7 @@ router.get('/', auth, adminOnly, async (req, res) => {
 // ── GET config pública ─────────────────────────────────────────────────────
 router.get('/public', async (req, res) => {
   try {
-    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder', 'max-orders-per-slot'];
+    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder', 'max-orders-per-slot', 'cajaGoals'];
     // Normalizar la key con guiones a camelCase para el frontend
     const keyMap = { 'max-orders-per-slot': 'maxOrdersPerSlot' };
     const configs = await Config.find({ key: { $in: keys } });

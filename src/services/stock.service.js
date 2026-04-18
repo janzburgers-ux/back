@@ -120,12 +120,31 @@ async function generateShoppingList() {
 // Calcula cuánto de cada ingrediente se necesita para producir `targetBurgers` unidades
 // usando un mix proporcional de todos los productos activos
 async function generateProductionShoppingList(targetBurgers = 50) {
-  const products = await Product.find({ active: true, variant: 'x1' })
+  const allProducts = await Product.find({ active: true })
     .populate({ path: 'recipe', populate: { path: 'ingredients.ingredient' } });
+
+  // Tomar solo 1 variante por nombre de producto para no duplicar ingredientes.
+  // Se elige la primera que tenga receta asignada; si ninguna la tiene, la primera.
+  const seen = new Set();
+  const products = [];
+  for (const p of allProducts) {
+    if (seen.has(p.name)) continue;
+    if (p.recipe?.ingredients?.length) {
+      seen.add(p.name);
+      products.push(p);
+    }
+  }
+  // Segunda pasada: agregar productos sin receta que no hayamos visto (para no perderlos)
+  for (const p of allProducts) {
+    if (!seen.has(p.name)) {
+      seen.add(p.name);
+      products.push(p);
+    }
+  }
 
   if (!products.length) return { items: [], totalEstimated: 0, targetBurgers };
 
-  // Distribuir el objetivo uniformemente entre los productos (podría hacerse proporcional a ventas)
+  // Distribuir el objetivo uniformemente entre los productos únicos
   const burgersPerProduct = Math.ceil(targetBurgers / products.length);
 
   // Acumular necesidades totales de ingredientes

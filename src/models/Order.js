@@ -15,7 +15,9 @@ const clientSchema = new mongoose.Schema({
   totalSpent: { type: Number, default: 0 },
   loyaltyPoints: { type: Number, default: 0 },
   totalPointsEarned: { type: Number, default: 0 },
-  active: { type: Boolean, default: true }
+  active: { type: Boolean, default: true },
+  // isTestClient: pedidos de este cliente no cuentan en reportes ni analytics
+  isTestClient: { type: Boolean, default: false }
 }, { timestamps: true });
 
 const orderItemAdditionalSchema = new mongoose.Schema({

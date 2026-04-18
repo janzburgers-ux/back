@@ -75,4 +75,28 @@ router.post('/', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 
+// DELETE pedido rechazado individual
+router.delete('/:id', auth, adminOnly, async (req, res) => {
+  try {
+    const doc = await RejectedOrder.findByIdAndDelete(req.params.id);
+    if (!doc) return res.status(404).json({ message: 'No encontrado' });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// DELETE bulk — eliminar varios o todos
+router.delete('/', auth, adminOnly, async (req, res) => {
+  try {
+    const { ids, all } = req.body;
+    if (all === true) {
+      const result = await RejectedOrder.deleteMany({});
+      return res.json({ success: true, deleted: result.deletedCount });
+    }
+    if (Array.isArray(ids) && ids.length) {
+      const result = await RejectedOrder.deleteMany({ _id: { $in: ids } });
+      return res.json({ success: true, deleted: result.deletedCount });
+    }
+    res.status(400).json({ message: 'Enviá ids[] o all:true' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 module.exports = router;

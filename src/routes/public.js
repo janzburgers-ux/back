@@ -48,7 +48,7 @@ async function isOpen() {
 router.get('/menu', async (req, res) => {
   try {
     const open = await isOpen();
-    const products = await Product.find({ active: true }).sort('name variant');
+    const products = await Product.find({ active: true, visible: { $ne: false } }).sort('name variant');
     const additionals = await Additional.find({ active: true }).sort('name');
 
     const zonesCfg = await Config.findOne({ key: 'zones' });
@@ -460,13 +460,14 @@ router.post('/review/:publicCode', async (req, res) => {
 
       const couponData = {
         code: couponCode,
-        type: 'review_reward',
+        type: 'loyalty',         // tipo válido en el enum del schema
+        owner: order.client._id, // ← campo REQUERIDO que faltaba — sin esto el save falla silenciosamente
+        ownerName: order.client?.name || '',
         active: true,
         unlimited: false,
         singleUse: true,
         expiresAt,
         discountForUser: settings.incentiveType === 'discount' ? (settings.discountPercent || 10) : 100,
-        description: 'Premio por reseña',
         applicableProduct: settings.incentiveType === 'product' && settings.productId
           ? settings.productId
           : null,

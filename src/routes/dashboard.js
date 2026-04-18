@@ -10,10 +10,12 @@ const {
   todayRangeAR, thisWeekRangeAR, thisMonthRangeAR, prevMonthRangeAR,
   monthRangeAR, yearRangeAR, arDayOfMonth
 } = require('../utils/arDate');
+const { noTestFilter } = require('../utils/testClientFilter');
 
 // ── Stats principales ──────────────────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
   try {
+    const testFilter = await noTestFilter();
     // ✅ Todas las fechas en timezone Argentina
     const today     = todayRangeAR();
     const week      = thisWeekRangeAR();
@@ -21,10 +23,10 @@ router.get('/', auth, async (req, res) => {
     const prevMonth = prevMonthRangeAR();
 
     const [todayOrders, weekOrders, monthOrders, prevMonthOrders, pendingOrders] = await Promise.all([
-      Order.find({ createdAt: { $gte: today.start, $lte: today.end }, status: { $ne: 'cancelled' } }),
-      Order.find({ createdAt: { $gte: week.start,  $lte: week.end  }, status: { $ne: 'cancelled' } }),
-      Order.find({ createdAt: { $gte: month.start, $lte: month.end }, status: { $ne: 'cancelled' } }),
-      Order.find({ createdAt: { $gte: prevMonth.start, $lte: prevMonth.end }, status: { $ne: 'cancelled' } }),
+      Order.find({ ...testFilter, createdAt: { $gte: today.start, $lte: today.end }, status: { $ne: 'cancelled' } }),
+      Order.find({ ...testFilter, createdAt: { $gte: week.start,  $lte: week.end  }, status: { $ne: 'cancelled' } }),
+      Order.find({ ...testFilter, createdAt: { $gte: month.start, $lte: month.end }, status: { $ne: 'cancelled' } }),
+      Order.find({ ...testFilter, createdAt: { $gte: prevMonth.start, $lte: prevMonth.end }, status: { $ne: 'cancelled' } }),
       Order.find({ status: { $in: ['pending', 'confirmed', 'preparing'] } })
         .populate('client', 'name phone whatsapp').sort({ createdAt: -1 }).limit(10)
     ]);
@@ -48,6 +50,7 @@ router.get('/', auth, async (req, res) => {
     const todayPrevWeekEnd = new Date(today.end);
     todayPrevWeekEnd.setDate(todayPrevWeekEnd.getDate() - 7);
     const prevWeekSameDayOrders = await Order.find({
+      ...testFilter,
       createdAt: { $gte: todayPrevWeekStart, $lte: todayPrevWeekEnd },
       status: { $ne: 'cancelled' }
     });

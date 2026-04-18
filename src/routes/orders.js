@@ -508,7 +508,8 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                   client: order.client._id,
                   status: 'delivered'
                 });
-                shouldSend = (deliveredCount % orderInterval === 0);
+                // El PRIMER pedido siempre envía; luego cada orderInterval pedidos
+                shouldSend = deliveredCount === 1 || (deliveredCount % orderInterval === 0);
               }
 
               if (shouldSend) {

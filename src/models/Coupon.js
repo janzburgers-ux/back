@@ -3,28 +3,23 @@ const mongoose = require('mongoose');
 const couponSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true, trim: true, uppercase: true },
 
-  // Cliente dueño del cupón (referido)
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
   ownerName: { type: String },
 
-  // Tipo de cupón
-  // 'referral'  → cupón de referido (cliente recomienda a otro)
-  // 'admin'     → cupón genérico creado por admin (uso ilimitado)
-  // 'loyalty'   → cupón de fidelización (1 uso, lo genera el sistema)
-  // 'product'   → descuento sobre una hamburguesa específica
+  // 'referral' | 'admin' | 'loyalty' | 'product'
   type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product'], default: 'referral' },
 
-  // ── Descuento ─────────────────────────────────────────────────────────────
-  // discountForUser: % de descuento que recibe quien usa el cupón
+  // Descuento para quien usa el cupón
   discountForUser: { type: Number, default: 10 },
-
-  // Producto específico al que aplica el descuento (null = todo el pedido)
   applicableProduct: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null },
-  applicableProductName: { type: String, default: null }, // cache legible
+  applicableProductName: { type: String, default: null },
 
-  // ── Recompensa para el dueño del cupón ────────────────────────────────────
-  rewardPerUse: { type: Number, default: 5 },
-  ownerPendingDiscount: { type: Number, default: 0 },
+  // ── Recompensa acumulable para el dueño ────────────────────────────────────
+  rewardPerUse: { type: Number, default: 5 },           // % que acumula por cada uso validado
+  ownerAccumulatedPercent: { type: Number, default: 0 }, // % acumulado esperando canje
+  ownerPendingDiscount: { type: Number, default: 0 },   // legacy / compatibilidad
+  ownerAvgTicket: { type: Number, default: 0 },          // tope dinámico = promedio de compra del dueño
+  ownerRedemptions: { type: Number, default: 0 },        // veces que ya canjeó
 
   // ── Historial de usos ─────────────────────────────────────────────────────
   uses: [{
@@ -33,21 +28,28 @@ const couponSchema = new mongoose.Schema({
     whatsapp: { type: String },
     order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
     orderNumber: { type: String },
+    orderTotal: { type: Number, default: 0 },
     discountApplied: { type: Number },
-    usedAt: { type: Date, default: Date.now }
+    // 'pending' = pedido hecho pero no entregado aún
+    // 'validated' = pedido entregado — ESTE es el que cuenta
+    status: { type: String, enum: ['pending', 'validated'], default: 'pending' },
+    usedAt: { type: Date, default: Date.now },
+    validatedAt: { type: Date, default: null }
   }],
-  totalUses: { type: Number, default: 0 },
+  totalUses: { type: Number, default: 0 },         // todos (pending + validated)
+  validatedUses: { type: Number, default: 0 },     // solo entregados
+
+  // ── Anti-fraude ───────────────────────────────────────────────────────────
+  blockedOwnerUse: { type: Boolean, default: true }, // bloquea que el dueño use su propio cupón
+  fraudFlags: [{ reason: String, flaggedAt: { type: Date, default: Date.now } }],
 
   // ── Opciones ──────────────────────────────────────────────────────────────
-  unlimited: { type: Boolean, default: false },
-  singleUse: { type: Boolean, default: false }, // 1 uso total en total
+  unlimited: { type: Boolean, default: true },
+  singleUse: { type: Boolean, default: false },
   active: { type: Boolean, default: true },
-
-  // Validez
   expiresAt: { type: Date, default: null }
 }, { timestamps: true });
 
-// Código siempre en mayúsculas
 couponSchema.pre('save', function(next) {
   this.code = this.code.toUpperCase();
   next();

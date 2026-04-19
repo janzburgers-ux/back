@@ -69,31 +69,24 @@ router.post('/validate', async (req, res) => {
       return res.status(400).json({ message: 'Este cupón está vencido' });
     }
 
+    // ── Anti-fraude: bloquear que el dueño use su propio cupón de referido ──
+    if (coupon.type === 'referral' && coupon.blockedOwnerUse !== false) {
+      const { isFraudAttempt } = require('../services/loyalty');
+      const fraud = await isFraudAttempt(coupon, whatsapp);
+      if (fraud) return res.status(400).json({ message: 'No podés usar tu propio cupón de referido' });
+    }
+
     if (!coupon.unlimited) {
-      // Buscar cliente por whatsapp
       const client = await Client.findOne({ whatsapp, active: true });
-
       if (client) {
-        // Verificar si ya tiene un pedido NO cancelado con este cupón
         const existingOrder = await Order.findOne({
-          coupon: coupon._id,
-          client: client._id,
-          status: { $ne: 'cancelled' }
+          coupon: coupon._id, client: client._id, status: { $ne: 'cancelled' }
         });
-        if (existingOrder) {
-          return res.status(400).json({ message: 'Ya usaste este cupón anteriormente' });
-        }
+        if (existingOrder) return res.status(400).json({ message: 'Ya usaste este cupón anteriormente' });
       }
-
-      // Cupón de uso único: verificar que no haya ningún pedido activo con él
       if (coupon.singleUse) {
-        const anyActiveOrder = await Order.findOne({
-          coupon: coupon._id,
-          status: { $ne: 'cancelled' }
-        });
-        if (anyActiveOrder) {
-          return res.status(400).json({ message: 'Este cupón ya fue utilizado' });
-        }
+        const anyActiveOrder = await Order.findOne({ coupon: coupon._id, status: { $ne: 'cancelled' } });
+        if (anyActiveOrder) return res.status(400).json({ message: 'Este cupón ya fue utilizado' });
       }
     }
 
@@ -105,7 +98,13 @@ router.post('/validate', async (req, res) => {
       message: `¡Cupón válido! Tenés ${coupon.discountForUser}% de descuento 🎉`
     };
 
-    // Si el cupón es de producto específico, informar al frontend
+    // Tope dinámico por ticket promedio del dueño
+    if (coupon.ownerAvgTicket > 0) {
+      response.maxDiscountAmount = Math.round(coupon.ownerAvgTicket * coupon.discountForUser / 100);
+      response.message += ` (tope: ${response.maxDiscountAmount.toLocaleString('es-AR')})`;
+    }
+
+    // Cupón de producto específico
     if (coupon.applicableProduct) {
       response.applicableProduct = {
         _id: coupon.applicableProduct._id,
@@ -249,6 +248,66 @@ router.post('/loyalty/award', auth, adminOnly, async (req, res) => {
     );
     if (!client) return res.status(404).json({ message: 'Cliente no encontrado' });
     res.json({ message: `${points} puntos acreditados a ${client.name}`, client });
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
+// ── POST canjear recompensa acumulada del dueño → genera cupón para él ────────
+router.post('/:id/redeem', auth, adminOnly, async (req, res) => {
+  try {
+    const { redeemReferralReward } = require('../services/loyalty');
+    const result = await redeemReferralReward(req.params.id);
+    res.json({ success: true, ...result });
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
+// ── POST enviar invitaciones de referido a clientes seleccionados ─────────────
+router.post('/send-referral-invitations', auth, adminOnly, async (req, res) => {
+  try {
+    const { clientIds, message } = req.body;
+    if (!clientIds?.length) return res.status(400).json({ message: 'Seleccioná al menos un cliente' });
+    if (!message?.trim())  return res.status(400).json({ message: 'El mensaje no puede estar vacío' });
+    const { sendReferralInvitations } = require('../services/loyalty');
+    const results = await sendReferralInvitations(clientIds, message);
+    const sent  = results.filter(r => r.status === 'enviado').length;
+    const failed = results.filter(r => r.status !== 'enviado').length;
+    res.json({ success: true, sent, failed, results });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST crear cupón de referido con cálculo de ticket promedio ───────────────
+// Versión enriquecida: calcula ownerAvgTicket automáticamente
+router.post('/referral', auth, adminOnly, async (req, res) => {
+  try {
+    const { ownerId, discountForUser, rewardPerUse, expiresAt } = req.body;
+    const owner = await Client.findById(ownerId);
+    if (!owner) return res.status(404).json({ message: 'Cliente no encontrado' });
+
+    const { calcOwnerAvgTicket } = require('../services/loyalty');
+    const avgTicket = await calcOwnerAvgTicket(ownerId);
+
+    // Generar código automático si no se pasa
+    const firstName = owner.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
+    const suffix = Math.floor(Math.random() * 900) + 100;
+    const code = `REF-${firstName}-${suffix}`;
+
+    const existing = await Coupon.findOne({ code });
+    if (existing) return res.status(400).json({ message: 'Código ya existe, intentá de nuevo' });
+
+    const coupon = new Coupon({
+      code,
+      owner: owner._id,
+      ownerName: owner.name,
+      type: 'referral',
+      discountForUser: discountForUser || 10,
+      rewardPerUse: rewardPerUse || 5,
+      ownerAvgTicket: avgTicket,
+      unlimited: true,
+      blockedOwnerUse: true,
+      active: true,
+      expiresAt: expiresAt || null
+    });
+    await coupon.save();
+    res.status(201).json({ coupon, ownerAvgTicket: avgTicket });
   } catch (err) { res.status(400).json({ message: err.message }); }
 });
 

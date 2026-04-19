@@ -7,7 +7,7 @@ const { auth, kitchenOrAdmin, adminOnly } = require('../middleware/auth');
 const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateProductAvailability } = require('../services/stock.service');
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
-const { addPointsForOrder, notifyReferralOwner, getReferralConfig } = require('../services/loyalty');
+const { addPointsForOrder, getReferralConfig, registerReferralUse, validateReferralUse, isFraudAttempt } = require('../services/loyalty');
 const { addProdePointsForOrder } = require('../services/prode.service');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -365,39 +365,40 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         order.whatsappSent = whatsappResult.success;
       }
 
-      // Registrar uso del cupón SOLO en confirmación
+      // Registrar uso del cupón al confirmar (estado: pending)
+      // Para referidos: la recompensa al dueño se acumula SOLO al entregar (validated)
       if (order.coupon) {
         const Coupon = require('../models/Coupon');
         const coupon = await Coupon.findById(order.coupon);
         if (coupon) {
-          // Solo agregar si no estaba ya registrado (idempotente)
           const alreadyRecorded = coupon.uses.some(u => u.order?.toString() === order._id.toString());
           if (!alreadyRecorded) {
-            await Coupon.findByIdAndUpdate(coupon._id, {
-              $push: {
-                uses: {
-                  client: order.client._id,
-                  clientName: order.client.name,
-                  whatsapp: order.client.whatsapp,
-                  order: order._id,
-                  orderNumber: order.orderNumber,
-                  discountApplied: order.discountAmount,
-                  usedAt: new Date()
-                }
-              },
-              $inc: { totalUses: 1, ownerPendingDiscount: coupon.rewardPerUse || 0 }
-            });
+            if (coupon.type === 'referral') {
+              // Referidos: registrar como pending, la validación y recompensa van al entregar
+              await registerReferralUse(
+                coupon._id, order.client._id, order.client.name, order.client.whatsapp,
+                order._id, order.orderNumber, order.total, order.discountAmount
+              );
+            } else {
+              // Otros cupones (admin, loyalty, product): registrar directamente
+              await Coupon.findByIdAndUpdate(coupon._id, {
+                $push: {
+                  uses: {
+                    client: order.client._id, clientName: order.client.name,
+                    whatsapp: order.client.whatsapp, order: order._id,
+                    orderNumber: order.orderNumber, orderTotal: order.total,
+                    discountApplied: order.discountAmount, status: 'validated',
+                    usedAt: new Date(), validatedAt: new Date()
+                  }
+                },
+                $inc: { totalUses: 1, validatedUses: 1 }
+              });
+            }
           }
 
           // Cupón de 1 uso → desactivar
           if (coupon.type === 'loyalty' || coupon.singleUse) {
             await Coupon.findByIdAndUpdate(coupon._id, { active: false });
-          }
-
-          const referralCfg = await getReferralConfig();
-          if (referralCfg.enabled) {
-            notifyReferralOwner(coupon, order.client.name, order.total)
-              .catch(e => console.error('Error WA referido:', e.message));
           }
         }
       }
@@ -489,6 +490,13 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       await Client.findByIdAndUpdate(order.client._id, { $inc: { totalSpent: order.total } });
       addPointsForOrder(order.client._id, order.total)
         .catch(e => console.error('Error puntos fidelización:', e.message));
+
+      // ── Validar uso de cupón de referido → acumula recompensa al dueño ────
+      // Solo se acumula cuando el pedido es ENTREGADO (no al confirmar)
+      if (order.coupon) {
+        validateReferralUse(order._id)
+          .catch(e => console.error('Error validando referido:', e.message));
+      }
 
       // ── Solicitar reseña con delay (configurable desde Config) ────────────
       if (order.client?.whatsapp && order.publicCode) {

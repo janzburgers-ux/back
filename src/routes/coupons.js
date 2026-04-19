@@ -53,6 +53,38 @@ router.get('/loyalty/near-threshold', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// GET panel de referidos — cupones con % acumulado para canjear
+router.get('/referral/panel', auth, adminOnly, async (req, res) => {
+  try {
+    const referrals = await Coupon.find({ type: 'referral' })
+      .populate('owner', 'name whatsapp')
+      .sort({ ownerAccumulatedPercent: -1, updatedAt: -1 });
+
+    const data = referrals.map(c => ({
+      _id:               c._id,
+      code:              c.code,
+      active:            c.active,
+      ownerName:         c.ownerName,
+      ownerWhatsapp:     c.owner?.whatsapp || '',
+      ownerAvgTicket:    c.ownerAvgTicket || 0,
+      accumulatedPercent: c.ownerAccumulatedPercent || 0,
+      validatedUses:     c.validatedUses || 0,
+      totalUses:         c.totalUses || 0,
+      ownerRedemptions:  c.ownerRedemptions || 0,
+      rewardPerUse:      c.rewardPerUse || 0,
+      discountForUser:   c.discountForUser,
+      fraudFlags:        c.fraudFlags || [],
+      // Usos validados recientes (últimos 5)
+      recentUses: (c.uses || [])
+        .filter(u => u.status === 'validated')
+        .slice(-5)
+        .map(u => ({ clientName: u.clientName, orderTotal: u.orderTotal, validatedAt: u.validatedAt }))
+    }));
+
+    res.json(data);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // POST validar cupón (público - desde /pedido)
 router.post('/validate', async (req, res) => {
   try {

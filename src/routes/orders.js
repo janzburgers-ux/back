@@ -504,20 +504,29 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           try {
             const reviewCfg = await Config.findOne({ key: 'reviewSettings' });
             const settings  = reviewCfg?.value || {};
-            // sendMode: 'auto' (default) | 'manual'
-            // orderInterval: cada cuántos pedidos enviar (0 = todos, default 1)
+
             if (settings.enabled !== false && settings.sendMode !== 'manual') {
-              // ── Verificar intervalo de pedidos ────────────────────────────
-              const orderInterval = settings.orderInterval || 1;
-              let shouldSend = true;
-              if (orderInterval > 1) {
-                // Contar pedidos entregados de este cliente
-                const deliveredCount = await Order.countDocuments({
-                  client: order.client._id,
-                  status: 'delivered'
-                });
-                // El PRIMER pedido siempre envía; luego cada orderInterval pedidos
-                shouldSend = deliveredCount === 1 || (deliveredCount % orderInterval === 0);
+              const orderInterval    = settings.orderInterval || 1;
+              const reviewActivatedAt = settings.reviewActivatedAt ? new Date(settings.reviewActivatedAt) : null;
+
+              // ── Contar pedidos entregados DESDE LA ACTIVACIÓN del sistema ──
+              // Si reviewActivatedAt no está definido, contar todos los pedidos.
+              // El "primer pedido desde la activación" siempre envía.
+              // Luego cada orderInterval pedidos desde la activación.
+              const countFilter = {
+                client: order.client._id,
+                status: 'delivered',
+                ...(reviewActivatedAt ? { createdAt: { $gte: reviewActivatedAt } } : {})
+              };
+              const deliveredSinceActivation = await Order.countDocuments(countFilter);
+
+              let shouldSend = false;
+              if (deliveredSinceActivation === 1) {
+                // Primer pedido desde activación → siempre enviar
+                shouldSend = true;
+              } else if (orderInterval > 0 && deliveredSinceActivation > 1) {
+                // Luego: cada orderInterval pedidos
+                shouldSend = (deliveredSinceActivation % orderInterval === 0);
               }
 
               if (shouldSend) {
@@ -525,10 +534,8 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                 setTimeout(async () => {
                   try {
                     const Review = require('../models/Review');
-                    // Verificar que no se haya enviado ya el request para este pedido
                     const existing = await Review.findOne({ order: order._id });
                     if (!existing?.requestSent) {
-                      // Crear placeholder SIN completed:true para no bloquear el formulario
                       await Review.findOneAndUpdate(
                         { order: order._id },
                         {
@@ -539,9 +546,9 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                             client:         order.client._id,
                             clientName:     order.client.name,
                             clientWhatsapp: order.client.whatsapp,
-                            stars:          1,        // mínimo requerido por schema
+                            stars:          1,
                             requestSent:    true,
-                            completed:      false     // NO completada aún por el cliente
+                            completed:      false
                           }
                         },
                         { upsert: true, new: true }

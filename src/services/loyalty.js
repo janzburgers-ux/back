@@ -43,13 +43,24 @@ async function isFraudAttempt(coupon, clientWhatsapp) {
 }
 
 // ── Registrar uso PENDIENTE al hacer el pedido ─────────────────────────────────
-// Se llama cuando el nuevo cliente confirma el pedido (antes de entrega)
+// Se llama cuando el cliente confirma el pedido con el cupón
+// Solo registra si es la PRIMERA VEZ que ese cliente usa ese cupón específico
 async function registerReferralUse(couponId, clientId, clientName, clientWhatsapp, orderId, orderNumber, orderTotal, discountApplied) {
   const coupon = await Coupon.findById(couponId);
   if (!coupon || coupon.type !== 'referral') return;
 
   const alreadyRecorded = coupon.uses.some(u => u.order?.toString() === orderId.toString());
   if (alreadyRecorded) return;
+
+  // ── Verificar que sea la primera vez que este cliente usa ESTE cupón ───────
+  // (puede haber pedido antes sin cupón — eso está bien)
+  const usedBefore = coupon.uses.some(
+    u => u.client?.toString() === clientId.toString()
+  );
+  if (usedBefore) {
+    console.log(`[Referido] Cupón ${coupon.code}: cliente ${clientName} ya usó este cupón antes — no cuenta`);
+    return;
+  }
 
   await Coupon.findByIdAndUpdate(couponId, {
     $push: {

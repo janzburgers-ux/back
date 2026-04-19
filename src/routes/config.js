@@ -53,7 +53,9 @@ const DEFAULTS = {
     productName:      'Papas fritas',
     validDays:        30,
     waitMinutes:      10,
-    messageText:      ''
+    messageText:      '',
+    orderInterval:    5,            // cada cuántos pedidos enviar (desde activación)
+    reviewActivatedAt: null         // fecha en que se activó el sistema — null = no hay referencia
   },
   // Hamburguesa del día (promo con countdown)
   dailyDeal: {
@@ -335,6 +337,28 @@ async function recalcAllProducts() {
     });
   }
 }
+
+// ── PUT reviewSettings — auto-registra reviewActivatedAt cuando se activa ──────
+router.put('/reviewSettings', auth, adminOnly, async (req, res) => {
+  try {
+    const { value } = req.body;
+    const existing = await Config.findOne({ key: 'reviewSettings' });
+    const wasEnabled = existing?.value?.enabled ?? false;
+    const nowEnabled = value?.enabled ?? false;
+
+    // Si pasó de desactivado a activado → guardar timestamp de activación
+    if (!wasEnabled && nowEnabled && !value.reviewActivatedAt) {
+      value.reviewActivatedAt = new Date().toISOString();
+    }
+    // Si ya estaba activado, preservar el reviewActivatedAt original
+    if (wasEnabled && nowEnabled && existing?.value?.reviewActivatedAt && !value.reviewActivatedAt) {
+      value.reviewActivatedAt = existing.value.reviewActivatedAt;
+    }
+
+    await upsert('reviewSettings', value, 'Configuración de reseñas');
+    res.json({ key: 'reviewSettings', value });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 module.exports = router;
 module.exports.recalcAllProducts = recalcAllProducts;

@@ -20,10 +20,15 @@ async function getChurnConfig() {
 
 // ── Generar cupón de reactivación ─────────────────────────────────────────────
 async function generateReactivationCoupon(client, percent) {
-  const code = `HOLA-${client.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6)}-${Math.floor(Math.random() * 900) + 100}`;
+  // Código corto: VLV-XXX99 (3 letras random + 2 dígitos)
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+  const digits = '23456789';
+  const randChars = Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  const randDigits = Array.from({ length: 2 }, () => digits[Math.floor(Math.random() * digits.length)]).join('');
+  const code = `VLV-${randChars}${randDigits}`;
 
   // Verificar que no exista uno activo para este cliente
-  const existing = await Coupon.findOne({ owner: client._id, active: true, code: { $regex: 'VOLVISTE' } });
+  const existing = await Coupon.findOne({ owner: client._id, active: true, type: 'reactivation' });
   if (existing) return existing.code;
 
   const coupon = new Coupon({

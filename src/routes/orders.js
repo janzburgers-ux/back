@@ -410,6 +410,9 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
     // ── preparing ─────────────────────────────────────────────────────────────
     if (status === 'preparing' && prevStatus === 'confirmed') {
       order.preparingAt = new Date();
+      // cookingStartedAt es el inicio real de la cuenta regresiva:
+      // para pedidos programados se empieza a contar desde aquí
+      order.cookingStartedAt = new Date();
     }
 
     // ── ready ─────────────────────────────────────────────────────────────────

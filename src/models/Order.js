@@ -78,6 +78,7 @@ const orderSchema = new mongoose.Schema({
   receivedAt: { type: Date },
   confirmedAt: { type: Date },
   preparingAt: { type: Date },
+  cookingStartedAt: { type: Date },  // inicio real del timer (al pasar a preparing)
   readyAt: { type: Date },
   deliveredAt: { type: Date },
 

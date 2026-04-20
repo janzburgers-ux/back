@@ -1,11 +1,18 @@
 const { Order } = require('../models/Order');
 const { sendMessage } = require('./whatsapp');
 
-// Obtener resumen de caja para una fecha (default: hoy)
+// Obtener resumen de caja para una fecha (YYYY-MM-DD, default: hoy en AR)
 async function getDailySummary(date) {
-  const d = date ? new Date(date) : new Date();
-  const start = new Date(d); start.setHours(0, 0, 0, 0);
-  const end = new Date(d); end.setHours(23, 59, 59, 999);
+  let dateStr;
+  if (typeof date === 'string' && date.match(/^\d{4}-\d{2}-\d{2}$/)) {
+    dateStr = date;
+  } else {
+    const d = date ? new Date(date) : new Date();
+    const ar = new Date(d.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+    dateStr = `${ar.getFullYear()}-${String(ar.getMonth() + 1).padStart(2, '0')}-${String(ar.getDate()).padStart(2, '0')}`;
+  }
+  const start = new Date(dateStr + 'T00:00:00-03:00');
+  const end   = new Date(dateStr + 'T23:59:59.999-03:00');
 
   const orders = await Order.find({
     createdAt: { $gte: start, $lte: end },
@@ -28,7 +35,7 @@ async function getDailySummary(date) {
     : null;
 
   return {
-    date: d.toISOString().split('T')[0],
+    date: dateStr,
     orders: { total: orders.length, delivered: delivered.length, pending: pending.length },
     revenue: { efectivo, transferencia, total: totalRevenue },
     avgDeliveryTime,
@@ -44,16 +51,20 @@ async function getDailySummary(date) {
   };
 }
 
-// Resumen semanal (últimos 7 días operativos)
+// Resumen semanal (últimos 7 días en timezone Argentina)
 async function getWeeklySummary() {
   const days = [];
   for (let i = 6; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    days.push(d);
+    // Usar timezone Argentina para no confundir días cerca de medianoche UTC
+    const arNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+    arNow.setDate(arNow.getDate() - i);
+    const y = arNow.getFullYear();
+    const m = String(arNow.getMonth() + 1).padStart(2, '0');
+    const d = String(arNow.getDate()).padStart(2, '0');
+    days.push(`${y}-${m}-${d}`);
   }
 
-  const summaries = await Promise.all(days.map(d => getDailySummary(d)));
+  const summaries = await Promise.all(days.map(dateStr => getDailySummary(dateStr)));
   return summaries;
 }
 

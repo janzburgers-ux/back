@@ -317,10 +317,12 @@ router.post('/referral', auth, adminOnly, async (req, res) => {
     const { calcOwnerAvgTicket } = require('../services/loyalty');
     const avgTicket = await calcOwnerAvgTicket(ownerId);
 
-    // Generar código automático si no se pasa
-    const firstName = owner.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
-    const suffix = Math.floor(Math.random() * 900) + 100;
-    const code = `REF-${firstName}-${suffix}`;
+    // Generar código corto automático: REF-XXX99 (3 letras + 2 dígitos)
+    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+    const digits = '23456789';
+    const randChars = Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+    const randDigits = Array.from({ length: 2 }, () => digits[Math.floor(Math.random() * digits.length)]).join('');
+    const code = `RF-${randChars}${randDigits}`;
 
     const existing = await Coupon.findOne({ code });
     if (existing) return res.status(400).json({ message: 'Código ya existe, intentá de nuevo' });

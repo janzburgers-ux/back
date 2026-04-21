@@ -20,12 +20,8 @@ async function getChurnConfig() {
 
 // ── Generar cupón de reactivación ─────────────────────────────────────────────
 async function generateReactivationCoupon(client, percent) {
-  // Código corto: VLV-XXX99 (3 letras random + 2 dígitos)
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ';
-  const digits = '23456789';
-  const randChars = Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  const randDigits = Array.from({ length: 2 }, () => digits[Math.floor(Math.random() * digits.length)]).join('');
-  const code = `VLV-${randChars}${randDigits}`;
+  const { generateCouponCode } = require('../services/loyalty');
+  const code = generateCouponCode(client.nickname || client.name?.split(' ')[0] || 'CLI');
 
   // Verificar que no exista uno activo para este cliente
   const existing = await Coupon.findOne({ owner: client._id, active: true, type: 'reactivation' });
@@ -100,10 +96,10 @@ async function runChurnAlertJob(manual = false) {
       }
 
       const msg = buildMessage(config.message, {
-        nombre: client.name.split(' ')[0],
-        codigo: couponCode,
-        descuento,
-        dias: Math.round(risk.daysSince)
+        nombre:   client.nickname || client.name.split(' ')[0],
+        codigo:   couponCode,
+        descuento: descuento,
+        dias:     Math.round(risk.daysSince)
       });
 
       const result = await sendMessage(client.whatsapp, msg);

@@ -7,7 +7,7 @@ const couponSchema = new mongoose.Schema({
   ownerName: { type: String },
 
   // 'referral' | 'admin' | 'loyalty' | 'product'
-  type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product'], default: 'referral' },
+  type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product', 'reactivation', 'birthday'], default: 'referral' },
 
   // Descuento para quien usa el cupón
   discountForUser: { type: Number, default: 10 },

@@ -314,33 +314,47 @@ router.post('/referral', auth, adminOnly, async (req, res) => {
     const owner = await Client.findById(ownerId);
     if (!owner) return res.status(404).json({ message: 'Cliente no encontrado' });
 
-    const { calcOwnerAvgTicket } = require('../services/loyalty');
+    const { calcOwnerAvgTicket, generateCouponCode, friendlyName } = require('../services/loyalty');
     const avgTicket = await calcOwnerAvgTicket(ownerId);
 
-    // Generar código corto automático: REF-XXX99 (3 letras + 2 dígitos)
-    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ';
-    const digits = '23456789';
-    const randChars = Array.from({ length: 3 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-    const randDigits = Array.from({ length: 2 }, () => digits[Math.floor(Math.random() * digits.length)]).join('');
-    const code = `RF-${randChars}${randDigits}`;
+    // Código unificado JB-APODO-X9
+    const code = generateCouponCode(owner.nickname || owner.name?.split(' ')[0] || 'CLI');
 
     const existing = await Coupon.findOne({ code });
     if (existing) return res.status(400).json({ message: 'Código ya existe, intentá de nuevo' });
 
     const coupon = new Coupon({
       code,
-      owner: owner._id,
-      ownerName: owner.name,
-      type: 'referral',
+      owner:           owner._id,
+      ownerName:       owner.name,
+      type:            'referral',
       discountForUser: discountForUser || 10,
-      rewardPerUse: rewardPerUse || 5,
-      ownerAvgTicket: avgTicket,
-      unlimited: true,
+      rewardPerUse:    rewardPerUse || 5,
+      ownerAvgTicket:  avgTicket,
+      unlimited:       true,
       blockedOwnerUse: true,
-      active: true,
-      expiresAt: expiresAt || null
+      active:          true,
+      expiresAt:       expiresAt || null
     });
     await coupon.save();
+
+    // ── WA automático al cliente con su código ─────────────────────────────────
+    if (owner.whatsapp) {
+      const { sendMessage } = require('../services/whatsapp');
+      const friendly = friendlyName(owner);
+      const disc     = discountForUser || 10;
+      const reward   = rewardPerUse   || 5;
+      const msg =
+        `🎉 ¡Hola ${friendly}! Ya sos parte del sistema de referidos de *Janz Burgers* 🍔\n\n` +
+        `Tu código personal es: *${code}*\n\n` +
+        `📤 Compartilo con quien quieras. Cada amigo que lo use tiene un *${disc}% de descuento en su compra*.\n\n` +
+        `🏆 Vos acumulás *${reward}%* de descuento por cada pedido válido de tus referidos.\n\n` +
+        `Cuando acumulés suficiente te avisamos y generamos tu cupón de recompensa. 🎁\n\n` +
+        `_Janz Burgers_ 🔥`;
+      sendMessage(owner.whatsapp, msg)
+        .catch(e => console.error('WA referido creado:', e.message));
+    }
+
     res.status(201).json({ coupon, ownerAvgTicket: avgTicket });
   } catch (err) { res.status(400).json({ message: err.message }); }
 });

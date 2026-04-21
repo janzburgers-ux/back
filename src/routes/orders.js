@@ -15,6 +15,11 @@ function nowAR() {
   return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
 }
 
+// Nombre amistoso: usa apodo si existe, sino primera palabra del nombre completo
+function friendlyName(client) {
+  return client?.nickname || client?.name?.split(' ')[0] || 'Cliente';
+}
+
 async function isOpen() {
   try {
     const cfg = await Config.findOne({ key: 'schedule' });
@@ -294,7 +299,7 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
     await Client.findByIdAndUpdate(client._id, { $inc: { totalOrders: 1 } });
 
     if (client.whatsapp) {
-      sendOrderReceived(client.whatsapp, order.orderNumber, client.name, order.publicCode)
+      sendOrderReceived(client.whatsapp, order.orderNumber, friendlyName(client), order.publicCode)
         .catch(err => console.error('Error WA received:', err.message));
     }
 
@@ -352,7 +357,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         whatsappResult = await sendOrderConfirmation(
           order.client.whatsapp,
           order.orderNumber,
-          order.client.name,
+          friendlyName(order.client),
           order.total,
           order.items,
           order.paymentMethod,
@@ -376,7 +381,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
             if (coupon.type === 'referral') {
               // Referidos: registrar como pending, la validación y recompensa van al entregar
               await registerReferralUse(
-                coupon._id, order.client._id, order.client.name, order.client.whatsapp,
+                coupon._id, order.client._id, friendlyName(order.client), order.client.whatsapp,
                 order._id, order.orderNumber, order.total, order.discountAmount
               );
             } else {
@@ -384,7 +389,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
               await Coupon.findByIdAndUpdate(coupon._id, {
                 $push: {
                   uses: {
-                    client: order.client._id, clientName: order.client.name,
+                    client: order.client._id, clientName: friendlyName(order.client),
                     whatsapp: order.client.whatsapp, order: order._id,
                     orderNumber: order.orderNumber, orderTotal: order.total,
                     discountApplied: order.discountAmount, status: 'validated',
@@ -420,7 +425,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       order.readyAt = new Date();
       if (order.client?.whatsapp) {
         sendOrderReady(
-          order.client.whatsapp, order.orderNumber, order.client.name,
+          order.client.whatsapp, order.orderNumber, friendlyName(order.client),
           order.deliveryType, order.total, order.paymentMethod, alias, order.publicCode
         ).catch(err => console.error('Error WA ready:', err.message));
       }
@@ -478,7 +483,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       } catch (e) { console.error('Error guardando rechazo:', e.message); }
 
       if (order.client?.whatsapp) {
-        sendOrderCancelled(order.client.whatsapp, order.client.name, order.publicCode, order.orderNumber)
+        sendOrderCancelled(order.client.whatsapp, friendlyName(order.client), order.publicCode, order.orderNumber)
           .catch(err => console.error('Error WA cancelado:', err.message));
       }
 
@@ -547,7 +552,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                             orderNumber:    order.orderNumber,
                             publicCode:     order.publicCode,
                             client:         order.client._id,
-                            clientName:     order.client.name,
+                            clientName:     friendlyName(order.client),
                             clientWhatsapp: order.client.whatsapp,
                             stars:          1,
                             requestSent:    true,
@@ -556,7 +561,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
                         },
                         { upsert: true, new: true }
                       );
-                      await sendReviewRequest(order.client.whatsapp, order.client.name, order.publicCode);
+                      await sendReviewRequest(order.client.whatsapp, friendlyName(order.client), order.publicCode);
                       await Review.findOneAndUpdate({ order: order._id }, { requestSent: true });
                     }
                   } catch (e) { console.error('Error enviando request de reseña:', e.message); }

@@ -2,6 +2,30 @@ const Config = require('../models/Config');
 const Coupon = require('../models/Coupon');
 const { Client, Order } = require('../models/Order');
 
+// ── Generar código de cupón unificado JB-APODO-X9 ─────────────────────────────
+// Min: las letras del apodo (sin relleno). Max: 8 chars. Sufijo: 1 letra + 1 dígito
+function generateCouponCode(nickname) {
+  const CHARS  = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+  const DIGITS = '23456789';
+  const slug = (nickname || 'CLI')
+    .toUpperCase()
+    .replace(/[^A-Z]/g, '')
+    .slice(0, 8);
+  const suffix =
+    CHARS[Math.floor(Math.random() * CHARS.length)] +
+    DIGITS[Math.floor(Math.random() * DIGITS.length)];
+  return `JB-${slug}-${suffix}`;
+}
+// "Gianfra"    → JB-GIANFRA-K7
+// "Sol"        → JB-SOL-M3
+// "Ro"         → JB-RO-A8
+// "Maximiliano"→ JB-MAXIMILI-K7
+
+// ── Nombre amistoso ───────────────────────────────────────────────────────────
+function friendlyName(client) {
+  return client?.nickname || client?.name?.split(' ')[0] || 'Cliente';
+}
+
 // ── Config helpers ─────────────────────────────────────────────────────────────
 async function getLoyaltyConfig() {
   const cfg = await Config.findOne({ key: 'loyalty' });
@@ -12,13 +36,13 @@ async function getReferralConfig() {
   const cfg = await Config.findOne({ key: 'loyalty' });
   const loyalty = cfg?.value || {};
   return {
-    enabled:          loyalty.referralEnabled      ?? false,
-    rewardPercent:    loyalty.referralRewardPercent ?? 5,
-    discountForNew:   loyalty.referralDiscountForNew ?? 10,
+    enabled:        loyalty.referralEnabled       ?? false,
+    rewardPercent:  loyalty.referralRewardPercent ?? 5,
+    discountForNew: loyalty.referralDiscountForNew ?? 10,
   };
 }
 
-// ── Calcular ticket promedio del dueño del cupón ────────────────────────────────
+// ── Calcular ticket promedio del dueño del cupón ───────────────────────────────
 async function calcOwnerAvgTicket(clientId) {
   const orders = await Order.find({ client: clientId, status: 'delivered' }).select('total');
   if (!orders.length) return 0;
@@ -31,9 +55,7 @@ async function isFraudAttempt(coupon, clientWhatsapp) {
   if (!coupon.blockedOwnerUse) return false;
   const owner = await Client.findById(coupon.owner).select('whatsapp');
   if (!owner) return false;
-  // Mismo whatsapp = el dueño intentó usar su propio cupón
   if (owner.whatsapp && clientWhatsapp && owner.whatsapp === clientWhatsapp) {
-    // Registrar intento
     await Coupon.findByIdAndUpdate(coupon._id, {
       $push: { fraudFlags: { reason: `Dueño intentó usar su propio cupón (WA: ${clientWhatsapp})` } }
     });
@@ -43,8 +65,6 @@ async function isFraudAttempt(coupon, clientWhatsapp) {
 }
 
 // ── Registrar uso PENDIENTE al hacer el pedido ─────────────────────────────────
-// Se llama cuando el cliente confirma el pedido con el cupón
-// Solo registra si es la PRIMERA VEZ que ese cliente usa ese cupón específico
 async function registerReferralUse(couponId, clientId, clientName, clientWhatsapp, orderId, orderNumber, orderTotal, discountApplied) {
   const coupon = await Coupon.findById(couponId);
   if (!coupon || coupon.type !== 'referral') return;
@@ -52,11 +72,7 @@ async function registerReferralUse(couponId, clientId, clientName, clientWhatsap
   const alreadyRecorded = coupon.uses.some(u => u.order?.toString() === orderId.toString());
   if (alreadyRecorded) return;
 
-  // ── Verificar que sea la primera vez que este cliente usa ESTE cupón ───────
-  // (puede haber pedido antes sin cupón — eso está bien)
-  const usedBefore = coupon.uses.some(
-    u => u.client?.toString() === clientId.toString()
-  );
+  const usedBefore = coupon.uses.some(u => u.client?.toString() === clientId.toString());
   if (usedBefore) {
     console.log(`[Referido] Cupón ${coupon.code}: cliente ${clientName} ya usó este cupón antes — no cuenta`);
     return;
@@ -65,15 +81,9 @@ async function registerReferralUse(couponId, clientId, clientName, clientWhatsap
   await Coupon.findByIdAndUpdate(couponId, {
     $push: {
       uses: {
-        client:        clientId,
-        clientName,
-        whatsapp:      clientWhatsapp,
-        order:         orderId,
-        orderNumber,
-        orderTotal,
-        discountApplied,
-        status:        'pending',
-        usedAt:        new Date()
+        client: clientId, clientName, whatsapp: clientWhatsapp,
+        order: orderId, orderNumber, orderTotal, discountApplied,
+        status: 'pending', usedAt: new Date()
       }
     },
     $inc: { totalUses: 1 }
@@ -81,8 +91,6 @@ async function registerReferralUse(couponId, clientId, clientName, clientWhatsap
 }
 
 // ── Validar uso al entregar el pedido ─────────────────────────────────────────
-// Se llama cuando el pedido pasa a 'delivered'
-// Aquí es donde realmente se acumula la recompensa del dueño
 async function validateReferralUse(orderId) {
   const coupon = await Coupon.findOne({ 'uses.order': orderId, type: 'referral' });
   if (!coupon) return null;
@@ -90,62 +98,51 @@ async function validateReferralUse(orderId) {
   const useIndex = coupon.uses.findIndex(u => u.order?.toString() === orderId.toString());
   if (useIndex === -1) return null;
   const use = coupon.uses[useIndex];
-  if (use.status === 'validated') return null; // ya validado
+  if (use.status === 'validated') return null;
 
   const referralCfg = await getReferralConfig();
   const rewardPercent = coupon.rewardPerUse || referralCfg.rewardPercent || 5;
-
-  // Acumular % para el dueño
   const newAccumulated = (coupon.ownerAccumulatedPercent || 0) + rewardPercent;
 
-  // Actualizar el uso a 'validated' y acumular recompensa
   await Coupon.findOneAndUpdate(
     { _id: coupon._id, 'uses.order': orderId },
     {
-      $set: {
-        'uses.$.status':      'validated',
-        'uses.$.validatedAt': new Date()
-      },
-      $inc: {
-        validatedUses:          1,
-        ownerAccumulatedPercent: rewardPercent
-      }
+      $set: { 'uses.$.status': 'validated', 'uses.$.validatedAt': new Date() },
+      $inc: { validatedUses: 1, ownerAccumulatedPercent: rewardPercent }
     }
   );
 
-  // Notificar al dueño por WhatsApp
   const updatedCoupon = await Coupon.findById(coupon._id);
   await notifyReferralOwner(updatedCoupon, use.clientName, use.orderTotal, newAccumulated);
 
   return { rewardPercent, newAccumulated, coupon: updatedCoupon };
 }
 
-// ── Notificar al dueño cuando alguien usa su cupón y el pedido fue entregado ───
+// ── Notificar al dueño cuando alguien usa su cupón ───────────────────────────
 async function notifyReferralOwner(coupon, newClientName, orderTotal, newAccumulated) {
   const referralCfg = await getReferralConfig();
   if (!referralCfg.enabled) return;
 
   try {
-    const owner = await Client.findById(coupon.owner).select('name whatsapp');
+    const owner = await Client.findById(coupon.owner).select('name nickname whatsapp');
     if (!owner?.whatsapp) return;
 
     const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
+    const friendly = friendlyName(owner);
     const rewardPercent = coupon.rewardPerUse || referralCfg.rewardPercent;
     const avgTicket = coupon.ownerAvgTicket || 0;
     const maxDiscount = avgTicket > 0 ? fmt(avgTicket) : 'tu promedio de compra';
-
-    // Cuántos usos válidos lleva (para mostrar progreso)
     const validUses = coupon.validatedUses || 0;
 
     const msg =
-      `🌟 ¡Buenas noticias ${owner.name}!\n\n` +
+      `🌟 ¡Buenas noticias ${friendly}!\n\n` +
       `*${newClientName}* acaba de recibir su pedido usando tu código *${coupon.code}*. ✅\n\n` +
       `📈 Acumulaste *+${rewardPercent}%* de descuento.\n` +
       `💰 Total acumulado: *${newAccumulated}%* (${validUses} uso${validUses !== 1 ? 's' : ''} válido${validUses !== 1 ? 's' : ''})\n\n` +
       (avgTicket > 0 ? `🔒 Tu cupón tiene un tope de *${maxDiscount}* (tu ticket promedio).\n\n` : '') +
       `¿Qué querés hacer?\n` +
       `👉 *Seguir acumulando* — no hagas nada, seguimos contando\n` +
-      `👉 *Canjear ahora* — respondé *CANJEAR* y te mandamos el cupón\n\n` +
+      `👉 *Canjear ahora* — avisanos y te mandamos el cupón\n\n` +
       `_Janz Burgers_ 🍔`;
 
     await sendWA(owner.whatsapp, msg);
@@ -154,7 +151,7 @@ async function notifyReferralOwner(coupon, newClientName, orderTotal, newAccumul
   }
 }
 
-// ── Canjear recompensa acumulada → generar cupón para el dueño ─────────────────
+// ── Canjear recompensa acumulada → generar cupón para el dueño ────────────────
 async function redeemReferralReward(couponId) {
   const coupon = await Coupon.findById(couponId).populate('owner');
   if (!coupon) throw new Error('Cupón no encontrado');
@@ -163,43 +160,37 @@ async function redeemReferralReward(couponId) {
   }
 
   const owner = coupon.owner;
-  const discountPercent = Math.min(coupon.ownerAccumulatedPercent, 100); // máximo 100%
+  const discountPercent = Math.min(coupon.ownerAccumulatedPercent, 100);
   const avgTicket = coupon.ownerAvgTicket || (await calcOwnerAvgTicket(owner._id));
-  const maxAmountCap = avgTicket; // tope = promedio de compra del dueño
+  const maxAmountCap = avgTicket;
+  const friendly = friendlyName(owner);
 
-  // Generar código único para el cupón de recompensa
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  const suffix = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  const rewardCode = `REF-${owner.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '').slice(0, 6)}-${suffix}`;
+  const rewardCode = generateCouponCode(owner.nickname || owner.name?.split(' ')[0] || 'CLI');
 
-  // Crear el cupón de recompensa (es de uso único para el dueño)
   const rewardCoupon = new Coupon({
-    code:           rewardCode,
-    owner:          owner._id,
-    ownerName:      owner.name,
-    type:           'loyalty',
+    code:            rewardCode,
+    owner:           owner._id,
+    ownerName:       owner.name,
+    type:            'loyalty',
     discountForUser: discountPercent,
-    // Si tiene tope, guardar info como nota (el tope se aplica en el checkout)
-    ownerAvgTicket: maxAmountCap,
-    rewardPerUse:   0,
-    unlimited:      false,
-    singleUse:      true,
-    active:         true,
-    expiresAt:      new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 días
+    ownerAvgTicket:  maxAmountCap,
+    rewardPerUse:    0,
+    unlimited:       false,
+    singleUse:       true,
+    active:          true,
+    expiresAt:       new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   });
   await rewardCoupon.save();
 
-  // Resetear contador del cupón de referido
   await Coupon.findByIdAndUpdate(couponId, {
-    $set:  { ownerAccumulatedPercent: 0 },
-    $inc:  { ownerRedemptions: 1 }
+    $set: { ownerAccumulatedPercent: 0 },
+    $inc: { ownerRedemptions: 1 }
   });
 
-  // Notificar al dueño con el código
   if (owner.whatsapp) {
     const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
     const msg =
-      `🎉 ¡Aquí está tu recompensa ${owner.name}!\n\n` +
+      `🎉 ¡Aquí está tu recompensa ${friendly}!\n\n` +
       `Generamos tu cupón de *${discountPercent}% de descuento*.\n` +
       (maxAmountCap > 0 ? `🔒 Tope máximo: *${fmt(maxAmountCap)}* de descuento.\n` : '') +
       `\n🎟️ Tu código: *${rewardCode}*\n\n` +
@@ -212,19 +203,19 @@ async function redeemReferralReward(couponId) {
   return { rewardCode, discountPercent, maxAmountCap };
 }
 
-// ── WhatsApp a múltiples clientes seleccionados ────────────────────────────────
+// ── WA a múltiples clientes (invitaciones referido) ───────────────────────────
 async function sendReferralInvitations(clientIds, message) {
-  const clients = await Client.find({ _id: { $in: clientIds }, active: true }).select('name whatsapp');
+  const clients = await Client.find({ _id: { $in: clientIds }, active: true }).select('name nickname whatsapp');
   const results = [];
   for (const client of clients) {
     if (!client.whatsapp) { results.push({ name: client.name, status: 'sin_whatsapp' }); continue; }
     try {
-      await sendWA(client.whatsapp, message.replace('{nombre}', client.name));
+      const msg = message.replace('{nombre}', friendlyName(client));
+      await sendWA(client.whatsapp, msg);
       results.push({ name: client.name, status: 'enviado' });
     } catch (e) {
       results.push({ name: client.name, status: 'error', error: e.message });
     }
-    // Pequeño delay para no saturar WhatsApp
     await new Promise(r => setTimeout(r, 800));
   }
   return results;
@@ -254,14 +245,32 @@ async function addPointsForOrder(clientId, orderTotal) {
 
 async function generateLoyaltyCoupon(client, loyalty) {
   try {
-    const code = `JANZ-${client.name.split(' ')[0].toUpperCase().replace(/[^A-Z]/g, '')}-${Math.floor(Math.random() * 900) + 100}`;
+    const code = generateCouponCode(client.nickname || client.name?.split(' ')[0] || 'CLI');
     const existing = await Coupon.findOne({ code });
     if (existing) return { couponGenerated: false };
-    const coupon = new Coupon({ code, owner: client._id, ownerName: client.name, discountForUser: loyalty.couponPercent, rewardPerUse: 0, type: 'loyalty' });
+
+    const coupon = new Coupon({
+      code,
+      owner:           client._id,
+      ownerName:       client.name,
+      discountForUser: loyalty.couponPercent,
+      rewardPerUse:    0,
+      type:            'loyalty',
+      unlimited:       false,
+      singleUse:       true,
+      active:          true,
+    });
     await coupon.save();
     await Client.findByIdAndUpdate(client._id, { $inc: { loyaltyPoints: -loyalty.redeemThreshold } });
+
+    const friendly = friendlyName(client);
     if (client.whatsapp) {
-      const msg = `🎉 ¡Felicitaciones ${client.name}!\n\nAcumulaste suficientes puntos y ganaste un cupón de *${loyalty.couponPercent}% de descuento*.\n\nTu código: *${code}*\n\nUsalo en tu próximo pedido. ¡Gracias por elegirnos! 🍔\n\n_Janz Burgers_ 🔥`;
+      const msg =
+        `🎉 ¡Felicitaciones ${friendly}!\n\n` +
+        `Acumulaste suficientes puntos y ganaste un cupón de *${loyalty.couponPercent}% de descuento*.\n\n` +
+        `🎟️ Tu código: *${code}*\n\n` +
+        `Usalo en tu próximo pedido. ¡Gracias por elegirnos! 🍔\n\n` +
+        `_Janz Burgers_ 🔥`;
       sendWA(client.whatsapp, msg).catch(e => console.error('WA fidelización:', e.message));
     }
     return { couponGenerated: true, couponCode: code };
@@ -278,6 +287,8 @@ async function getClientsNearThreshold() {
 }
 
 module.exports = {
+  generateCouponCode,
+  friendlyName,
   getLoyaltyConfig, getReferralConfig,
   addPointsForOrder,
   calcOwnerAvgTicket, isFraudAttempt,

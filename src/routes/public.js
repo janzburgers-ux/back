@@ -4,9 +4,10 @@ const { Product } = require('../models/Product');
 const { Client, Order } = require('../models/Order');
 const Additional = require('../models/Additional');
 const Config = require('../models/Config');
-const { sendOrderReceived } = require('../services/whatsapp');
+const { sendOrderReceived, sendMessage } = require('../services/whatsapp');
 const Review = require('../models/Review');
 const Coupon = require('../models/Coupon');
+const PinVerification = require('../models/PinVerification');
 const { calcPackagingCost, deductStockForOrder, autoUpdateProductAvailability } = require('../services/stock.service');
 const { estimateWaitTime } = require('../services/kitchen-capacity');
 
@@ -43,6 +44,106 @@ async function isOpen() {
     return [5, 6, 0].includes(nowAR().getDay());
   }
 }
+
+// ── Helper: nombre amistoso (nickname con fallback) ───────────────────────────
+function friendlyName(client) {
+  return client.nickname || client.name?.split(' ')[0] || 'Cliente';
+}
+
+// ── GET /api/public/client?wa=XXXX — lookup por WhatsApp ─────────────────────
+// Solo devuelve datos necesarios para el form, sin info sensible de negocio
+router.get('/client', async (req, res) => {
+  try {
+    const { wa } = req.query;
+    if (!wa) return res.status(400).json({ message: 'WhatsApp requerido' });
+
+    const client = await Client.findOne({ whatsapp: wa.replace(/\D/g, ''), active: true })
+      .select('name nickname address floor neighborhood references birthDay birthMonth birthSkipped');
+
+    if (!client) return res.json({ found: false });
+
+    res.json({
+      found:        true,
+      name:         client.name || '',
+      nickname:     client.nickname || '',
+      address:      client.address || '',
+      floor:        client.floor || '',
+      neighborhood: client.neighborhood || '',
+      references:   client.references || '',
+      hasNickname:  !!client.nickname,
+      hasBirth:     !!(client.birthDay && client.birthMonth),
+      birthSkipped: !!client.birthSkipped
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST /api/public/send-pin — enviar PIN a cliente nuevo ───────────────────
+router.post('/send-pin', async (req, res) => {
+  try {
+    const { wa } = req.body;
+    if (!wa) return res.status(400).json({ message: 'WhatsApp requerido' });
+
+    const cleanWa = wa.replace(/\D/g, '');
+
+    // Generar PIN de 4 dígitos
+    const pin = String(Math.floor(1000 + Math.random() * 9000));
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutos
+
+    // Invalidar PINs previos del mismo WA
+    await PinVerification.deleteMany({ wa: cleanWa });
+
+    // Guardar nuevo PIN
+    await PinVerification.create({ wa: cleanWa, pin, expiresAt });
+
+    // Enviar WA
+    const msg = `🔐 Tu código de verificación *Janz Burgers* es:\n\n*${pin}*\n\nExpira en 10 minutos. No lo compartas con nadie.\n\n_Janz Burgers_ 🍔`;
+    await sendMessage(cleanWa, msg);
+
+    res.json({ sent: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST /api/public/verify-pin — verificar PIN ───────────────────────────────
+router.post('/verify-pin', async (req, res) => {
+  try {
+    const { wa, pin } = req.body;
+    if (!wa || !pin) return res.status(400).json({ message: 'WA y PIN requeridos' });
+
+    const cleanWa = wa.replace(/\D/g, '');
+    const record = await PinVerification.findOne({ wa: cleanWa, used: false });
+
+    if (!record) return res.status(400).json({ valid: false, message: 'PIN no encontrado o ya usado' });
+    if (new Date() > record.expiresAt) return res.status(400).json({ valid: false, message: 'PIN expirado. Solicitá uno nuevo.' });
+    if (record.pin !== String(pin)) return res.status(400).json({ valid: false, message: 'Código incorrecto' });
+
+    // Marcar como usado
+    await PinVerification.findByIdAndUpdate(record._id, { used: true });
+
+    res.json({ valid: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PATCH /api/public/client-update — actualizar nickname/cumple de cliente existente ──
+router.patch('/client-update', async (req, res) => {
+  try {
+    const { wa, nickname, birthDay, birthMonth, birthSkipped } = req.body;
+    if (!wa) return res.status(400).json({ message: 'WhatsApp requerido' });
+
+    const cleanWa = wa.replace(/\D/g, '');
+    const client = await Client.findOne({ whatsapp: cleanWa, active: true });
+    if (!client) return res.status(404).json({ message: 'Cliente no encontrado' });
+
+    if (nickname)            client.nickname     = nickname.trim();
+    if (birthDay)            client.birthDay     = Number(birthDay);
+    if (birthMonth)          client.birthMonth   = Number(birthMonth);
+    if (birthSkipped)        client.birthSkipped = true;
+    // Si dio cumple, asegurarse de que no quede skipped
+    if (birthDay && birthMonth) client.birthSkipped = false;
+
+    await client.save();
+    res.json({ success: true, nickname: client.nickname });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 // GET menú público
 router.get('/menu', async (req, res) => {
@@ -186,23 +287,33 @@ router.post('/order', async (req, res) => {
     let client = await Client.findOne({ whatsapp: clientData.whatsapp, active: true });
     if (!client) {
       client = new Client({
-        name: clientData.name,
-        phone: clientData.phone || clientData.whatsapp,
-        whatsapp: clientData.whatsapp,
-        address: clientData.address,
-        floor: clientData.floor,
+        name:         clientData.name,
+        nickname:     clientData.nickname?.trim() || '',
+        phone:        clientData.phone || clientData.whatsapp,
+        whatsapp:     clientData.whatsapp,
+        address:      clientData.address,
+        floor:        clientData.floor,
         neighborhood: clientData.neighborhood,
-        references: clientData.references,
-        notes: clientData.notes
+        references:   clientData.references,
+        notes:        clientData.notes,
+        birthDay:     clientData.birthDay     ? Number(clientData.birthDay)   : undefined,
+        birthMonth:   clientData.birthMonth   ? Number(clientData.birthMonth) : undefined,
+        birthSkipped: clientData.birthSkipped ? true                          : false,
       });
       await client.save();
     } else {
-      Object.assign(client, {
-        address: clientData.address || client.address,
-        floor: clientData.floor || client.floor,
-        neighborhood: clientData.neighborhood || client.neighborhood,
-        references: clientData.references || client.references
-      });
+      // Actualizar dirección siempre
+      if (clientData.address)      client.address      = clientData.address;
+      if (clientData.floor != null) client.floor        = clientData.floor;
+      if (clientData.neighborhood) client.neighborhood  = clientData.neighborhood;
+      if (clientData.references)   client.references    = clientData.references;
+      // Solo actualizar nickname si aún no tiene uno
+      if (clientData.nickname && !client.nickname) client.nickname = clientData.nickname.trim();
+      // Solo actualizar cumple si aún no tiene y el cliente lo dio
+      if (!client.birthDay && clientData.birthDay)   client.birthDay   = Number(clientData.birthDay);
+      if (!client.birthMonth && clientData.birthMonth) client.birthMonth = Number(clientData.birthMonth);
+      // Registrar si saltó el cumple (solo si no tiene ya un cumple registrado)
+      if (clientData.birthSkipped && !client.birthDay) client.birthSkipped = true;
       await client.save();
     }
 
@@ -348,7 +459,7 @@ router.post('/order', async (req, res) => {
 
     // WhatsApp mensaje 1
     if (client.whatsapp) {
-      sendOrderReceived(client.whatsapp, order.orderNumber, client.name, order.publicCode)
+      sendOrderReceived(client.whatsapp, order.orderNumber, friendlyName(client), order.publicCode)
         .catch(err => console.error('Error WA received:', err.message));
     }
 

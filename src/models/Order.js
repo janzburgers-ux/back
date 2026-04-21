@@ -11,6 +11,10 @@ const clientSchema = new mongoose.Schema({
   neighborhood: { type: String },
   references: { type: String },
   notes: { type: String },
+  nickname: { type: String, trim: true },          // apodo para mensajes WA
+  birthDay: { type: Number, min: 1, max: 31 },     // día de cumpleaños
+  birthMonth: { type: Number, min: 1, max: 12 },   // mes de cumpleaños
+  birthSkipped: { type: Boolean, default: false },  // eligió no dar cumple → no volver a preguntar
   totalOrders: { type: Number, default: 0 },
   totalSpent: { type: Number, default: 0 },
   loyaltyPoints: { type: Number, default: 0 },

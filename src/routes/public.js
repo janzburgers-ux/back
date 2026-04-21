@@ -243,6 +243,23 @@ router.post('/order', async (req, res) => {
       }
 
       if (couponDoc) {
+        // ── Cupón de referido: solo 1 uso por cliente ──────────────────────
+        // Chequeo independiente del flag unlimited — un cliente no puede usar
+        // el cupón de otro más de una vez, sin importar configuración.
+        if (couponDoc.type === 'referral') {
+          const clientForCheck = await Client.findOne({ whatsapp: clientData.whatsapp, active: true });
+          if (clientForCheck) {
+            const alreadyUsed = couponDoc.uses.some(
+              u => u.client?.toString() === clientForCheck._id.toString()
+            );
+            if (alreadyUsed) {
+              couponDoc = null; // bloquear silenciosamente (ya fue validado en /validate)
+            }
+          }
+        }
+      }
+
+      if (couponDoc) {
         // Verificar si ya fue usado por este cliente en algún pedido NO cancelado
         if (!couponDoc.unlimited) {
           const existingOrder = await Order.findOne({
@@ -525,7 +542,7 @@ router.get('/review/:publicCode', async (req, res) => {
 router.post('/review/:publicCode', async (req, res) => {
   try {
     const { Order: OrderModel, Client: ClientModel } = require('../models/Order');
-    const { stars, burgerRating, tempRating, onTime, comment } = req.body;
+    const { stars, burgerRating, tempRating, onTime, comment, npsScore } = req.body;
 
     if (!stars || stars < 1 || stars > 5) return res.status(400).json({ message: 'Calificación inválida' });
 
@@ -554,6 +571,7 @@ router.post('/review/:publicCode', async (req, res) => {
       tempRating:   tempRating   || '',
       onTime:       onTime != null ? Boolean(onTime) : null,
       comment:      comment       || '',
+      npsScore:     npsScore      ? Number(npsScore) : null,
       requestSent:  true,
       completed:    true  // marca que el cliente completó el formulario (diferencia del placeholder)
     };

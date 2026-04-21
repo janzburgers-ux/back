@@ -108,6 +108,21 @@ router.post('/validate', async (req, res) => {
       if (fraud) return res.status(400).json({ message: 'No podés usar tu propio cupón de referido' });
     }
 
+    // ── Cupón de referido: solo 1 uso por cliente (independiente de unlimited) ──
+    // La lógica de referidos es traer clientes NUEVOS; el mismo cliente no puede
+    // volver a beneficiarse del descuento de un cupón ajeno más de una vez.
+    if (coupon.type === 'referral') {
+      const client = await Client.findOne({ whatsapp, active: true });
+      if (client) {
+        const alreadyUsed = coupon.uses.some(
+          u => u.client?.toString() === client._id.toString()
+        );
+        if (alreadyUsed) {
+          return res.status(400).json({ message: 'Ya utilizaste este cupón anteriormente' });
+        }
+      }
+    }
+
     if (!coupon.unlimited) {
       const client = await Client.findOne({ whatsapp, active: true });
       if (client) {

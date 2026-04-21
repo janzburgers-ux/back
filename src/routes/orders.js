@@ -605,9 +605,32 @@ router.delete('/:id', auth, adminOnly, async (req, res) => {
     if (password !== deletePassword) {
       return res.status(401).json({ message: 'Contraseña incorrecta' });
     }
-    const order = await Order.findByIdAndDelete(req.params.id);
+
+    // Buscar antes de eliminar para poder deshacer efectos secundarios
+    const order = await Order.findById(req.params.id).populate('items.product');
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
-    res.json({ message: 'Pedido eliminado' });
+
+    // ── Devolver stock si el pedido lo había descontado ───────────────────────
+    // Cubre pedidos confirmed, preparing, ready y delivered
+    let stockReturned = false;
+    if (order.stockDeducted) {
+      try {
+        await returnStockForOrder(order.items);
+        stockReturned = true;
+        autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+      } catch (e) {
+        console.error('Error devolviendo stock al eliminar pedido:', e.message);
+        // No abortamos: el pedido se elimina igual, pero logueamos el problema
+      }
+    }
+
+    await Order.findByIdAndDelete(req.params.id);
+
+    res.json({
+      message: 'Pedido eliminado',
+      stockReturned,
+      orderStatus: order.status
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

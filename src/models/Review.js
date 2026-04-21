@@ -23,6 +23,9 @@ const reviewSchema = new mongoose.Schema({
   comment: { type: String, default: '' },
   photo:   { type: String, default: '' }, // URL de Cloudinary (opcional)
 
+  // NPS: ¿Cuánto recomendarías Janz a un amigo? (1-5)
+  npsScore: { type: Number, min: 1, max: 5, default: null },
+
   // Incentivo generado
   incentiveType:   { type: String, enum: ['discount', 'product', 'none'], default: 'none' },
   couponGenerated: { type: String, default: null }, // código del cupón

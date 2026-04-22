@@ -158,6 +158,46 @@ router.put('/:id', auth, adminOnly, async (req, res) => {
   }
 });
 
+// PATCH marcar como hamburguesa del día
+router.patch('/:id/daily', auth, adminOnly, async (req, res) => {
+  try {
+    const { isDailyBurger, dailyDiscountPrice, dailyFromHour, dailyToHour } = req.body;
+
+    // Si se activa, desactivar cualquier otra que estuviera como del día
+    if (isDailyBurger) {
+      await Product.updateMany({ isDailyBurger: true }, { $set: { isDailyBurger: false } });
+    }
+
+    const updated = await Product.findByIdAndUpdate(
+      req.params.id,
+      { isDailyBurger: !!isDailyBurger, dailyDiscountPrice: dailyDiscountPrice || 0, dailyFromHour: dailyFromHour || '', dailyToHour: dailyToHour || '' },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json(updated);
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
+// PATCH marcar como hamburguesa del mes
+router.patch('/:id/monthly', auth, adminOnly, async (req, res) => {
+  try {
+    const { isMonthlyBurger, monthlyLabel } = req.body;
+
+    // Si se activa, desactivar cualquier otra que estuviera como del mes
+    if (isMonthlyBurger) {
+      await Product.updateMany({ isMonthlyBurger: true }, { $set: { isMonthlyBurger: false } });
+    }
+
+    const updated = await Product.findByIdAndUpdate(
+      req.params.id,
+      { isMonthlyBurger: !!isMonthlyBurger, monthlyLabel: monthlyLabel || '' },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json(updated);
+  } catch (err) { res.status(400).json({ message: err.message }); }
+});
+
 // DELETE product (soft-delete: active: false)
 // También llama a autoUpdateProductAvailability para que el stock
 // no quede desalineado con productos que ya no existen en el menú.

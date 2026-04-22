@@ -175,29 +175,55 @@ router.get('/menu', async (req, res) => {
         _id: p._id, name: p.name, variant: p.variant,
         salePrice: p.salePrice, available: p.available,
         image: p.image, description: p.description,
-        productType: p.productType || 'burger'
+        productType: p.productType || 'burger',
+        isDailyBurger:   !!p.isDailyBurger,
+        isMonthlyBurger: !!p.isMonthlyBurger
       });
       return acc;
     }, {});
 
-    // ── Hamburguesa del día y del mes ──────────────────────────────────────
-    const dailyDealCfg  = await Config.findOne({ key: 'dailyDeal' });
-    const monthlyBurgerCfg = await Config.findOne({ key: 'monthlyBurger' });
-    const dailyDeal     = dailyDealCfg?.value  || { enabled: false };
-    const monthlyBurger = monthlyBurgerCfg?.value || { enabled: false };
+    // ── Hamburguesa del día y del mes (desde campos del producto) ──────────
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+    const nowStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-    // Verificar si el deal diario está vigente
+    // Hamburguesa del día: buscar producto activo marcado como tal
+    const dailyProduct = products.find(p => p.isDailyBurger && p.active && p.visible !== false);
     let activeDailyDeal = null;
-    if (dailyDeal.enabled) {
-      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
-      const nowStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-      if ((!dailyDeal.fromHour || nowStr >= dailyDeal.fromHour) &&
-          (!dailyDeal.toHour   || nowStr <= dailyDeal.toHour)) {
-        activeDailyDeal = dailyDeal;
+    if (dailyProduct) {
+      const from = dailyProduct.dailyFromHour || '00:00';
+      const to   = dailyProduct.dailyToHour   || '23:59';
+      if (nowStr >= from && nowStr <= to) {
+        activeDailyDeal = {
+          enabled:        true,
+          productId:      dailyProduct._id,
+          name:           dailyProduct.name + (dailyProduct.variant ? ` ${dailyProduct.variant}` : ''),
+          description:    dailyProduct.description || '',
+          image:          dailyProduct.image || '',
+          originalPrice:  dailyProduct.salePrice,
+          discountPrice:  dailyProduct.dailyDiscountPrice || dailyProduct.salePrice,
+          discountPercent: dailyProduct.dailyDiscountPrice
+            ? Math.round((1 - dailyProduct.dailyDiscountPrice / dailyProduct.salePrice) * 100)
+            : 0,
+          fromHour: from,
+          toHour:   to
+        };
       }
     }
 
-    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: monthlyBurger.enabled ? monthlyBurger : null });
+    // Hamburguesa del mes: buscar producto activo marcado como tal
+    const monthlyProduct = products.find(p => p.isMonthlyBurger && p.active && p.visible !== false);
+    const activeMonthlyBurger = monthlyProduct ? {
+      enabled:     true,
+      productId:   monthlyProduct._id,
+      name:        monthlyProduct.name + (monthlyProduct.variant ? ` ${monthlyProduct.variant}` : ''),
+      description: monthlyProduct.description || '',
+      image:       monthlyProduct.image || '',
+      price:       monthlyProduct.salePrice,
+      badge:       '🏆 Del mes',
+      month:       monthlyProduct.monthlyLabel || ''
+    } : null;
+
+    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -207,6 +233,25 @@ router.post('/order', async (req, res) => {
     const open = await isOpen();
     if (!open) {
       return res.status(403).json({ message: 'Estamos cerrados. Volvemos según nuestro horario.', closed: true });
+    }
+
+    // ── Anti-duplicados: idempotency key ──────────────────────────────────────
+    // El frontend genera un key único por intento de checkout y lo guarda en
+    // sessionStorage. Si hay un corte de internet y el cliente reintenta, manda
+    // el mismo key → devolvemos el pedido ya creado sin crear uno nuevo.
+    const { idempotencyKey } = req.body;
+    if (idempotencyKey) {
+      const existing = await Order.findOne({ idempotencyKey, status: { $ne: 'cancelled' } })
+        .select('orderNumber publicCode status total');
+      if (existing) {
+        return res.json({
+          orderNumber:        existing.orderNumber,
+          publicCode:         existing.publicCode,
+          status:             existing.status,
+          total:              existing.total,
+          _idempotentResponse: true   // flag para que el frontend lo sepa si lo necesita
+        });
+      }
     }
 
     // Límite diario (timezone Argentina)
@@ -223,7 +268,7 @@ router.post('/order', async (req, res) => {
       }
     }
 
-    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone, scheduledFor, isScheduled } = req.body;
+    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone, scheduledFor, isScheduled, idempotencyKey: iKey } = req.body;
 
     // ── Validar cupón ──────────────────────────────────────────────────────────
     let couponDoc = null;
@@ -443,7 +488,8 @@ router.post('/order', async (req, res) => {
       discountType,
       status: 'pending',
       scheduledFor: scheduledDate,
-      isScheduled: !!isScheduled
+      isScheduled: !!isScheduled,
+      idempotencyKey: iKey || null
     });
 
     // Packaging automático

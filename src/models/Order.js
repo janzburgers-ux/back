@@ -95,7 +95,12 @@ const orderSchema = new mongoose.Schema({
   // Zona y packaging
   zone: { type: String },
   deliveryCost: { type: Number, default: 0 },
-  packagingCost: { type: Number, default: 0 }
+  packagingCost: { type: Number, default: 0 },
+
+  // Anti-duplicados: clave única generada en el frontend por sesión de checkout.
+  // Si el cliente reintenta el envío (corte de internet, doble tap), el backend
+  // detecta el key repetido y devuelve el pedido ya creado sin duplicar.
+  idempotencyKey: { type: String, default: null, index: true, sparse: true }
 }, { timestamps: true });
 
 function generatePublicCode() {

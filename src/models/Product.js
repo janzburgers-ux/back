@@ -42,7 +42,18 @@ const productSchema = new mongoose.Schema({
   // 'burger' → adicionales de hamburguesa + papas + salsas
   // 'papas'  → solo adicionales de papas + salsas
   // 'otro'   → todos los adicionales
-  productType: { type: String, enum: ['burger', 'papas', 'otro'], default: 'burger' }
+  productType: { type: String, enum: ['burger', 'papas', 'otro'], default: 'burger' },
+
+  // ── Destacados ─────────────────────────────────────────────────────────────
+  // isDailyBurger: se muestra como "Hamburguesa del día" con precio especial y countdown
+  isDailyBurger:       { type: Boolean, default: false },
+  dailyDiscountPrice:  { type: Number, default: 0 },   // precio con descuento (0 = sin descuento)
+  dailyFromHour:       { type: String, default: '' },   // ej: "19:00"
+  dailyToHour:         { type: String, default: '' },   // ej: "21:00"
+
+  // isMonthlyBurger: se muestra como "Hamburguesa del mes" (solo puede haber 1 activa)
+  isMonthlyBurger:     { type: Boolean, default: false },
+  monthlyLabel:        { type: String, default: '' }    // ej: "Abril 2025"
 }, { timestamps: true });
 
 const Recipe = mongoose.model('Recipe', recipeSchema);

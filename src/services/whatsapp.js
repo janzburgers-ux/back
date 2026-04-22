@@ -40,7 +40,8 @@ function initWhatsApp() {
   client.initialize().catch(err => console.error('❌ Error iniciando WhatsApp:', err.message));
 }
 
-initWhatsApp();
+// ⚠️ initWhatsApp() ya NO se llama automáticamente.
+// Se dispara bajo demanda desde POST /api/whatsapp/initiate (solo admin autenticado).
 
 async function sendMessage(phoneNumber, message) {
   if (!isReady || !client) return { success: false, reason: 'WhatsApp no conectado' };
@@ -140,7 +141,7 @@ async function sendOrderCancelled(phoneNumber, clientName, publicCode, orderNumb
   return sendMessage(phoneNumber, message);
 }
 
-module.exports = { sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
+module.exports = { initWhatsApp, sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
 
 
 // ── Mensaje 5: Solicitud de reseña (post-entrega) ─────────────────────────────

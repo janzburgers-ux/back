@@ -7,7 +7,10 @@ const http = require('http');
 const { Server } = require('socket.io');
 require('dotenv').config();
 const QRCode = require('qrcode');
-const { getCurrentQR } = require('./services/whatsapp');
+const { initWhatsApp, getCurrentQR, getWhatsAppStatus } = require('./services/whatsapp');
+
+// Estado de iniciación (persiste en memoria mientras el proceso vive)
+let whatsappInitiated = false;
 
 const app = express();
 const server = http.createServer(app);
@@ -72,7 +75,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Database
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/janzburgers')
+mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB conectado'))
   .catch(err => console.error('❌ Error MongoDB:', err));
 
@@ -127,14 +130,38 @@ mongoose.connection.once('open', () => {
   startBirthdayJob();
 });
 
-app.get('/api/whatsapp/qr', async (req, res) => {
+// ── WhatsApp: status, initiate bajo demanda, y QR ────────────────────────────
+const { auth, adminOnly } = require('./middleware/auth');
+
+// GET estado actual de WhatsApp (conectado / desconectado / tiene QR listo)
+app.get('/api/whatsapp/status', auth, adminOnly, (req, res) => {
+  const { connected } = getWhatsAppStatus();
+  const hasQR = !!getCurrentQR();
+  res.json({ connected, hasQR, initiated: whatsappInitiated });
+});
+
+// POST iniciar WhatsApp bajo demanda — genera el proceso y el QR
+// Solo admin puede disparar esto. Evita que actores externos inicien sesiones.
+app.post('/api/whatsapp/initiate', auth, adminOnly, (req, res) => {
+  if (whatsappInitiated) {
+    return res.json({ ok: true, alreadyInitiated: true });
+  }
+  whatsappInitiated = true;
+  initWhatsApp();
+  const backendUrl = (process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`);
+  res.json({ ok: true, qrViewUrl: `${backendUrl}/api/whatsapp/qr-view` });
+});
+
+// GET QR como imagen base64 (para polling desde el frontend)
+app.get('/api/whatsapp/qr', auth, adminOnly, async (req, res) => {
   const qr = getCurrentQR();
-  if (!qr) return res.json({ message: 'QR no disponible aún' });
+  if (!qr) return res.json({ qr: null, message: 'QR no disponible aún' });
   const qrImage = await QRCode.toDataURL(qr);
   res.json({ qr: qrImage });
 });
 
-app.get('/api/whatsapp/qr-view', async (req, res) => {
+// GET QR como página HTML (para abrir en nueva tab y escanear con el teléfono)
+app.get('/api/whatsapp/qr-view', auth, adminOnly, async (req, res) => {
   const qr = getCurrentQR();
   if (!qr) {
     return res.send(`<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Janz Burgers — WhatsApp QR</title><meta http-equiv="refresh" content="5"><style>body{background:#0a0a0a;color:white;font-family:Inter,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:20px}.spinner{width:48px;height:48px;border:4px solid #333;border-top-color:#E8B84B;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:24px}@keyframes spin{to{transform:rotate(360deg)}}h2{font-size:1.4rem;color:#E8B84B;margin-bottom:8px}p{color:#888;font-size:0.9rem}</style></head><body><div class="spinner"></div><h2>Iniciando WhatsApp...</h2><p>Esta página se actualiza sola cada 5 segundos.</p></body></html>`);

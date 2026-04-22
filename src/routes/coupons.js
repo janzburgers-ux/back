@@ -145,10 +145,13 @@ router.post('/validate', async (req, res) => {
       message: `¡Cupón válido! Tenés ${coupon.discountForUser}% de descuento 🎉`
     };
 
-    // Tope dinámico por ticket promedio del dueño
-    if (coupon.ownerAvgTicket > 0) {
+    // Tope dinámico por ticket promedio del dueño:
+    // Solo se expone en cupones NO referidos (ej: cupón de recompensa del referente).
+    // El cupón que comparte el referente con sus amigos no tiene tope visible —
+    // el nuevo cliente recibe el descuento completo sin restricciones de monto.
+    if (coupon.type !== 'referral' && coupon.ownerAvgTicket > 0) {
       response.maxDiscountAmount = Math.round(coupon.ownerAvgTicket * coupon.discountForUser / 100);
-      response.message += ` (tope: ${response.maxDiscountAmount.toLocaleString('es-AR')})`;
+      response.message += ` (tope: $${response.maxDiscountAmount.toLocaleString('es-AR')})`;
     }
 
     // Cupón de producto específico

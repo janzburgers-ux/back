@@ -120,6 +120,7 @@ app.use('/api/public', require('./routes/slots'));     // agrega /api/public/slo
 // Nuevas rutas
 app.use('/api/whatsapp-templates', require('./routes/whatsapp-templates'));
 app.use('/api/push',               require('./routes/push'));
+app.use('/api/broadcast',          require('./routes/broadcast'));
 app.use('/api/reviews',            require('./routes/reviews'));
 
 // ── Jobs automáticos ──────────────────────────────────────────────────────────

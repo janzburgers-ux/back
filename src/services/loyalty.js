@@ -119,35 +119,35 @@ async function validateReferralUse(orderId) {
 }
 
 // ── Notificar al dueño cuando alguien usa su cupón ───────────────────────────
+// Mensaje corto e informativo: el dueño sabe quién usó su código y cuánto lleva acumulado.
 async function notifyReferralOwner(coupon, newClientName, orderTotal, newAccumulated) {
   const referralCfg = await getReferralConfig();
   if (!referralCfg.enabled) return;
 
   try {
     const owner = await Client.findById(coupon.owner).select('name nickname whatsapp');
-    if (!owner?.whatsapp) return;
+    if (!owner?.whatsapp) {
+      console.log(`[Referido] Dueño del cupón ${coupon.code} sin WhatsApp registrado — notificación omitida`);
+      return;
+    }
 
-    const fmt = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
     const friendly = friendlyName(owner);
     const rewardPercent = coupon.rewardPerUse || referralCfg.rewardPercent;
-    const avgTicket = coupon.ownerAvgTicket || 0;
-    const maxDiscount = avgTicket > 0 ? fmt(avgTicket) : 'tu promedio de compra';
-    const validUses = coupon.validatedUses || 0;
+    const validUses = (coupon.validatedUses || 0);
+    const usosText = `${validUses} uso${validUses !== 1 ? 's' : ''} válido${validUses !== 1 ? 's' : ''}`;
 
     const msg =
-      `🌟 ¡Buenas noticias ${friendly}!\n\n` +
-      `*${newClientName}* acaba de recibir su pedido usando tu código *${coupon.code}*. ✅\n\n` +
-      `📈 Acumulaste *+${rewardPercent}%* de descuento.\n` +
-      `💰 Total acumulado: *${newAccumulated}%* (${validUses} uso${validUses !== 1 ? 's' : ''} válido${validUses !== 1 ? 's' : ''})\n\n` +
-      (avgTicket > 0 ? `🔒 Tu cupón tiene un tope de *${maxDiscount}* (tu ticket promedio).\n\n` : '') +
-      `¿Qué querés hacer?\n` +
-      `👉 *Seguir acumulando* — no hagas nada, seguimos contando\n` +
-      `👉 *Canjear ahora* — avisanos y te mandamos el cupón\n\n` +
-      `_Janz Burgers_ 🍔`;
+      `🍔 *Janz Burgers* — Referidos\n\n` +
+      `¡Hola ${friendly}! *${newClientName}* usó tu código *${coupon.code}*. ✅\n\n` +
+      `📈 Acumulás *+${rewardPercent}%* → total: *${newAccumulated}%* (${usosText})\n\n` +
+      `Cuando quieras canjear tu descuento, avisanos. 🎁`;
 
-    await sendWA(owner.whatsapp, msg);
+    const result = await sendWA(owner.whatsapp, msg);
+    if (!result?.success) {
+      console.error(`[Referido] No se pudo enviar WA al dueño ${owner.name} (${owner.whatsapp}): ${result?.reason || 'desconocido'}`);
+    }
   } catch (err) {
-    console.error('Error notificando referido:', err.message);
+    console.error('[Referido] Error notificando al dueño del cupón:', err.message);
   }
 }
 
@@ -161,8 +161,16 @@ async function redeemReferralReward(couponId) {
 
   const owner = coupon.owner;
   const discountPercent = Math.min(coupon.ownerAccumulatedPercent, 100);
-  const avgTicket = coupon.ownerAvgTicket || (await calcOwnerAvgTicket(owner._id));
-  const maxAmountCap = avgTicket;
+
+  // Recalcular ticket promedio al momento del canje (más preciso que el valor guardado al crear)
+  const freshAvgTicket = await calcOwnerAvgTicket(owner._id);
+  const TECHO_ABSOLUTO = 50000;
+  // Tope = el menor entre el ticket promedio actualizado y el techo absoluto de $50.000
+  const maxAmountCap = freshAvgTicket > 0 ? Math.min(freshAvgTicket, TECHO_ABSOLUTO) : 0;
+
+  // Actualizar ownerAvgTicket en el cupón de referido para que quede al día
+  await Coupon.findByIdAndUpdate(couponId, { $set: { ownerAvgTicket: freshAvgTicket } });
+
   const friendly = friendlyName(owner);
 
   const rewardCode = generateCouponCode(owner.nickname || owner.name?.split(' ')[0] || 'CLI');

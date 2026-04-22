@@ -21,7 +21,9 @@ const clientSchema = new mongoose.Schema({
   totalPointsEarned: { type: Number, default: 0 },
   active: { type: Boolean, default: true },
   // isTestClient: pedidos de este cliente no cuentan en reportes ni analytics
-  isTestClient: { type: Boolean, default: false }
+  isTestClient: { type: Boolean, default: false },
+  // Difusión masiva: si true, este cliente no recibe mensajes de broadcast
+  broadcastOptOut: { type: Boolean, default: false }
 }, { timestamps: true });
 
 const orderItemAdditionalSchema = new mongoose.Schema({

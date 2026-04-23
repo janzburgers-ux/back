@@ -121,9 +121,8 @@ async function validateReferralUse(orderId) {
 // ── Notificar al dueño cuando alguien usa su cupón ───────────────────────────
 // Mensaje corto e informativo: el dueño sabe quién usó su código y cuánto lleva acumulado.
 async function notifyReferralOwner(coupon, newClientName, orderTotal, newAccumulated) {
-  const referralCfg = await getReferralConfig();
-  if (!referralCfg.enabled) return;
-
+  // Nota: el envío se hace siempre que el cupón sea de referido y el dueño tenga WhatsApp.
+  // No depende de referralEnabled porque ese flag controla la creación de cupones, no las notificaciones.
   try {
     const owner = await Client.findById(coupon.owner).select('name nickname whatsapp');
     if (!owner?.whatsapp) {

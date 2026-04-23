@@ -31,11 +31,22 @@ router.get('/', auth, adminOnly, async (req, res) => {
     const burgerRatingCount = {};
     const tempRatingCount   = {};
     let onTimeYes = 0, onTimeNo = 0;
+
+    // NPS: distribución de scores y promotores (score 4-5 = potencial referido)
+    const npsDist = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    let npsTotal = 0, npsSum = 0, npsPromoters = 0;
+
     all.forEach(r => {
       if (r.burgerRating) burgerRatingCount[r.burgerRating] = (burgerRatingCount[r.burgerRating] || 0) + 1;
       if (r.tempRating)   tempRatingCount[r.tempRating]     = (tempRatingCount[r.tempRating]     || 0) + 1;
       if (r.onTime === true)  onTimeYes++;
       if (r.onTime === false) onTimeNo++;
+      if (r.npsScore != null) {
+        npsDist[r.npsScore] = (npsDist[r.npsScore] || 0) + 1;
+        npsSum += r.npsScore;
+        npsTotal++;
+        if (r.npsScore >= 4) npsPromoters++;
+      }
     });
 
     res.json({
@@ -49,7 +60,13 @@ router.get('/', auth, adminOnly, async (req, res) => {
         distribution: dist,
         burgerRating: burgerRatingCount,
         tempRating: tempRatingCount,
-        onTime: { yes: onTimeYes, no: onTimeNo }
+        onTime: { yes: onTimeYes, no: onTimeNo },
+        nps: {
+          total: npsTotal,
+          avg: npsTotal > 0 ? Number((npsSum / npsTotal).toFixed(1)) : 0,
+          promoters: npsPromoters,
+          distribution: npsDist
+        }
       }
     });
   } catch (err) { res.status(500).json({ message: err.message }); }

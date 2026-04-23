@@ -21,14 +21,39 @@ function buildUnsubUrl(req, clientId) {
   return `${base}/api/broadcast/unsub/${encodeToken(clientId)}`;
 }
 
+// ── GET /api/broadcast/debug — diagnóstico sin filtros (admin) ───────────────
+router.get('/debug', auth, adminOnly, async (req, res) => {
+  try {
+    const total        = await Client.countDocuments({ active: true });
+    const conWhatsapp  = await Client.countDocuments({ active: true, whatsapp: { $exists: true, $nin: [null, ''] } });
+    const conPedidos   = await Client.countDocuments({ active: true, totalOrders: { $gte: 1 } });
+    const optOut       = await Client.countDocuments({ active: true, broadcastOptOut: true });
+    const listos       = await Client.countDocuments({
+      active: true,
+      totalOrders: { $gte: 1 },
+      broadcastOptOut: { $ne: true },
+      whatsapp: { $exists: true, $nin: [null, ''] }
+    });
+
+    // Todos los clientes activos con sus datos clave para diagnóstico completo
+    const todos = await Client.find({ active: true })
+      .select('name whatsapp phone totalOrders broadcastOptOut')
+      .sort('-totalOrders');
+
+    res.json({ total, conWhatsapp, conPedidos, optOut, listos, todos });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── GET /api/broadcast/list — clientes que recibirían el broadcast ─────────────
 router.get('/list', auth, adminOnly, async (req, res) => {
   try {
     const clients = await Client.find({
+      active: true,
       totalOrders: { $gte: 1 },
       broadcastOptOut: { $ne: true },
-      active: true,
-      whatsapp: { $exists: true, $ne: '' }
+      whatsapp: { $exists: true, $nin: [null, ''] }
     }).select('name nickname whatsapp totalOrders').sort('-totalOrders');
 
     res.json({ count: clients.length, clients });

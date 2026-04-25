@@ -390,12 +390,17 @@ router.post('/order', async (req, res) => {
         if (!add) continue;
         resolvedAdditionals.push({ additional: add._id, name: add.name, unitPrice: add.price, quantity: a.quantity || 1 });
       }
+      // Si es la burger del día con precio especial, usar dailyDiscountPrice
+      const unitPrice = (product.isDailyBurger && product.dailyDiscountPrice > 0)
+        ? product.dailyDiscountPrice
+        : product.salePrice;
+
       orderItems.push({
         product: product._id,
         productName: product.name,
         variant: product.variant,
         quantity: item.quantity,
-        unitPrice: product.salePrice,
+        unitPrice,
         additionals: resolvedAdditionals,
         notes: item.notes || ''
       });

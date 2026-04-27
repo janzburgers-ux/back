@@ -352,14 +352,35 @@ router.get('/report', auth, adminOnly, async (req, res) => {
     const userDistrib = await User.find({ active: true, profitPercent: { $gt: 0 } });
     const totalRevenue = orders.reduce((s, o) => s + o.total, 0);
     const totalCouponDiscount = orders.reduce((s, o) => s + (o.discountAmount || 0), 0);
-    const productsCost = orders.reduce((s, o) => s + (o.items?.reduce((ss, i) => ss + (i.totalCost || 0) * i.quantity, 0) || 0), 0);
+
+    // Food cost real desde realTotalCost del producto (calculado por la receta)
+    const productIds = [...new Set(orders.flatMap(o => o.items.map(i => i.product?.toString()).filter(Boolean)))];
+    const products   = await Product.find({ _id: { $in: productIds } }).select('_id realTotalCost name variant salePrice');
+    const costMap    = {};
+    products.forEach(p => { costMap[p._id.toString()] = p.realTotalCost || 0; });
+    const productsCost = orders.reduce((sum, o) =>
+      sum + o.items.reduce((s, item) => s + (costMap[item.product?.toString()] || 0) * item.quantity, 0), 0
+    );
+
+    // topProducts con food cost real por producto
+    const topProductsWithCost = Object.values(productMap)
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10)
+      .map(p => {
+        const match = products.find(pr => `${pr.name} ${pr.variant || ''}`.trim() === p.name);
+        const unitCost = match?.realTotalCost || 0;
+        const totalCostP = unitCost * p.units;
+        const foodCostPct = p.revenue > 0 ? ((totalCostP / p.revenue) * 100).toFixed(1) : null;
+        return { ...p, unitCost, totalCost: totalCostP, foodCostPct };
+      });
+
     const netProfit = totalRevenue - totalCouponDiscount - productsCost - totalFixed;
     const avgTicket = orders.length > 0 ? Math.round(totalRevenue / orders.length) : 0;
 
     res.json({
       period: { month, year, monthName: ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'][month-1] },
       summary: { totalOrders: orders.length, cancelledOrders: cancelledOrders.length, totalRevenue, avgTicket, totalCouponDiscount, productsCost, totalFixed, netProfit },
-      salesByDay, topProducts, topClients,
+      salesByDay, topProducts: topProductsWithCost, topClients,
       paymentMethods: paymentMap,
       fixedExpenses,
       userDistribution: userDistrib.map(u => ({ name: u.name, percent: u.profitPercent, amount: Math.round(netProfit * u.profitPercent / 100) }))

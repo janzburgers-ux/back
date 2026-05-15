@@ -72,8 +72,8 @@ router.put('/config', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── GET fixture completo ──────────────────────────────────────────────────────
-router.get('/fixture', auth, async (req, res) => {
+// ── GET fixture completo (público — lo necesita PublicProde.jsx sin token) ────
+router.get('/fixture', async (req, res) => {
   try {
     const { stage, group, status } = req.query;
     const filter = {};
@@ -89,8 +89,76 @@ router.get('/fixture', auth, async (req, res) => {
 router.post('/fixture/sync', auth, adminOnly, async (req, res) => {
   try {
     const result = await syncFixture();
+    // syncFixture nunca tira, devuelve { synced, error? } — lo exponemos completo
+    if (result.error) {
+      return res.status(502).json({ message: `API error: ${result.error}`, synced: 0 });
+    }
     res.json(result);
   } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET debug API — raw response de RapidAPI (solo admin) ────────────────────
+router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
+  const axios = require('axios');
+  const { getProdeConfig } = require('../services/prode.service');
+  try {
+    const cfg = await getProdeConfig();
+    const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+    const FOOTBALL_HOST = 'football201.p.rapidapi.com';
+
+    if (!RAPIDAPI_KEY) {
+      return res.json({
+        ok: false,
+        problema: 'RAPIDAPI_KEY no está definida en las variables de entorno',
+        cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
+      });
+    }
+
+    const url = `https://${FOOTBALL_HOST}/tournament/${cfg.tournamentId}/season/${cfg.seasonId}/matches`;
+    let rawData, statusCode;
+    try {
+      const resp = await axios.get(url, {
+        headers: {
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'x-rapidapi-host': FOOTBALL_HOST,
+          'Content-Type': 'application/json',
+        },
+        timeout: 12000,
+      });
+      rawData = resp.data;
+      statusCode = resp.status;
+    } catch (apiErr) {
+      return res.json({
+        ok: false,
+        problema: apiErr.message,
+        httpStatus: apiErr.response?.status,
+        apiResponse: apiErr.response?.data,
+        url,
+        cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
+      });
+    }
+
+    // Diagnosticar la estructura de la respuesta
+    const topKeys = Object.keys(rawData || {});
+    const matches = rawData?.events || rawData?.matches || rawData?.data || [];
+    const matchCount = Array.isArray(matches) ? matches.length : 'no es array';
+    const primerPartido = Array.isArray(matches) && matches.length > 0 ? matches[0] : null;
+
+    res.json({
+      ok: true,
+      httpStatus: statusCode,
+      url,
+      cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
+      respuesta: {
+        claves_raiz: topKeys,
+        campo_detectado: rawData?.events ? 'events' : rawData?.matches ? 'matches' : rawData?.data ? 'data' : 'ninguno reconocido',
+        cantidad_partidos: matchCount,
+        primer_partido_raw: primerPartido,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, problema: err.message });
+  }
 });
 
 // ── POST seed fixture mockeado (solo admin, solo si no hay datos) ─────────────

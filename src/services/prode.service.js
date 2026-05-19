@@ -1,4 +1,4 @@
-const axios = require('axios');
+/*const axios = require('axios');
 const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/Prode');
 const { Client } = require('../models/Order');
 const { sendMessage } = require('./whatsapp');
@@ -341,4 +341,193 @@ module.exports = {
   evaluateMatch,
   getTotalPoints,
   getRanking,
+};
+*/
+/*prueba de prode con mundial pasado 2022*/
+const axios = require('axios');
+const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/Prode');
+const { Client } = require('../models/Order');
+const { sendMessage } = require('./whatsapp');
+
+// ── API-Football v3 ───────────────────────────────────────────────────────────
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+
+// ── CONFIG MUNDIAL QATAR 2022 ────────────────────────────────────────────────
+// league=1 → FIFA World Cup
+// season=2022 → Mundial Qatar 2022
+const WORLD_CUP_LEAGUE_ID = 1;
+const WORLD_CUP_SEASON = 2022;
+
+// ── Mapeo de rondas ──────────────────────────────────────────────────────────
+function mapRoundToStage(round = '') {
+  const r = round.toLowerCase();
+
+  if (r.includes('group')) return 'Fase de Grupos';
+  if (r.includes('round of 16')) return 'Octavos de Final';
+  if (r.includes('quarter')) return 'Cuartos de Final';
+  if (r.includes('semi')) return 'Semifinal';
+  if (r.includes('3rd') || r.includes('third')) return 'Tercer Puesto';
+  if (r.includes('final')) return 'Final';
+
+  return round;
+}
+
+// ── Estados LIVE ─────────────────────────────────────────────────────────────
+const LIVE_STATUSES = ['1H', '2H', 'HT', 'ET', 'BT', 'P', 'INT', 'LIVE'];
+
+// ── Estados FINALIZADOS ──────────────────────────────────────────────────────
+const FINISHED_STATUSES = ['FT', 'AET', 'PEN'];
+
+// ── Sync Mundial Qatar 2022 ──────────────────────────────────────────────────
+async function syncWorldCup2022() {
+  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+
+  if (!API_FOOTBALL_KEY) {
+    return {
+      synced: 0,
+      error: 'API_FOOTBALL_KEY no definida'
+    };
+  }
+
+  try {
+
+    console.log('🌍 Sincronizando Mundial Qatar 2022...');
+
+    const { data } = await axios.get(
+      `${API_FOOTBALL_BASE}/fixtures`,
+      {
+        params: {
+          league: WORLD_CUP_LEAGUE_ID,
+          season: WORLD_CUP_SEASON
+        },
+        headers: {
+          'x-apisports-key': API_FOOTBALL_KEY
+        },
+        timeout: 15000
+      }
+    );
+
+    console.log('📦 Respuesta API:');
+    console.log(JSON.stringify(data, null, 2));
+
+    const fixtures = data?.response || [];
+
+    if (!Array.isArray(fixtures) || fixtures.length === 0) {
+      return {
+        synced: 0,
+        error: 'La API respondió correctamente pero no devolvió partidos.'
+      };
+    }
+
+    let synced = 0;
+
+    for (const f of fixtures) {
+
+      const fix = f.fixture;
+      const teams = f.teams;
+      const goals = f.goals;
+      const league = f.league;
+
+      const apiId = String(fix?.id);
+
+      const homeTeam = teams?.home?.name || 'TBD';
+      const awayTeam = teams?.away?.name || 'TBD';
+
+      const homeLogo = teams?.home?.logo || null;
+      const awayLogo = teams?.away?.logo || null;
+
+      const matchDate = fix?.date
+        ? new Date(fix.date)
+        : null;
+
+      const stage = mapRoundToStage(league?.round || '');
+
+      const statusShort = fix?.status?.short || 'NS';
+
+      let status = 'scheduled';
+      let homeScore = null;
+      let awayScore = null;
+      let winner = null;
+
+      // ── Partido finalizado ───────────────────────────────────────────────
+      if (FINISHED_STATUSES.includes(statusShort)) {
+
+        status = 'finished';
+
+        homeScore = goals?.home ?? null;
+        awayScore = goals?.away ?? null;
+
+        if (homeScore !== null && awayScore !== null) {
+
+          if (homeScore > awayScore) {
+            winner = 'home';
+          } else if (awayScore > homeScore) {
+            winner = 'away';
+          } else {
+            winner = 'draw';
+          }
+
+        }
+
+      }
+
+      // ── Partido en vivo ─────────────────────────────────────────────────
+      else if (LIVE_STATUSES.includes(statusShort)) {
+        status = 'live';
+      }
+
+      // ── Guardar en Mongo ────────────────────────────────────────────────
+      await ProdeMatch.findOneAndUpdate(
+        { apiId },
+        {
+          apiId,
+
+          homeTeam,
+          awayTeam,
+
+          homeLogo,
+          awayLogo,
+
+          matchDate,
+
+          stage,
+
+          homeScore,
+          awayScore,
+
+          status,
+          winner
+        },
+        {
+          upsert: true,
+          new: true
+        }
+      );
+
+      synced++;
+
+      console.log(`✅ ${homeTeam} vs ${awayTeam}`);
+    }
+
+    console.log(`🏆 Mundial Qatar 2022 sincronizado: ${synced} partidos`);
+
+    return {
+      synced
+    };
+
+  } catch (err) {
+
+    console.error('❌ Error sync Qatar 2022:', err.response?.data || err.message);
+
+    return {
+      synced: 0,
+      error: err.response?.data || err.message
+    };
+
+  }
+}
+
+// ── Export ───────────────────────────────────────────────────────────────────
+module.exports = {
+  syncWorldCup2022
 };

@@ -53,8 +53,7 @@ async function isProdeActive() {
 async function syncFixture() {
   const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
   const cfg = await getProdeConfig();
-  /*const season = cfg.season || 2026;*/
-  const season = 2022;
+  const season = cfg.season || 2026;
 
   if (!API_FOOTBALL_KEY) {
     return { synced: 0, error: 'API_FOOTBALL_KEY no definida en variables de entorno' };

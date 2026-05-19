@@ -3,8 +3,32 @@ const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/
 const { Client } = require('../models/Order');
 const { sendMessage } = require('./whatsapp');
 
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
-const FOOTBALL_HOST = 'football201.p.rapidapi.com';
+// ── API-Football v3 — acceso directo (sin RapidAPI) ──────────────────────────
+// Registro gratuito: https://dashboard.api-football.com/register
+// Plan Free: 100 req/día, sin tarjeta de crédito
+// Env var requerida: API_FOOTBALL_KEY  (la key del dashboard de api-sports)
+// Endpoint: GET /fixtures?league=1&season=2026
+//   league=1 → FIFA World Cup (fijo, no cambia)
+//   season   → año del torneo (configurable desde admin, default 2026)
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+
+// Mapeo de ronda en inglés → etapa en español
+function mapRoundToStage(round = '') {
+  const r = round.toLowerCase();
+  if (r.includes('group'))        return 'Fase de Grupos';
+  if (r.includes('round of 32')) return 'Ronda de 32';
+  if (r.includes('round of 16')) return 'Octavos de Final';
+  if (r.includes('quarter'))     return 'Cuartos de Final';
+  if (r.includes('semi'))        return 'Semifinal';
+  if (r.includes('3rd') || r.includes('third')) return 'Tercer Puesto';
+  if (r.includes('final'))       return 'Final';
+  return round;
+}
+
+// Estados de API-Football que significan "en juego"
+const LIVE_STATUSES = ['1H', '2H', 'HT', 'ET', 'BT', 'P', 'INT', 'LIVE'];
+// Estados que significan "terminado"
+const FINISHED_STATUSES = ['FT', 'AET', 'PEN'];
 
 // ── Obtener config activa ─────────────────────────────────────────────────────
 async function getProdeConfig() {
@@ -25,47 +49,56 @@ async function isProdeActive() {
   return true;
 }
 
-// ── Sync fixture desde Football201 API ───────────────────────────────────────
+// ── Sync fixture desde API-Football v3 ───────────────────────────────────────
 async function syncFixture() {
+  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
   const cfg = await getProdeConfig();
+  const season = cfg.season || 2026;
+
+  if (!API_FOOTBALL_KEY) {
+    return { synced: 0, error: 'API_FOOTBALL_KEY no definida en variables de entorno' };
+  }
+
   try {
-    const { data } = await axios.get(
-      `https://${FOOTBALL_HOST}/tournament/${cfg.tournamentId}/season/${cfg.seasonId}/matches`,
-      {
-        headers: {
-          'x-rapidapi-key': RAPIDAPI_KEY,
-          'x-rapidapi-host': FOOTBALL_HOST,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000,
-      }
-    );
+    const { data } = await axios.get(`${API_FOOTBALL_BASE}/fixtures`, {
+      params: { league: 1, season },
+      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+      timeout: 15000,
+    });
 
-    const matches = data?.events || data?.matches || [];
+    const fixtures = data?.response || [];
+    if (!Array.isArray(fixtures) || fixtures.length === 0) {
+      return { synced: 0, error: `La API devolvió 0 partidos para league=1&season=${season}. Verificar API key.` };
+    }
+
     let synced = 0;
+    for (const f of fixtures) {
+      const fix    = f.fixture;
+      const teams  = f.teams;
+      const goals  = f.goals;
+      const league = f.league;
 
-    for (const m of matches) {
-      const homeTeam  = m.homeTeam?.name || m.home?.name || 'TBD';
-      const awayTeam  = m.awayTeam?.name || m.away?.name || 'TBD';
-      const matchDate = m.startTimestamp
-        ? new Date(m.startTimestamp * 1000)
-        : new Date(m.date || m.startDate);
-      const apiId     = String(m.id);
-      const stage     = m.roundInfo?.name || m.round?.name || m.stage?.name || 'Fase de Grupos';
-      const group     = m.groupName || m.group?.name || null;
-      const homeLogo  = m.homeTeam?.logo || m.home?.logo || null;
-      const awayLogo  = m.awayTeam?.logo || m.away?.logo || null;
+      const apiId     = String(fix?.id);
+      const homeTeam  = teams?.home?.name || 'TBD';
+      const awayTeam  = teams?.away?.name || 'TBD';
+      const homeLogo  = teams?.home?.logo || null;
+      const awayLogo  = teams?.away?.logo || null;
+      const matchDate = fix?.date ? new Date(fix.date) : null;
+      const stage     = mapRoundToStage(league?.round || '');
+      const group     = null; // API-Football no expone el grupo letra en /fixtures
 
-      // Resultado
-      let homeScore = null, awayScore = null, status = 'scheduled', winner = null;
-      if (m.status?.type === 'finished' || m.status === 'finished') {
-        homeScore = m.homeScore?.current ?? m.score?.home ?? null;
-        awayScore = m.awayScore?.current ?? m.score?.away ?? null;
-        status = 'finished';
+      const statusShort = fix?.status?.short || 'NS';
+      let status = 'scheduled';
+      let homeScore = null, awayScore = null, winner = null;
+
+      if (FINISHED_STATUSES.includes(statusShort)) {
+        status    = 'finished';
+        homeScore = goals?.home ?? null;
+        awayScore = goals?.away ?? null;
         if (homeScore !== null && awayScore !== null) {
           winner = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : 'draw';
         }
-      } else if (m.status?.type === 'inprogress') {
+      } else if (LIVE_STATUSES.includes(statusShort)) {
         status = 'live';
       }
 
@@ -77,11 +110,10 @@ async function syncFixture() {
       synced++;
     }
 
-    console.log(`✅ Prode: ${synced} partidos sincronizados`);
+    console.log(`✅ Prode: ${synced} partidos sincronizados desde API-Football (league=1, season=${season})`);
     return { synced };
   } catch (err) {
     console.error('❌ Prode sync error:', err.message);
-    // Si la API falla, no rompe nada — los datos mockeados siguen ahí
     return { synced: 0, error: err.message };
   }
 }

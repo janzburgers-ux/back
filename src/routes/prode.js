@@ -97,69 +97,48 @@ router.post('/fixture/sync', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── GET debug API — raw response de RapidAPI (solo admin) ────────────────────
+// ── GET debug API — raw response de API-Football v3 (solo admin) ─────────────
 router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
   const axios = require('axios');
   const { getProdeConfig } = require('../services/prode.service');
+  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+
+  if (!API_FOOTBALL_KEY) {
+    return res.json({
+      ok: false,
+      problema: 'API_FOOTBALL_KEY no está definida en las variables de entorno. Agregala en Railway.',
+    });
+  }
+
+  const cfg    = await getProdeConfig();
+  const season = cfg.season || 2026;
+  const url    = `https://v3.football.api-sports.io/fixtures?league=1&season=${season}`;
+
   try {
-    const cfg = await getProdeConfig();
-    const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
-    const FOOTBALL_HOST = 'football201.p.rapidapi.com';
-
-    if (!RAPIDAPI_KEY) {
-      return res.json({
-        ok: false,
-        problema: 'RAPIDAPI_KEY no está definida en las variables de entorno',
-        cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
-      });
-    }
-
-    const url = `https://${FOOTBALL_HOST}/tournament/${cfg.tournamentId}/season/${cfg.seasonId}/matches`;
-    let rawData, statusCode;
-    try {
-      const resp = await axios.get(url, {
-        headers: {
-          'x-rapidapi-key': RAPIDAPI_KEY,
-          'x-rapidapi-host': FOOTBALL_HOST,
-          'Content-Type': 'application/json',
-        },
-        timeout: 12000,
-      });
-      rawData = resp.data;
-      statusCode = resp.status;
-    } catch (apiErr) {
-      return res.json({
-        ok: false,
-        problema: apiErr.message,
-        httpStatus: apiErr.response?.status,
-        apiResponse: apiErr.response?.data,
-        url,
-        cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
-      });
-    }
-
-    // Diagnosticar la estructura de la respuesta
-    const topKeys = Object.keys(rawData || {});
-    const matches = rawData?.events || rawData?.matches || rawData?.data || [];
-    const matchCount = Array.isArray(matches) ? matches.length : 'no es array';
-    const primerPartido = Array.isArray(matches) && matches.length > 0 ? matches[0] : null;
-
-    res.json({
-      ok: true,
-      httpStatus: statusCode,
+    const resp = await axios.get(url, {
+      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+      timeout: 12000,
+    });
+    const fixtures = resp.data?.response || [];
+    return res.json({
+      ok:             true,
+      httpStatus:     resp.status,
       url,
-      cfg: { tournamentId: cfg.tournamentId, seasonId: cfg.seasonId },
-      respuesta: {
-        claves_raiz: topKeys,
-        campo_detectado: rawData?.events ? 'events' : rawData?.matches ? 'matches' : rawData?.data ? 'data' : 'ninguno reconocido',
-        cantidad_partidos: matchCount,
-        primer_partido_raw: primerPartido,
-      },
+      season,
+      cantidad:       fixtures.length,
+      primer_partido: fixtures[0] || null,
     });
   } catch (err) {
-    res.status(500).json({ ok: false, problema: err.message });
+    return res.json({
+      ok:          false,
+      problema:    err.message,
+      httpStatus:  err.response?.status,
+      apiResponse: err.response?.data,
+      url,
+    });
   }
 });
+
 
 // ── POST seed fixture mockeado (solo admin, solo si no hay datos) ─────────────
 router.post('/fixture/seed-mock', auth, adminOnly, async (req, res) => {

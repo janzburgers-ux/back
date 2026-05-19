@@ -1,87 +1,342 @@
-const mongoose = require('mongoose');
+const express = require('express');
+const router = express.Router();
+const { auth, adminOnly } = require('../middleware/auth');
+const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/Prode');
+const {
+  getProdeConfig,
+  isProdeActive,
+  syncFixture,
+  seedMockFixture,
+  evaluateMatch,
+  getRanking,
+  getTotalPoints,
+} = require('../services/prode.service');
 
-// ── Fixture cacheado desde la API ─────────────────────────────────────────────
-const matchSchema = new mongoose.Schema({
-  apiId:       { type: String, required: true, unique: true },
-  stage:       { type: String }, // 'Group Stage', 'Round of 16', 'Quarter-final', etc.
-  group:       { type: String }, // 'Group A', 'Group B', null si es eliminatoria
-  homeTeam:    { type: String, required: true },
-  awayTeam:    { type: String, required: true },
-  homeLogo:    { type: String },
-  awayLogo:    { type: String },
-  matchDate:   { type: Date, required: true },
-  // Resultado final (null hasta que se juegue)
-  homeScore:   { type: Number, default: null },
-  awayScore:   { type: Number, default: null },
-  status:      { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
-  // Ganador calculado: 'home' | 'away' | 'draw' | null
-  winner:      { type: String, default: null },
-}, { timestamps: true });
+// ── POST acceso al prode por número de WhatsApp (público, sin auth) ──────────
+router.post('/acceso', async (req, res) => {
+  try {
+    let { whatsapp } = req.body;
+    if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
 
-// ── Pronóstico de un cliente para un partido ──────────────────────────────────
-const pronosticoSchema = new mongoose.Schema({
-  clientId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
-  matchId:     { type: mongoose.Schema.Types.ObjectId, ref: 'ProdeMatch', required: true },
-  // Pronóstico del resultado: 'home' | 'away' | 'draw'
-  predictedWinner: { type: String, enum: ['home', 'away', 'draw'], required: true },
-  // Resultado exacto (opcional, da puntos extra)
-  predictedHome:   { type: Number, default: null },
-  predictedAway:   { type: Number, default: null },
-  // Puntos obtenidos (calculados al cerrar el partido)
-  pointsEarned:    { type: Number, default: 0 },
-  evaluated:       { type: Boolean, default: false },
-}, { timestamps: true });
+    // Normalizar: limpiar caracteres no numéricos
+    const clean = whatsapp.replace(/\D/g, '');
 
-// Índice único: un cliente solo puede pronosticar una vez por partido
-pronosticoSchema.index({ clientId: 1, matchId: 1 }, { unique: true });
+    // Buscar cliente por whatsapp o phone (con variantes de formato)
+    const { Client, Order } = require('../models/Order');
+    const client = await Client.findOne({
+      $or: [
+        { whatsapp: { $regex: clean.slice(-8) } }, // últimos 8 dígitos
+        { phone:    { $regex: clean.slice(-8) } },
+      ],
+      active: true,
+    });
 
-// ── Historial de puntos del prode por cliente ─────────────────────────────────
-const prodePointsSchema = new mongoose.Schema({
-  clientId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
-  tipo:        { type: String, enum: ['pronostico', 'compra'], required: true },
-  descripcion: { type: String },
-  puntos:      { type: Number, required: true },
-  // Referencia opcional al pedido (solo para tipo 'compra')
-  orderId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
-  // Referencia opcional al partido (solo para tipo 'pronostico')
-  matchId:     { type: mongoose.Schema.Types.ObjectId, ref: 'ProdeMatch', default: null },
-}, { timestamps: true });
+    if (!client) {
+      return res.status(404).json({
+        message: 'No encontramos ese número. ¿Seguro que compraste con este WhatsApp?'
+      });
+    }
 
-// ── Configuración del prode (guardada en DB para editarla desde admin) ────────
-const prodeConfigSchema = new mongoose.Schema({
-  key:   { type: String, required: true, unique: true, default: 'prode' },
-  value: {
-    enabled:       { type: Boolean, default: false },
-    startDate:     { type: Date, default: null },
-    endDate:       { type: Date, default: null },
-    pointsWinner:  { type: Number, default: 1 },
-    pointsExact:   { type: Number, default: 5 },
-    pointsPerOrder: { type: Number, default: 1 },
-    cutoffMinutes: { type: Number, default: 30 },
-    tournamentId:  { type: String, default: '132' },
-    seasonId:      { type: String, default: '65360' },
-    // ── Bonificaciones extra por condiciones de compra ──────────────────────
-    bonificaciones: [{
-      tipo: {
-        type: String,
-        enum: ['producto', 'gasto_minimo', 'por_cada_x'],
-        // producto: comprar X producto = +N puntos
-        // gasto_minimo: gastar más de $X = +N puntos
-        // por_cada_x: cada $X gastado = +N puntos
-      },
-      descripcion:    { type: String },   // texto libre para mostrar en UI
-      productoId:     { type: String },   // solo para tipo 'producto'
-      productoNombre: { type: String },   // nombre legible
-      montoMinimo:    { type: Number },   // para 'gasto_minimo' y 'por_cada_x'
-      puntos:         { type: Number, default: 1 },
-      activa:         { type: Boolean, default: true },
-    }],
+    // Verificar que tenga al menos un pedido
+    const pedidos = await Order.countDocuments({ client: client._id });
+    if (pedidos === 0) {
+      return res.status(403).json({
+        message: 'Para participar del prode necesitás haber realizado al menos un pedido.'
+      });
+    }
+
+    res.json({
+      clientId: client._id,
+      nombre: client.name.split(' ')[0],
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET config del prode (público — para mostrar/ocultar banner en /pedido) ───
+router.get('/config', async (req, res) => {
+  try {
+    const cfg = await getProdeConfig();
+    res.json(cfg);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT actualizar config (solo admin) ───────────────────────────────────────
+router.put('/config', auth, adminOnly, async (req, res) => {
+  try {
+    const cfg = await ProdeConfig.findOneAndUpdate(
+      { key: 'prode' },
+      { $set: { value: req.body } },
+      { upsert: true, new: true }
+    );
+    res.json(cfg.value);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET fixture completo (público — lo necesita PublicProde.jsx sin token) ────
+router.get('/fixture', async (req, res) => {
+  try {
+    const { stage, group, status } = req.query;
+    const filter = {};
+    if (stage)  filter.stage  = stage;
+    if (group)  filter.group  = group;
+    if (status) filter.status = status;
+    const matches = await ProdeMatch.find(filter).sort({ matchDate: 1 });
+    res.json(matches);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST sync fixture desde API (solo admin) ─────────────────────────────────
+router.post('/fixture/sync', auth, adminOnly, async (req, res) => {
+  try {
+    const result = await syncFixture();
+    // syncFixture nunca tira, devuelve { synced, error? } — lo exponemos completo
+    if (result.error) {
+      return res.status(502).json({ message: `API error: ${result.error}`, synced: 0 });
+    }
+    res.json(result);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET debug API — raw response de API-Football v3 (solo admin) ─────────────
+router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
+  const axios = require('axios');
+  const { getProdeConfig } = require('../services/prode.service');
+  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+
+  if (!API_FOOTBALL_KEY) {
+    return res.json({
+      ok: false,
+      problema: 'API_FOOTBALL_KEY no está definida en las variables de entorno. Agregala en Railway.',
+    });
   }
-}, { timestamps: true });
 
-const ProdeMatch    = mongoose.model('ProdeMatch',    matchSchema);
-const Pronostico    = mongoose.model('Pronostico',    pronosticoSchema);
-const ProdePoints   = mongoose.model('ProdePoints',   prodePointsSchema);
-const ProdeConfig   = mongoose.model('ProdeConfig',   prodeConfigSchema);
+  const cfg    = await getProdeConfig();
+  const season = cfg.season || 2026;
+  const url    = `https://v3.football.api-sports.io/fixtures?league=1&season=${season}`;
 
-module.exports = { ProdeMatch, Pronostico, ProdePoints, ProdeConfig };
+  try {
+    const resp = await axios.get(url, {
+      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+      timeout: 12000,
+    });
+    const fixtures = resp.data?.response || [];
+    return res.json({
+      ok:             true,
+      httpStatus:     resp.status,
+      url,
+      season,
+      cantidad:       fixtures.length,
+      primer_partido: fixtures[0] || null,
+    });
+  } catch (err) {
+    return res.json({
+      ok:          false,
+      problema:    err.message,
+      httpStatus:  err.response?.status,
+      apiResponse: err.response?.data,
+      url,
+    });
+  }
+});
+
+
+// ── POST seed fixture mockeado (solo admin, solo si no hay datos) ─────────────
+router.post('/fixture/seed-mock', auth, adminOnly, async (req, res) => {
+  try {
+    await seedMockFixture();
+    res.json({ message: 'Fixture mockeado insertado' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT actualizar resultado de un partido manualmente (solo admin) ───────────
+router.put('/fixture/:id/resultado', auth, adminOnly, async (req, res) => {
+  try {
+    const { homeScore, awayScore } = req.body;
+    const winner = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : 'draw';
+    const match = await ProdeMatch.findByIdAndUpdate(
+      req.params.id,
+      { homeScore, awayScore, winner, status: 'finished' },
+      { new: true }
+    );
+    // Evaluar pronósticos automáticamente
+    await evaluateMatch(match._id);
+    res.json(match);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET pronósticos de un cliente ─────────────────────────────────────────────
+// Ruta pública para el cliente (usa clientId desde query o body)
+router.get('/pronosticos/:clientId', async (req, res) => {
+  try {
+    const pronosticos = await Pronostico.find({ clientId: req.params.clientId })
+      .populate('matchId');
+    res.json(pronosticos);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST guardar/actualizar pronóstico de un cliente ─────────────────────────
+router.post('/pronosticos', async (req, res) => {
+  try {
+    const { clientId, matchId, predictedWinner, predictedHome, predictedAway } = req.body;
+    if (!clientId || !matchId || !predictedWinner) {
+      return res.status(400).json({ message: 'Faltan campos requeridos' });
+    }
+
+    // Verificar que el partido no haya empezado (cutoff)
+    const match = await ProdeMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
+    if (match.status !== 'scheduled') {
+      return res.status(400).json({ message: 'El partido ya comenzó, no se pueden modificar pronósticos' });
+    }
+
+    const cfg = await getProdeConfig();
+    const cutoffMs = (cfg.cutoffMinutes || 30) * 60 * 1000;
+    if (new Date(match.matchDate) - new Date() < cutoffMs) {
+      return res.status(400).json({ message: `Pronósticos bloqueados ${cfg.cutoffMinutes || 30} minutos antes del partido` });
+    }
+
+    const pronostico = await Pronostico.findOneAndUpdate(
+      { clientId, matchId },
+      { predictedWinner, predictedHome: predictedHome ?? null, predictedAway: predictedAway ?? null, evaluated: false, pointsEarned: 0 },
+      { upsert: true, new: true }
+    );
+    res.json(pronostico);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET ranking general (admin) ───────────────────────────────────────────────
+router.get('/ranking', auth, async (req, res) => {
+  try {
+    const ranking = await getRanking();
+    res.json(ranking);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET ranking público — top 5, sin auth, solo nombre y total ────────────────
+router.get('/ranking/publico', async (req, res) => {
+  try {
+    const ranking = await getRanking();
+    const top5 = ranking.slice(0, 5).map((r, i) => ({
+      posicion: i + 1,
+      nombre: r.nombre,
+      totalPuntos: r.totalPuntos,
+    }));
+    res.json(top5);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET historial de puntos de un cliente ─────────────────────────────────────
+router.get('/puntos/:clientId', async (req, res) => {
+  try {
+    const historial = await ProdePoints.find({ clientId: req.params.clientId })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    const total = await getTotalPoints(req.params.clientId);
+    res.json({ historial, total });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST evaluar todos los partidos terminados pendientes (solo admin) ─────────
+router.post('/evaluar', auth, adminOnly, async (req, res) => {
+  try {
+    const matches = await ProdeMatch.find({ status: 'finished' });
+    let evaluated = 0;
+    for (const m of matches) {
+      await evaluateMatch(m._id);
+      evaluated++;
+    }
+    res.json({ evaluated });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET estadísticas del prode para el admin ──────────────────────────────────
+router.get('/stats', auth, adminOnly, async (req, res) => {
+  try {
+    const [totalParticipantes, totalPartidos, totalPronosticos, totalPuntos] = await Promise.all([
+      ProdePoints.distinct('clientId').then(r => r.length),
+      ProdeMatch.countDocuments(),
+      Pronostico.countDocuments(),
+      ProdePoints.aggregate([{ $group: { _id: null, total: { $sum: '$puntos' } } }]).then(r => r[0]?.total || 0),
+    ]);
+    const lider = await getRanking().then(r => r[0] || null);
+    res.json({ totalParticipantes, totalPartidos, totalPronosticos, totalPuntos, lider });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET bonificaciones ────────────────────────────────────────────────────────
+router.get('/bonificaciones', auth, adminOnly, async (req, res) => {
+  try {
+    const cfg = await ProdeConfig.findOne({ key: 'prode' });
+    res.json(cfg?.value?.bonificaciones || []);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST agregar bonificación ─────────────────────────────────────────────────
+router.post('/bonificaciones', auth, adminOnly, async (req, res) => {
+  try {
+    const { tipo, descripcion, productoId, productoNombre, montoMinimo, puntos } = req.body;
+    if (!tipo || !puntos) return res.status(400).json({ message: 'Faltan campos requeridos' });
+
+    const nueva = { tipo, descripcion, productoId, productoNombre, montoMinimo: Number(montoMinimo) || 0, puntos: Number(puntos), activa: true };
+
+    let cfg = await ProdeConfig.findOne({ key: 'prode' });
+    if (!cfg) cfg = await ProdeConfig.create({ key: 'prode', value: {} });
+
+    const bonificaciones = cfg.value?.bonificaciones || [];
+    bonificaciones.push(nueva);
+
+    await ProdeConfig.findOneAndUpdate(
+      { key: 'prode' },
+      { $set: { 'value.bonificaciones': bonificaciones } },
+      { new: true }
+    );
+
+    res.json(nueva);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT actualizar bonificación (por índice) ──────────────────────────────────
+router.put('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
+  try {
+    const idx = Number(req.params.index);
+    const cfg = await ProdeConfig.findOne({ key: 'prode' });
+    if (!cfg) return res.status(404).json({ message: 'Config no encontrada' });
+
+    const bonificaciones = cfg.value?.bonificaciones || [];
+    if (idx < 0 || idx >= bonificaciones.length) return res.status(404).json({ message: 'Bonificación no encontrada' });
+
+    bonificaciones[idx] = { ...bonificaciones[idx], ...req.body };
+
+    await ProdeConfig.findOneAndUpdate(
+      { key: 'prode' },
+      { $set: { 'value.bonificaciones': bonificaciones } },
+      { new: true }
+    );
+
+    res.json(bonificaciones[idx]);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE bonificación (por índice) ─────────────────────────────────────────
+router.delete('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
+  try {
+    const idx = Number(req.params.index);
+    const cfg = await ProdeConfig.findOne({ key: 'prode' });
+    if (!cfg) return res.status(404).json({ message: 'Config no encontrada' });
+
+    const bonificaciones = cfg.value?.bonificaciones || [];
+    if (idx < 0 || idx >= bonificaciones.length) return res.status(404).json({ message: 'Bonificación no encontrada' });
+
+    bonificaciones.splice(idx, 1);
+
+    await ProdeConfig.findOneAndUpdate(
+      { key: 'prode' },
+      { $set: { 'value.bonificaciones': bonificaciones } },
+      { new: true }
+    );
+
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+module.exports = router;

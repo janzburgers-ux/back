@@ -147,6 +147,14 @@ router.post('/fixture/seed-mock', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── DELETE partidos mockeados (apiId empieza con "mock-") ────────────────────
+router.delete('/fixture/mock', auth, adminOnly, async (req, res) => {
+  try {
+    const result = await ProdeMatch.deleteMany({ apiId: { $regex: /^mock-/ } });
+    res.json({ deleted: result.deletedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── PUT actualizar resultado de un partido manualmente (solo admin) ───────────
 router.put('/fixture/:id/resultado', auth, adminOnly, async (req, res) => {
   try {

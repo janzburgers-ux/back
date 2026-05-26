@@ -82,8 +82,8 @@ async function syncFixture() {
       return { synced: 0, error: 'La API devolvio 0 partidos. Verificar que el Mundial 2026 este disponible en tu plan.' };
     }
 
-    let synced = 0;
-    for (const m of matches) {
+    // Construir todas las operaciones de una sola vez → un único bulkWrite en lugar de 104 queries
+    const ops = matches.map(m => {
       const apiId     = String(m.id);
       const homeTeam  = m.homeTeam?.name || 'TBD';
       const awayTeam  = m.awayTeam?.name || 'TBD';
@@ -107,16 +107,20 @@ async function syncFixture() {
         status = 'live';
       }
 
-      await ProdeMatch.findOneAndUpdate(
-        { apiId },
-        { homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, homeScore, awayScore, status, winner },
-        { upsert: true, new: true }
-      );
-      synced++;
-    }
+      return {
+        updateOne: {
+          filter: { apiId },
+          update: { $set: { homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, homeScore, awayScore, status, winner } },
+          upsert: true,
+        },
+      };
+    });
+
+    const result = await ProdeMatch.bulkWrite(ops, { ordered: false });
+    const synced = result.upsertedCount + result.modifiedCount + result.matchedCount;
 
     console.log(`Prode: ${synced} partidos sincronizados desde football-data.org (WC 2026)`);
-    return { synced };
+    return { synced: matches.length, insertados: result.upsertedCount, actualizados: result.modifiedCount };
   } catch (err) {
     console.error('Prode sync error:', err.message);
     // Error 403 = key invalida, 429 = rate limit, 404 = competicion no encontrada

@@ -3,32 +3,45 @@ const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/
 const { Client } = require('../models/Order');
 const { sendMessage } = require('./whatsapp');
 
-// ── API-Football v3 — acceso directo (sin RapidAPI) ──────────────────────────
-// Registro gratuito: https://dashboard.api-football.com/register
-// Plan Free: 100 req/día, sin tarjeta de crédito
-// Env var requerida: API_FOOTBALL_KEY  (la key del dashboard de api-sports)
-// Endpoint: GET /fixtures?league=1&season=2026
-//   league=1 → FIFA World Cup (fijo, no cambia)
-//   season   → año del torneo (configurable desde admin, default 2026)
-const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
 
-// Mapeo de ronda en inglés → etapa en español
-function mapRoundToStage(round = '') {
-  const r = round.toLowerCase();
-  if (r.includes('group'))        return 'Fase de Grupos';
-  if (r.includes('round of 32')) return 'Ronda de 32';
-  if (r.includes('round of 16')) return 'Octavos de Final';
-  if (r.includes('quarter'))     return 'Cuartos de Final';
-  if (r.includes('semi'))        return 'Semifinal';
-  if (r.includes('3rd') || r.includes('third')) return 'Tercer Puesto';
-  if (r.includes('final'))       return 'Final';
-  return round;
+// ── football-data.org v4 ──────────────────────────────────────────────────────
+// Registro gratuito: https://www.football-data.org/client/register
+// Plan Free: 10 req/min, sin tarjeta de credito
+// Env var requerida: FOOTBALL_DATA_KEY (la key que llega por mail al registrarse)
+// Endpoint: GET /v4/competitions/WC/matches  (WC = FIFA World Cup, codigo fijo)
+const FOOTBALL_DATA_BASE = 'https://api.football-data.org/v4';
+
+// Mapeo stage football-data.org -> etapa en espanol
+function mapStage(stage = '') {
+  const map = {
+    GROUP_STAGE:    'Fase de Grupos',
+    ROUND_OF_32:    'Ronda de 32',
+    ROUND_OF_16:    'Octavos de Final',
+    QUARTER_FINALS: 'Cuartos de Final',
+    SEMI_FINALS:    'Semifinal',
+    THIRD_PLACE:    'Tercer Puesto',
+    FINAL:          'Final',
+  };
+  return map[stage] || stage;
 }
 
-// Estados de API-Football que significan "en juego"
-const LIVE_STATUSES = ['1H', '2H', 'HT', 'ET', 'BT', 'P', 'INT', 'LIVE'];
-// Estados que significan "terminado"
-const FINISHED_STATUSES = ['FT', 'AET', 'PEN'];
+// "GROUP_A" -> "Grupo A"
+function mapGroup(group = '') {
+  return group ? group.replace('GROUP_', 'Grupo ') : '';
+}
+
+// Estados live y terminado de football-data.org
+const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME'];
+const FINISHED_STATUSES = ['FINISHED'];
+
+// winner de football-data.org -> nuestro enum
+function mapWinner(winner) {
+  if (winner === 'HOME_TEAM') return 'home';
+  if (winner === 'AWAY_TEAM') return 'away';
+  if (winner === 'DRAW')      return 'draw';
+  return null;
+}
+
 
 // ── Obtener config activa ─────────────────────────────────────────────────────
 async function getProdeConfig() {
@@ -49,56 +62,48 @@ async function isProdeActive() {
   return true;
 }
 
-// ── Sync fixture desde API-Football v3 ───────────────────────────────────────
-async function syncFixture() {
-  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
-  const cfg = await getProdeConfig();
-  const season = cfg.season || 2026;
 
-  if (!API_FOOTBALL_KEY) {
-    return { synced: 0, error: 'API_FOOTBALL_KEY no definida en variables de entorno' };
+// ── Sync fixture desde football-data.org v4 ───────────────────────────────────
+async function syncFixture() {
+  const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
+
+  if (!FOOTBALL_DATA_KEY) {
+    return { synced: 0, error: 'FOOTBALL_DATA_KEY no definida en variables de entorno. Registrate en football-data.org y agregala en Railway.' };
   }
 
   try {
-    const { data } = await axios.get(`${API_FOOTBALL_BASE}/fixtures`, {
-      params: { league: 1, season },
-      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+    const { data } = await axios.get(`${FOOTBALL_DATA_BASE}/competitions/WC/matches`, {
+      headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY },
       timeout: 15000,
     });
 
-    const fixtures = data?.response || [];
-    if (!Array.isArray(fixtures) || fixtures.length === 0) {
-      return { synced: 0, error: `La API devolvió 0 partidos para league=1&season=${season}. Verificar API key.` };
+    const matches = data?.matches || [];
+    if (!Array.isArray(matches) || matches.length === 0) {
+      return { synced: 0, error: 'La API devolvio 0 partidos. Verificar que el Mundial 2026 este disponible en tu plan.' };
     }
 
     let synced = 0;
-    for (const f of fixtures) {
-      const fix    = f.fixture;
-      const teams  = f.teams;
-      const goals  = f.goals;
-      const league = f.league;
+    for (const m of matches) {
+      const apiId     = String(m.id);
+      const homeTeam  = m.homeTeam?.name || 'TBD';
+      const awayTeam  = m.awayTeam?.name || 'TBD';
+      const homeLogo  = m.homeTeam?.crest || '';
+      const awayLogo  = m.awayTeam?.crest || '';
+      const matchDate = m.utcDate ? new Date(m.utcDate) : null;
+      const stage     = mapStage(m.stage || '');
+      const group     = mapGroup(m.group || '');
 
-      const apiId     = String(fix?.id);
-      const homeTeam  = teams?.home?.name || 'TBD';
-      const awayTeam  = teams?.away?.name || 'TBD';
-      const homeLogo  = teams?.home?.logo || null;
-      const awayLogo  = teams?.away?.logo || null;
-      const matchDate = fix?.date ? new Date(fix.date) : null;
-      const stage     = mapRoundToStage(league?.round || '');
-      const group     = null; // API-Football no expone el grupo letra en /fixtures
+      let status    = 'scheduled';
+      let homeScore = null;
+      let awayScore = null;
+      let winner    = null;
 
-      const statusShort = fix?.status?.short || 'NS';
-      let status = 'scheduled';
-      let homeScore = null, awayScore = null, winner = null;
-
-      if (FINISHED_STATUSES.includes(statusShort)) {
+      if (FINISHED_STATUSES.includes(m.status)) {
         status    = 'finished';
-        homeScore = goals?.home ?? null;
-        awayScore = goals?.away ?? null;
-        if (homeScore !== null && awayScore !== null) {
-          winner = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : 'draw';
-        }
-      } else if (LIVE_STATUSES.includes(statusShort)) {
+        homeScore = m.score?.fullTime?.home ?? null;
+        awayScore = m.score?.fullTime?.away ?? null;
+        winner    = mapWinner(m.score?.winner);
+      } else if (LIVE_STATUSES.includes(m.status)) {
         status = 'live';
       }
 
@@ -110,13 +115,19 @@ async function syncFixture() {
       synced++;
     }
 
-    console.log(`✅ Prode: ${synced} partidos sincronizados desde API-Football (league=1, season=${season})`);
+    console.log(`Prode: ${synced} partidos sincronizados desde football-data.org (WC 2026)`);
     return { synced };
   } catch (err) {
-    console.error('❌ Prode sync error:', err.message);
+    console.error('Prode sync error:', err.message);
+    // Error 403 = key invalida, 429 = rate limit, 404 = competicion no encontrada
+    const status = err.response?.status;
+    if (status === 403) return { synced: 0, error: 'API key invalida o sin permisos. Verificar FOOTBALL_DATA_KEY.' };
+    if (status === 429) return { synced: 0, error: 'Rate limit alcanzado (10 req/min). Espera un momento y reintenta.' };
+    if (status === 404) return { synced: 0, error: 'Competicion WC no encontrada. Puede que el Mundial 2026 aun no este en el sistema.' };
     return { synced: 0, error: err.message };
   }
 }
+
 
 // ── Seed de fixture mockeado (para desarrollo o si la API no tiene el Mundial aún) ──
 async function seedMockFixture() {
@@ -265,11 +276,11 @@ async function evaluateMatch(matchId) {
 
     if (pts > 0) {
       await ProdePoints.create({
-        clientId: p.clientId,
-        tipo: 'pronostico',
-        descripcion: `${match.homeTeam} vs ${match.awayTeam} — ${pts} pts`,
-        puntos: pts,
+        clientId:    p.clientId,
         matchId,
+        tipo:        'pronostico',
+        descripcion: `${match.homeTeam} vs ${match.awayTeam} — ${pts} pts`,
+        puntos:      pts,
       });
     }
   }

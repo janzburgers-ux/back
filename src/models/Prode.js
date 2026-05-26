@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 // ── ProdeMatch — un partido del fixture ───────────────────────────────────────
 const ProdeMatchSchema = new mongoose.Schema({
-  matchId:    { type: Number, unique: true }, // ID de API-Football
+  apiId:      { type: String, unique: true, sparse: true }, // ID de API-Football (string)
   homeTeam:   { type: String, required: true },
   awayTeam:   { type: String, required: true },
   homeLogo:   { type: String, default: '' },
@@ -31,11 +31,15 @@ PronosticoSchema.index({ clientId: 1, matchId: 1 }, { unique: true });
 
 // ── ProdePoints — historial de puntos de un cliente ───────────────────────────
 const ProdePointsSchema = new mongoose.Schema({
-  clientId: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
-  matchId:  { type: mongoose.Schema.Types.ObjectId, ref: 'ProdeMatch', default: null },
-  puntos:   { type: Number, required: true },
-  motivo:   { type: String, default: '' }, // 'pronostico', 'bonificacion', etc.
+  clientId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
+  matchId:     { type: mongoose.Schema.Types.ObjectId, ref: 'ProdeMatch', default: null },
+  orderId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
+  puntos:      { type: Number, required: true },
+  tipo:        { type: String, enum: ['pronostico', 'compra', 'bonificacion'], default: 'compra' },
+  descripcion: { type: String, default: '' },
 }, { timestamps: true });
+
+ProdePointsSchema.index({ clientId: 1 });
 
 // ── ProdeConfig — configuración general del prode ─────────────────────────────
 const ProdeConfigSchema = new mongoose.Schema({

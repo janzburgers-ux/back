@@ -39,9 +39,9 @@ router.post('/acceso', async (req, res) => {
 
     // Verificar que tenga al menos un pedido
     const pedidos = await Order.countDocuments({ client: client._id });
-    if (pedidos === 0) {
+    if (pedidos < 1) {
       return res.status(403).json({
-        message: 'Para participar del prode necesitás haber realizado al menos un pedido.'
+        message: 'Para participar del prode necesitás haber realizado al menos un pedido en Janz.'
       });
     }
 
@@ -100,45 +100,44 @@ router.post('/fixture/sync', auth, adminOnly, async (req, res) => {
 // ── GET debug API — raw response de API-Football v3 (solo admin) ─────────────
 router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
   const axios = require('axios');
-  const { getProdeConfig } = require('../services/prode.service');
-  const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+  const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
+  const url = 'https://api.football-data.org/v4/competitions/WC/matches';
 
-  if (!API_FOOTBALL_KEY) {
+  if (!FOOTBALL_DATA_KEY) {
     return res.json({
       ok: false,
-      problema: 'API_FOOTBALL_KEY no está definida en las variables de entorno. Agregala en Railway.',
+      problema: 'FOOTBALL_DATA_KEY no esta definida en las variables de entorno. Registrate en football-data.org y agregala en Railway.',
     });
   }
 
-  const cfg    = await getProdeConfig();
-  const season = cfg.season || 2026;
-  const url    = `https://v3.football.api-sports.io/fixtures?league=1&season=${season}`;
-
   try {
     const resp = await axios.get(url, {
-      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+      headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY },
       timeout: 12000,
     });
-    const fixtures = resp.data?.response || [];
+    const matches = resp.data?.matches || [];
     return res.json({
       ok:             true,
       httpStatus:     resp.status,
       url,
-      season,
-      cantidad:       fixtures.length,
-      primer_partido: fixtures[0] || null,
+      cantidad:       matches.length,
+      primer_partido: matches[0] || null,
     });
   } catch (err) {
+    const status = err.response?.status;
+    let problema = err.message;
+    if (status === 403) problema = 'API key invalida o sin permisos para WC.';
+    if (status === 429) problema = 'Rate limit (10 req/min). Esperá un momento.';
+    if (status === 404) problema = 'Competicion WC no encontrada en este plan.';
     return res.json({
       ok:          false,
-      problema:    err.message,
-      httpStatus:  err.response?.status,
+      problema,
+      httpStatus:  status,
       apiResponse: err.response?.data,
       url,
     });
   }
 });
-
 
 // ── POST seed fixture mockeado (solo admin, solo si no hay datos) ─────────────
 router.post('/fixture/seed-mock', auth, adminOnly, async (req, res) => {

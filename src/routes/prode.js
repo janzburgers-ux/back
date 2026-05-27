@@ -223,12 +223,25 @@ router.get('/ranking', auth, async (req, res) => {
 router.get('/ranking/publico', async (req, res) => {
   try {
     const ranking = await getRanking();
-    const top5 = ranking.slice(0, 5).map((r, i) => ({
-      posicion: i + 1,
-      nombre: r.nombre,
+    const top20 = ranking.slice(0, 20).map((r, i) => ({
+      posicion:    i + 1,
+      _id:         r.clientId,
+      nombre:      r.nombre,
       totalPuntos: r.totalPuntos,
     }));
-    res.json(top5);
+    res.json(top20);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.get('/ranking/posicion/:clientId', async (req, res) => {
+  try {
+    const ranking = await getRanking();
+    const idx = ranking.findIndex(r => String(r.clientId) === req.params.clientId);
+    res.json({
+      posicion:    idx >= 0 ? idx + 1 : null,
+      total:       ranking.length,
+      totalPuntos: idx >= 0 ? ranking[idx].totalPuntos : 0,
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

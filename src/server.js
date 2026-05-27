@@ -107,6 +107,7 @@ app.use('/api/churn-job',       require('./routes/churn-job'));
 app.use('/api/rejected-orders', require('./routes/rejected-orders'));
 app.use('/api/expenses',        require('./routes/expenses'));
 app.use('/api/prode',           require('./routes/prode'));
+app.use('/api/prode-test',      require('./routes/prode-test'));
 app.use('/api/cash-movements',  require('./routes/cash-movements'));
 
 // /api/public — primero el router principal, luego los slots
@@ -126,9 +127,11 @@ app.use('/api/reviews',            require('./routes/reviews'));
 // ── Jobs automáticos ──────────────────────────────────────────────────────────
 const { startChurnJob }    = require('./jobs/churn-alert');
 const { startBirthdayJob } = require('./jobs/birthday-coupons');
+const { startProdeSync }   = require('./jobs/prode-sync');
 mongoose.connection.once('open', () => {
   startChurnJob().catch(err => console.error('❌ Error iniciando churn job:', err.message));
   startBirthdayJob();
+  startProdeSync();
 });
 
 // ── WhatsApp: status, initiate bajo demanda, y QR ────────────────────────────

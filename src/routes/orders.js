@@ -408,7 +408,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         }
       }
 
-      addProdePointsForOrder(order.client._id, order._id, order.total)
+      addProdePointsForOrder(order.client._id, order._id, order.total, order.items || [])
         .catch(e => console.error('Prode points error:', e.message));
     }
 

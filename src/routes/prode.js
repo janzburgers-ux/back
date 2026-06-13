@@ -52,6 +52,83 @@ router.post('/acceso', async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── POST solicitar código OTP (paso 1 del login con verificación) ─────────────
+router.post('/acceso/codigo', async (req, res) => {
+  try {
+    let { whatsapp } = req.body;
+    if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
+
+    const clean = whatsapp.replace(/\D/g, '');
+    const key   = clean.slice(-8); // últimos 8 dígitos como clave
+
+    const { Client, Order } = require('../models/Order');
+    const client = await Client.findOne({
+      $or: [
+        { whatsapp: { $regex: key } },
+        { phone:    { $regex: key } },
+      ],
+      active: true,
+    });
+
+    if (!client) {
+      return res.status(404).json({ message: 'No encontramos ese número. ¿Seguro que compraste con este WhatsApp?' });
+    }
+
+    const pedidos = await Order.countDocuments({ client: client._id });
+    if (pedidos < 1) {
+      return res.status(403).json({ message: 'Para participar necesitás haber realizado al menos un pedido en Janz.' });
+    }
+
+    const { requestOTP } = require('../utils/otp');
+    const result = requestOTP(key, String(client._id));
+
+    if (!result.ok) {
+      const secsLeft = Math.ceil((result.resendAt - Date.now()) / 1000);
+      return res.status(429).json({ message: `Aguardá ${secsLeft} segundos antes de pedir otro código.` });
+    }
+
+    // Enviar por WhatsApp
+    const { sendMessage } = require('../services/whatsapp');
+    const waNum = client.whatsapp || client.phone || '';
+    if (!waNum) return res.status(400).json({ message: 'No tenemos WhatsApp registrado para esta cuenta.' });
+
+    await sendMessage(waNum,
+      `🏆 *Prode Janz — Código de verificación*\n\n` +
+      `Tu código es: *${result.code}*\n\n` +
+      `Válido por 5 minutos. No lo compartas.\n\n` +
+      `_Janz Burgers_ 🍔⚽`
+    );
+
+    res.json({ sent: true, nombre: client.name.split(' ')[0] });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST verificar código OTP (paso 2) ────────────────────────────────────────
+router.post('/acceso/verificar', async (req, res) => {
+  try {
+    const { whatsapp, code } = req.body;
+    if (!whatsapp || !code) return res.status(400).json({ message: 'Faltan datos' });
+
+    const key = whatsapp.replace(/\D/g, '').slice(-8);
+    const { verifyOTP } = require('../utils/otp');
+    const result = verifyOTP(key, code);
+
+    if (!result.ok) {
+      if (result.reason === 'expired')   return res.status(400).json({ message: 'El código expiró. Pedí uno nuevo.' });
+      if (result.reason === 'too_many')  return res.status(400).json({ message: 'Demasiados intentos fallidos. Pedí un código nuevo.' });
+      if (result.reason === 'not_found') return res.status(400).json({ message: 'Código expirado. Pedí uno nuevo.' });
+      const left = result.attemptsLeft;
+      return res.status(400).json({ message: `Código incorrecto.${left > 0 ? ` Te quedan ${left} intento${left !== 1 ? 's' : ''}.` : ''}` });
+    }
+
+    const { Client } = require('../models/Order');
+    const client = await Client.findById(result.clientId);
+    if (!client) return res.status(404).json({ message: 'Cliente no encontrado' });
+
+    res.json({ clientId: client._id, nombre: client.name.split(' ')[0] });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── GET config del prode (público — para mostrar/ocultar banner en /pedido) ───
 router.get('/config', async (req, res) => {
   try {
@@ -165,9 +242,50 @@ router.put('/fixture/:id/resultado', auth, adminOnly, async (req, res) => {
       { homeScore, awayScore, winner, status: 'finished' },
       { new: true }
     );
-    // Evaluar pronósticos automáticamente
+
+    // Si el partido ya había sido evaluado (con resultado anterior o incorrecto),
+    // reseteamos todo para que la re-evaluación sea limpia.
+    const yaEvaluados = await Pronostico.countDocuments({ matchId: match._id, evaluated: true });
+    if (yaEvaluados > 0) {
+      // Eliminar ProdePoints de pronósticos de este partido
+      await ProdePoints.deleteMany({ matchId: match._id, tipo: 'pronostico' });
+      // Resetear flag en los pronósticos
+      await Pronostico.updateMany(
+        { matchId: match._id },
+        { $set: { evaluated: false, pointsEarned: 0 } }
+      );
+    }
+
+    // Evaluar pronósticos con el resultado correcto
     await evaluateMatch(match._id);
     res.json(match);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET todas las predicciones de un partido (admin) ─────────────────────────
+router.get('/pronosticos-admin', auth, adminOnly, async (req, res) => {
+  try {
+    const { matchId } = req.query;
+    const { Client } = require('../models/Order');
+
+    const filter = {};
+    if (matchId) filter.matchId = matchId;
+
+    const pronosticos = await Pronostico.find(filter)
+      .populate('matchId')
+      .lean();
+
+    const clientIds = [...new Set(pronosticos.map(p => String(p.clientId)))];
+    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone').lean();
+    const clientMap = {};
+    clients.forEach(c => { clientMap[String(c._id)] = c; });
+
+    const result = pronosticos.map(p => ({
+      ...p,
+      client: clientMap[String(p.clientId)] || null,
+    }));
+
+    res.json(result);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -356,6 +474,108 @@ router.delete('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
     );
 
     res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+
+// ── GET lista completa de participantes con stats (admin) ─────────────────────
+// Incluye clientes con 0 puntos (todos los que hicieron al menos 1 pronóstico)
+router.get('/participantes', auth, adminOnly, async (req, res) => {
+  try {
+    const { Client, Order } = require('../models/Order');
+    const { getProdeConfig } = require('../services/prode.service');
+
+    // Todos los clientIds con al menos 1 pronóstico
+    const clientIds = await Pronostico.distinct('clientId');
+    if (clientIds.length === 0) return res.json([]);
+
+    // Info de clientes
+    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone').lean();
+
+    // Puntos acumulados por cliente
+    const ptsByClient = await ProdePoints.aggregate([
+      { $match: { clientId: { $in: clientIds } } },
+      { $group: {
+        _id: '$clientId',
+        total:          { $sum: '$puntos' },
+        porPronostico:  { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
+        porCompra:      { $sum: { $cond: [{ $eq: ['$tipo', 'compra']    }, '$puntos', 0] } },
+      }}
+    ]);
+    const ptsMap = {};
+    ptsByClient.forEach(p => { ptsMap[String(p._id)] = p; });
+
+    // Estadísticas de pronósticos por cliente
+    const statsByClient = await Pronostico.aggregate([
+      { $match: { clientId: { $in: clientIds } } },
+      { $group: {
+        _id: '$clientId',
+        total:    { $sum: 1 },
+        acertados:{ $sum: { $cond: [{ $and: [{ $eq: ['$evaluated', true] }, { $gt: ['$pointsEarned', 0] }] }, 1, 0] } },
+        exactos:  { $sum: { $cond: [
+          { $and: [
+            { $eq: ['$evaluated', true] },
+            { $gt: ['$pointsEarned', 0] },
+            { $ne: ['$predictedHome', null] },
+          ]}, 1, 0
+        ]}},
+      }}
+    ]);
+    const statsMap = {};
+    statsByClient.forEach(s => { statsMap[String(s._id)] = s; });
+
+    // Config (para filtro de fechas en pedidos)
+    const cfg = await getProdeConfig();
+
+    // Construir resultado con pedidos en período (N+1 aceptable para el volumen de Janz)
+    const result = await Promise.all(clients.map(async c => {
+      const cid = String(c._id);
+      const filter = { client: c._id };
+      if (cfg.startDate) filter.createdAt = { $gte: new Date(cfg.startDate) };
+      if (cfg.endDate)   filter.createdAt = { ...(filter.createdAt || {}), $lte: new Date(cfg.endDate) };
+      const pedidosEnPeriodo = await Order.countDocuments(filter);
+      return {
+        clientId: c._id,
+        nombre:   c.name,
+        whatsapp: c.whatsapp || c.phone || '',
+        puntos:          ptsMap[cid]?.total          || 0,
+        puntosPronostico:ptsMap[cid]?.porPronostico  || 0,
+        puntosCompra:    ptsMap[cid]?.porCompra      || 0,
+        pronosticos: {
+          total:    statsMap[cid]?.total    || 0,
+          acertados:statsMap[cid]?.acertados|| 0,
+          exactos:  statsMap[cid]?.exactos  || 0,
+        },
+        pedidosEnPeriodo,
+      };
+    }));
+
+    result.sort((a, b) => b.puntos - a.puntos);
+    res.json(result);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE resetear predicciones de un cliente específico (admin/testing) ─────
+router.delete('/reset-cliente/:clientId', auth, adminOnly, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const [p, pts] = await Promise.all([
+      Pronostico.deleteMany({ clientId }),
+      ProdePoints.deleteMany({ clientId }),
+    ]);
+    res.json({ pronosticosEliminados: p.deletedCount, puntosEliminados: pts.deletedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE reset nuclear — borra TODOS los pronósticos y puntos (admin/testing) ─
+router.delete('/reset-all', auth, adminOnly, async (req, res) => {
+  try {
+    const [p, pts] = await Promise.all([
+      Pronostico.deleteMany({}),
+      ProdePoints.deleteMany({}),
+    ]);
+    // No tocamos ProdeMatch — los scores vienen de la API y se regeneran solos
+    res.json({ pronosticosEliminados: p.deletedCount, puntosEliminados: pts.deletedCount });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

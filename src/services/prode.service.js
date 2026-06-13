@@ -100,17 +100,45 @@ async function syncFixture() {
 
       if (FINISHED_STATUSES.includes(m.status)) {
         status    = 'finished';
-        homeScore = m.score?.fullTime?.home ?? null;
-        awayScore = m.score?.fullTime?.away ?? null;
+        // La API a veces devuelve null en fullTime incluso para FINISHED
+        // (ventana breve post-partido antes de que carguen el score).
+        // Usamos regularTime como fallback antes de renderirnos con null.
+        const ft = m.score?.fullTime;
+        const rt = m.score?.regularTime;
+        homeScore = ft?.home ?? rt?.home ?? null;
+        awayScore = ft?.away ?? rt?.away ?? null;
         winner    = mapWinner(m.score?.winner);
       } else if (LIVE_STATUSES.includes(m.status)) {
         status = 'live';
+        // En vivo: score parcial si está disponible
+        const ft = m.score?.fullTime;
+        homeScore = ft?.home ?? null;
+        awayScore = ft?.away ?? null;
+      }
+
+      // ── $set base: siempre actualizamos info del partido ─────────────────
+      const $setFields = {
+        homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, status,
+      };
+
+      // ── Scores/winner: solo sobreescribimos si la API trae datos reales.
+      // Esto evita que un "null" transitorio de la API borre un resultado
+      // ya guardado de un sync anterior.
+      if (status === 'finished' || status === 'live') {
+        if (homeScore !== null) $setFields.homeScore = homeScore;
+        if (awayScore !== null) $setFields.awayScore = awayScore;
+        if (winner    !== null) $setFields.winner    = winner;
+      } else {
+        // scheduled → limpiar scores (el partido todavía no empezó)
+        $setFields.homeScore = null;
+        $setFields.awayScore = null;
+        $setFields.winner    = null;
       }
 
       return {
         updateOne: {
           filter: { apiId },
-          update: { $set: { homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, homeScore, awayScore, status, winner } },
+          update: { $set: $setFields },
           upsert: true,
         },
       };
@@ -182,6 +210,15 @@ async function seedMockFixture() {
 async function addProdePointsForOrder(clientId, orderId, orderTotal, orderItems = []) {
   const active = await isProdeActive();
   if (!active) return null;
+
+  // Guard: evitar puntos duplicados si el evento del pedido llega más de una vez
+  if (orderId) {
+    const existing = await ProdePoints.findOne({ orderId });
+    if (existing) {
+      console.log(`Prode: puntos ya registrados para orden ${orderId} — skip`);
+      return null;
+    }
+  }
 
   const cfg = await getProdeConfig();
   let puntosTotales = cfg.pointsPerOrder || 1;

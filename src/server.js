@@ -107,7 +107,7 @@ app.use('/api/churn-job',       require('./routes/churn-job'));
 app.use('/api/rejected-orders', require('./routes/rejected-orders'));
 app.use('/api/expenses',        require('./routes/expenses'));
 app.use('/api/prode',           require('./routes/prode'));
-app.use('/api/prode-test',      require('./routes/prode-test'));
+
 app.use('/api/cash-movements',  require('./routes/cash-movements'));
 
 // /api/public — primero el router principal, luego los slots

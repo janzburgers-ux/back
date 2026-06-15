@@ -8,7 +8,7 @@ const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateP
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
 const { addPointsForOrder, getReferralConfig, registerReferralUse, validateReferralUse, isFraudAttempt } = require('../services/loyalty');
-const { addProdePointsForOrder } = require('../services/prode.service');
+const { processProdeCategoryOnDelivery } = require('../services/prode.service');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function nowAR() {
@@ -408,8 +408,6 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         }
       }
 
-      addProdePointsForOrder(order.client._id, order._id, order.total, order.items || [])
-        .catch(e => console.error('Prode points error:', e.message));
     }
 
     // ── preparing ─────────────────────────────────────────────────────────────
@@ -498,6 +496,9 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       await Client.findByIdAndUpdate(order.client._id, { $inc: { totalSpent: order.total } });
       addPointsForOrder(order.client._id, order.total)
         .catch(e => console.error('Error puntos fidelización:', e.message));
+
+      processProdeCategoryOnDelivery(order.client._id, order._id)
+        .catch(e => console.error('Prode category error:', e.message));
 
       // ── Validar uso de cupón de referido → acumula recompensa al dueño ────
       // Solo se acumula cuando el pedido es ENTREGADO (no al confirmar)

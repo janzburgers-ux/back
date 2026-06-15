@@ -1,17 +1,17 @@
 const axios = require('axios');
+const mongoose = require('mongoose');
 const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/Prode');
-const { Client } = require('../models/Order');
+const { Client, Order } = require('../models/Order');
 const { sendMessage } = require('./whatsapp');
 
+// ── Subtipos de bonificación (idempotencia) ───────────────────────────────────
+const BONUS = {
+  UPGRADE_CLIENTE: 'upgrade_cliente',
+  UPGRADE_VIP:     'upgrade_vip',
+};
 
-// ── football-data.org v4 ──────────────────────────────────────────────────────
-// Registro gratuito: https://www.football-data.org/client/register
-// Plan Free: 10 req/min, sin tarjeta de credito
-// Env var requerida: FOOTBALL_DATA_KEY (la key que llega por mail al registrarse)
-// Endpoint: GET /v4/competitions/WC/matches  (WC = FIFA World Cup, codigo fijo)
 const FOOTBALL_DATA_BASE = 'https://api.football-data.org/v4';
 
-// Mapeo stage football-data.org -> etapa en espanol
 function mapStage(stage = '') {
   const map = {
     GROUP_STAGE:    'Fase de Grupos',
@@ -25,16 +25,13 @@ function mapStage(stage = '') {
   return map[stage] || stage;
 }
 
-// "GROUP_A" -> "Grupo A"
 function mapGroup(group = '') {
   return group ? group.replace('GROUP_', 'Grupo ') : '';
 }
 
-// Estados live y terminado de football-data.org
 const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME'];
 const FINISHED_STATUSES = ['FINISHED'];
 
-// winner de football-data.org -> nuestro enum
 function mapWinner(winner) {
   if (winner === 'HOME_TEAM') return 'home';
   if (winner === 'AWAY_TEAM') return 'away';
@@ -42,6 +39,54 @@ function mapWinner(winner) {
   return null;
 }
 
+function normalizePhone(raw = '') {
+  return String(raw).replace(/\D/g, '');
+}
+
+function phoneKey(raw = '') {
+  const clean = normalizePhone(raw);
+  return clean.slice(-8);
+}
+
+async function findClientByPhone(raw = '') {
+  const key = phoneKey(raw);
+  if (!key) return null;
+  return Client.findOne({
+    $or: [
+      { whatsapp: { $regex: key } },
+      { phone:    { $regex: key } },
+    ],
+    active: true,
+  });
+}
+
+function buildDeliveredPeriodFilter(clientId, cfg) {
+  const filter = { client: clientId, status: 'delivered' };
+  if (cfg.startDate) {
+    filter.deliveredAt = { $gte: new Date(cfg.startDate) };
+  }
+  if (cfg.endDate) {
+    filter.deliveredAt = {
+      ...(filter.deliveredAt || {}),
+      $lte: new Date(cfg.endDate),
+    };
+  }
+  return filter;
+}
+
+async function countDeliveredPreProde(clientId, cfg) {
+  if (!cfg.startDate) return 0;
+  return Order.countDocuments({
+    client: clientId,
+    status: 'delivered',
+    deliveredAt: { $lt: new Date(cfg.startDate) },
+  });
+}
+
+async function countDeliveredInPeriod(clientId, cfg) {
+  if (!cfg.startDate) return 0;
+  return Order.countDocuments(buildDeliveredPeriodFilter(clientId, cfg));
+}
 
 // ── Obtener config activa ─────────────────────────────────────────────────────
 async function getProdeConfig() {
@@ -52,7 +97,6 @@ async function getProdeConfig() {
   return cfg.value;
 }
 
-// ── Verificar si el período de compras está activo ────────────────────────────
 async function isProdeActive() {
   const cfg = await getProdeConfig();
   if (!cfg.enabled) return false;
@@ -62,8 +106,15 @@ async function isProdeActive() {
   return true;
 }
 
+async function isOrderInProdePeriod(deliveredAt, cfg) {
+  if (!cfg.startDate) return false;
+  const d = new Date(deliveredAt);
+  if (d < new Date(cfg.startDate)) return false;
+  if (cfg.endDate && d > new Date(cfg.endDate)) return false;
+  return true;
+}
 
-// ── Sync fixture desde football-data.org v4 ───────────────────────────────────
+// ── Sync fixture ────────────────────────────────────────────────────────────────
 async function syncFixture() {
   const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
 
@@ -82,7 +133,6 @@ async function syncFixture() {
       return { synced: 0, error: 'La API devolvio 0 partidos. Verificar que el Mundial 2026 este disponible en tu plan.' };
     }
 
-    // Construir todas las operaciones de una sola vez → un único bulkWrite en lugar de 104 queries
     const ops = matches.map(m => {
       const apiId     = String(m.id);
       const homeTeam  = m.homeTeam?.name || 'TBD';
@@ -93,6 +143,13 @@ async function syncFixture() {
       const stage     = mapStage(m.stage || '');
       const group     = mapGroup(m.group || '');
 
+      const isTBD = (name) =>
+        !name ||
+        name === 'TBD' ||
+        /^(winner|loser|ganador|perdedor)\b/i.test(name) ||
+        /^(w|l)\s?(of|del?)\s/i.test(name);
+      const teamsConfirmed = !isTBD(homeTeam) && !isTBD(awayTeam);
+
       let status    = 'scheduled';
       let homeScore = null;
       let awayScore = null;
@@ -100,9 +157,6 @@ async function syncFixture() {
 
       if (FINISHED_STATUSES.includes(m.status)) {
         status    = 'finished';
-        // La API a veces devuelve null en fullTime incluso para FINISHED
-        // (ventana breve post-partido antes de que carguen el score).
-        // Usamos regularTime como fallback antes de renderirnos con null.
         const ft = m.score?.fullTime;
         const rt = m.score?.regularTime;
         homeScore = ft?.home ?? rt?.home ?? null;
@@ -110,26 +164,21 @@ async function syncFixture() {
         winner    = mapWinner(m.score?.winner);
       } else if (LIVE_STATUSES.includes(m.status)) {
         status = 'live';
-        // En vivo: score parcial si está disponible
         const ft = m.score?.fullTime;
         homeScore = ft?.home ?? null;
         awayScore = ft?.away ?? null;
       }
 
-      // ── $set base: siempre actualizamos info del partido ─────────────────
       const $setFields = {
         homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, status,
+        teamsConfirmed,
       };
 
-      // ── Scores/winner: solo sobreescribimos si la API trae datos reales.
-      // Esto evita que un "null" transitorio de la API borre un resultado
-      // ya guardado de un sync anterior.
       if (status === 'finished' || status === 'live') {
         if (homeScore !== null) $setFields.homeScore = homeScore;
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
       } else {
-        // scheduled → limpiar scores (el partido todavía no empezó)
         $setFields.homeScore = null;
         $setFields.awayScore = null;
         $setFields.winner    = null;
@@ -151,7 +200,6 @@ async function syncFixture() {
     return { synced: matches.length, insertados: result.upsertedCount, actualizados: result.modifiedCount };
   } catch (err) {
     console.error('Prode sync error:', err.message);
-    // Error 403 = key invalida, 429 = rate limit, 404 = competicion no encontrada
     const status = err.response?.status;
     if (status === 403) return { synced: 0, error: 'API key invalida o sin permisos. Verificar FOOTBALL_DATA_KEY.' };
     if (status === 429) return { synced: 0, error: 'Rate limit alcanzado (10 req/min). Espera un momento y reintenta.' };
@@ -160,8 +208,6 @@ async function syncFixture() {
   }
 }
 
-
-// ── Seed de fixture mockeado (para desarrollo o si la API no tiene el Mundial aún) ──
 async function seedMockFixture() {
   const existing = await ProdeMatch.countDocuments();
   if (existing > 0) return;
@@ -184,7 +230,6 @@ async function seedMockFixture() {
 
   for (const g of groups) {
     const t = teams[g];
-    // 6 partidos por grupo (todos contra todos)
     const pairs = [[0,1],[2,3],[0,2],[1,3],[0,3],[1,2]];
     for (const [i, j] of pairs) {
       const d = new Date(baseDate);
@@ -197,6 +242,7 @@ async function seedMockFixture() {
         awayTeam: t[j],
         matchDate: d,
         status: 'scheduled',
+        teamsConfirmed: true,
       });
       matchIndex++;
     }
@@ -206,89 +252,253 @@ async function seedMockFixture() {
   console.log(`🌱 Prode: ${matches.length} partidos mockeados insertados`);
 }
 
-// ── Sumar puntos por compra (incluye bonificaciones) ─────────────────────────
-async function addProdePointsForOrder(clientId, orderId, orderTotal, orderItems = []) {
-  const active = await isProdeActive();
-  if (!active) return null;
+// ── Bonus helpers ─────────────────────────────────────────────────────────────
+async function grantBonus(clientId, { subtipo, puntos, descripcion, orderId = null }) {
+  const existing = await ProdePoints.findOne({ clientId, subtipo });
+  if (existing) return null;
 
-  // Guard: evitar puntos duplicados si el evento del pedido llega más de una vez
-  if (orderId) {
-    const existing = await ProdePoints.findOne({ orderId });
-    if (existing) {
-      console.log(`Prode: puntos ya registrados para orden ${orderId} — skip`);
-      return null;
-    }
-  }
-
-  const cfg = await getProdeConfig();
-  let puntosTotales = cfg.pointsPerOrder || 1;
-  const detalles = [`Pedido confirmado: +${puntosTotales} pt`];
-
-  // ── Evaluar bonificaciones ───────────────────────────────────────────────
-  const bonificaciones = (cfg.bonificaciones || []).filter(b => b.activa);
-  for (const bon of bonificaciones) {
-    let ptsBonus = 0;
-
-    if (bon.tipo === 'gasto_minimo' && bon.montoMinimo > 0) {
-      // gastar más de $X = +N puntos
-      if (orderTotal >= bon.montoMinimo) {
-        ptsBonus = bon.puntos;
-        detalles.push(`${bon.descripcion || `Gasto ≥ $${bon.montoMinimo}`}: +${ptsBonus} pt`);
-      }
-    } else if (bon.tipo === 'por_cada_x' && bon.montoMinimo > 0) {
-      // cada $X gastado = +N puntos (se multiplica)
-      const veces = Math.floor(orderTotal / bon.montoMinimo);
-      if (veces > 0) {
-        ptsBonus = bon.puntos * veces;
-        detalles.push(`${bon.descripcion || `Cada $${bon.montoMinimo}`} ×${veces}: +${ptsBonus} pt`);
-      }
-    } else if (bon.tipo === 'producto' && bon.productoId) {
-      // comprar X producto = +N puntos
-      const tieneProducto = orderItems.some(item => {
-        const pid = item.product?._id?.toString() || item.product?.toString() || '';
-        return pid === bon.productoId;
-      });
-      if (tieneProducto) {
-        ptsBonus = bon.puntos;
-        detalles.push(`${bon.descripcion || `Compra de ${bon.productoNombre}`}: +${ptsBonus} pt`);
-      }
-    }
-
-    puntosTotales += ptsBonus;
-  }
-
-  await ProdePoints.create({
+  const record = await ProdePoints.create({
     clientId,
-    tipo: 'compra',
-    descripcion: detalles.join(' | '),
-    puntos: puntosTotales,
     orderId,
+    tipo: 'bonificacion',
+    subtipo,
+    descripcion,
+    puntos,
   });
 
-  // Notificar por WhatsApp
+  return record;
+}
+
+function resolveCategoria(entregasPreProde, entregasEnPeriodo) {
+  if (entregasEnPeriodo >= 2) return 'vip';
+  if (entregasPreProde >= 1 || entregasEnPeriodo >= 1) return 'cliente';
+  return 'invitado';
+}
+
+function resolvePremioSegmento(entregasPreProde, entregasEnPeriodo) {
+  if (entregasEnPeriodo >= 1) return 'competidor';
+  if (entregasPreProde >= 1) return 'cliente';
+  return 'invitado';
+}
+
+function premioDescripcion(segmento, cfg = {}) {
+  if (segmento === 'competidor') return 'Competís por los premios top 3 del ranking';
+  if (segmento === 'cliente')    return cfg.prizeCliente || 'Combo doble a elección';
+  return cfg.prizeInvitado || 'Cupón 20% en tu primera compra';
+}
+
+function buildProximoPaso(categoria, entregasPreProde, entregasEnPeriodo, cfg = {}) {
+  const faltaVip = Math.max(0, 2 - entregasEnPeriodo);
+
+  if (categoria === 'invitado') {
+    return 'Hacé tu primera compra entregada: pasás a Cliente y sumás +3 pts';
+  }
+  if (categoria === 'cliente' && faltaVip > 0) {
+    if (entregasPreProde >= 1 && entregasEnPeriodo === 0) {
+      return 'Comprá durante el Mundial para competir por el podio (+3 pts al llegar a VIP con 2 entregas)';
+    }
+    return faltaVip === 1
+      ? '1 entrega más en el período → VIP (+3 pts) y competís por el podio'
+      : `${faltaVip} entregas más en el período → VIP (+3 pts)`;
+  }
+  if (categoria === 'vip') {
+    return 'Sos VIP: competís por los premios top 3. ¡Seguí pronosticando!';
+  }
+  if (entregasEnPeriodo >= 1) {
+    return 'Competís por el podio. Seguí pronosticando para escalar posiciones.';
+  }
+  return cfg.prizeCliente ? `Premio Cliente: ${cfg.prizeCliente}` : '';
+}
+
+// ── Estado del participante ─────────────────────────────────────────────────────
+async function resolveProdeStatus(clientId) {
+  const cfg = await getProdeConfig();
+  const client = await Client.findById(clientId).select('name prodeRegisteredAt prodeGuestCouponCode').lean();
+  if (!client) return null;
+
+  const entregasPreProde  = await countDeliveredPreProde(clientId, cfg);
+  const entregasEnPeriodo = await countDeliveredInPeriod(clientId, cfg);
+  const categoria         = resolveCategoria(entregasPreProde, entregasEnPeriodo);
+  const premioSegmento    = resolvePremioSegmento(entregasPreProde, entregasEnPeriodo);
+  const elegibleTop3      = entregasEnPeriodo >= 1;
+  const faltaParaVip      = Math.max(0, 2 - entregasEnPeriodo);
+
+  const bonuses = await ProdePoints.find({
+    clientId,
+    tipo: 'bonificacion',
+    subtipo: { $in: [BONUS.UPGRADE_CLIENTE, BONUS.UPGRADE_VIP] },
+  }).select('subtipo puntos').lean();
+
+  const bonusMap = {};
+  bonuses.forEach(b => { bonusMap[b.subtipo] = b.puntos; });
+
+  const puntosBonus = bonuses.reduce((s, b) => s + b.puntos, 0);
+  const totalPts    = await getTotalPoints(clientId);
+
+  return {
+    clientId,
+    nombre: client.name?.split(' ')[0] || 'Participante',
+    categoria,
+    categoriaLabel: categoria === 'vip' ? 'VIP' : categoria === 'cliente' ? 'Cliente' : 'Invitado',
+    premioSegmento,
+    premioDescripcion: premioDescripcion(premioSegmento, cfg),
+    elegibleTop3,
+    entregasPreProde,
+    entregasEnPeriodo,
+    faltaParaVip,
+    proximoPaso: buildProximoPaso(categoria, entregasPreProde, entregasEnPeriodo, cfg),
+    bonusUpgradeCliente: bonusMap[BONUS.UPGRADE_CLIENTE] || 0,
+    bonusUpgradeVip:     bonusMap[BONUS.UPGRADE_VIP] || 0,
+    puntosBonus,
+    totalPuntos: totalPts,
+    cuponInvitado: client.prodeGuestCouponCode || null,
+    prodeRegisteredAt: client.prodeRegisteredAt || null,
+  };
+}
+
+// ── Procesar categoría al ENTREGAR pedido ───────────────────────────────────────
+async function processProdeCategoryOnDelivery(clientId, orderId) {
+  const cfg = await getProdeConfig();
+  if (!cfg.enabled) return null;
+
+  const order = await Order.findById(orderId).select('status deliveredAt client');
+  if (!order || order.status !== 'delivered') return null;
+
+  const deliveredAt = order.deliveredAt || new Date();
+  if (!await isOrderInProdePeriod(deliveredAt, cfg)) return null;
+
+  const entregasPreProde  = await countDeliveredPreProde(clientId, cfg);
+  const entregasEnPeriodo = await countDeliveredInPeriod(clientId, cfg);
+
+  const granted = [];
+
+  // Invitado → Cliente: 1.ª entrega en período sin historial pre-Prode
+  if (entregasEnPeriodo === 1 && entregasPreProde === 0) {
+    const r = await grantBonus(clientId, {
+      subtipo: BONUS.UPGRADE_CLIENTE,
+      puntos: cfg.pointsCategoryCliente || 3,
+      descripcion: 'Primera compra entregada — pasás a Cliente (+3 pts)',
+      orderId,
+    });
+    if (r) granted.push(BONUS.UPGRADE_CLIENTE);
+  }
+
+  // → VIP: 2.ª entrega en período
+  if (entregasEnPeriodo === 2) {
+    const r = await grantBonus(clientId, {
+      subtipo: BONUS.UPGRADE_VIP,
+      puntos: cfg.pointsCategoryVip || 3,
+      descripcion: '2 compras entregadas en el Mundial — sos VIP (+3 pts)',
+      orderId,
+    });
+    if (r) granted.push(BONUS.UPGRADE_VIP);
+  }
+
+  if (granted.length === 0) return { entregasEnPeriodo, entregasPreProde, granted: [] };
+
   try {
     const client = await Client.findById(clientId);
     if (client?.whatsapp) {
-      const totalPuntos = await getTotalPoints(clientId);
-      const bonusTxt = detalles.length > 1
-        ? `\n\n🎁 *Bonificaciones obtenidas:*\n${detalles.slice(1).map(d => `  • ${d}`).join('\n')}`
-        : '';
+      const status = await resolveProdeStatus(clientId);
+      const bonusTxt = granted.includes(BONUS.UPGRADE_VIP)
+        ? '🌟 *¡Ahora sos VIP!* Sumaste +3 pts extra.'
+        : '🎉 *¡Pasaste a Cliente!* Sumaste +3 pts extra.';
       const msg =
-        `🏆 *¡Sumaste puntos al Prode Janz!*\n\n` +
-        `Tu pedido suma *+${puntosTotales} punto${puntosTotales > 1 ? 's' : ''}* al ranking del Mundial.${bonusTxt}\n\n` +
-        `Tu total actual: *${totalPuntos} pts* 🌟\n\n` +
-        `Seguí pidiendo y pronosticando para escalar posiciones.\n\n` +
+        `🏆 *Prode Janz — Actualización*\n\n` +
+        `${bonusTxt}\n\n` +
+        `Tu total: *${status.totalPuntos} pts*\n` +
+        `Categoría: *${status.categoriaLabel}*\n\n` +
+        `${status.proximoPaso}\n\n` +
         `_Janz Burgers_ 🍔⚽`;
-      sendMessage(client.whatsapp, msg).catch(e => console.error('WA prode:', e.message));
+      sendMessage(client.whatsapp, msg).catch(e => console.error('WA prode category:', e.message));
     }
   } catch (e) {
-    console.error('WA prode points:', e.message);
+    console.error('WA prode category notify:', e.message);
   }
 
-  return { puntos: puntosTotales, detalles };
+  return { entregasEnPeriodo, entregasPreProde, granted };
 }
 
-// ── Evaluar pronósticos de un partido terminado ───────────────────────────────
+// ── Registro invitado ───────────────────────────────────────────────────────────
+function generateProdeCouponCode(name = 'INV') {
+  const prefix = String(name).replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase() || 'INV';
+  const suffix = String(Math.floor(1000 + Math.random() * 9000));
+  return `PRODE${prefix}${suffix}`;
+}
+
+async function createGuestCoupon(client, cfg) {
+  if (client.prodeGuestCouponCode) {
+    return client.prodeGuestCouponCode;
+  }
+
+  const entregasPre = await countDeliveredPreProde(client._id, cfg);
+  if (entregasPre > 0) return null;
+
+  const Coupon = require('../models/Coupon');
+  let code = generateProdeCouponCode(client.name);
+  for (let i = 0; i < 5; i++) {
+    const exists = await Coupon.findOne({ code });
+    if (!exists) break;
+    code = generateProdeCouponCode(client.name);
+  }
+
+  await Coupon.create({
+    code,
+    owner: client._id,
+    ownerName: client.name,
+    type: 'admin',
+    discountForUser: cfg.guestCouponPercent || 20,
+    singleUse: true,
+    unlimited: false,
+    active: true,
+    expiresAt: cfg.endDate ? new Date(cfg.endDate) : null,
+  });
+
+  await Client.findByIdAndUpdate(client._id, { prodeGuestCouponCode: code });
+  return code;
+}
+
+async function registerProdeGuest({ nombre, whatsapp }) {
+  const clean = normalizePhone(whatsapp);
+  if (!nombre?.trim() || clean.length < 8) {
+    throw new Error('Nombre y WhatsApp válido son requeridos');
+  }
+
+  const cfg = await getProdeConfig();
+  if (!cfg.enabled) throw new Error('El Prode no está activo');
+
+  let client = await findClientByPhone(clean);
+  if (!client) {
+    client = await Client.create({
+      name: nombre.trim(),
+      whatsapp: clean,
+      phone: clean,
+      prodeRegisteredAt: new Date(),
+    });
+  } else {
+    if (!client.prodeRegisteredAt) {
+      client.prodeRegisteredAt = new Date();
+      await client.save();
+    }
+  }
+
+  const couponCode = await createGuestCoupon(client, cfg);
+
+  return { client, couponCode };
+}
+
+async function markProdeRegistered(clientId) {
+  const client = await Client.findById(clientId);
+  if (!client) return;
+  if (!client.prodeRegisteredAt) {
+    client.prodeRegisteredAt = new Date();
+    await client.save();
+  }
+  const cfg = await getProdeConfig();
+  await createGuestCoupon(client, cfg);
+}
+
+// ── Evaluar pronósticos ─────────────────────────────────────────────────────────
 async function evaluateMatch(matchId) {
   const match = await ProdeMatch.findById(matchId);
   if (!match || match.status !== 'finished' || match.winner === null) return;
@@ -299,15 +509,14 @@ async function evaluateMatch(matchId) {
   for (const p of pronosticos) {
     let pts = 0;
     if (p.predictedWinner === match.winner) {
-      pts += cfg.pointsWinner || 1;
-      // Resultado exacto
+      pts += cfg.pointsWinner || 3;
       if (
         p.predictedHome !== null &&
         p.predictedAway !== null &&
         p.predictedHome === match.homeScore &&
         p.predictedAway === match.awayScore
       ) {
-        pts += cfg.pointsExact || 5;
+        pts += cfg.pointsExact || 3;
       }
     }
 
@@ -329,25 +538,30 @@ async function evaluateMatch(matchId) {
   console.log(`✅ Evaluados ${pronosticos.length} pronósticos para ${match.homeTeam} vs ${match.awayTeam}`);
 }
 
-// ── Obtener total de puntos de un cliente ─────────────────────────────────────
 async function getTotalPoints(clientId) {
   const result = await ProdePoints.aggregate([
-    { $match: { clientId: new (require('mongoose').Types.ObjectId)(clientId) } },
-    { $group: { _id: null, total: { $sum: '$puntos' } } }
+    { $match: {
+      clientId: new mongoose.Types.ObjectId(clientId),
+      tipo: { $in: ['pronostico', 'bonificacion'] },
+    }},
+    { $group: { _id: null, total: { $sum: '$puntos' } } },
   ]);
   return result[0]?.total || 0;
 }
 
-// ── Ranking general ───────────────────────────────────────────────────────────
+// ── Ranking general ─────────────────────────────────────────────────────────────
 async function getRanking() {
+  const cfg = await getProdeConfig();
+
   const ranking = await ProdePoints.aggregate([
+    { $match: { tipo: { $in: ['pronostico', 'bonificacion'] } } },
     {
       $group: {
         _id: '$clientId',
-        totalPuntos: { $sum: '$puntos' },
+        totalPuntos:       { $sum: '$puntos' },
         puntosPronosticos: { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
-        puntosCompras:     { $sum: { $cond: [{ $eq: ['$tipo', 'compra']    }, '$puntos', 0] } },
-      }
+        puntosBonus:       { $sum: { $cond: [{ $eq: ['$tipo', 'bonificacion'] }, '$puntos', 0] } },
+      },
     },
     { $sort: { totalPuntos: -1 } },
     {
@@ -355,42 +569,114 @@ async function getRanking() {
         from: 'clients',
         localField: '_id',
         foreignField: '_id',
-        as: 'client'
-      }
+        as: 'client',
+      },
     },
     { $unwind: '$client' },
     {
       $project: {
         clientId: '$_id',
         nombre: '$client.name',
+        apodo: { $arrayElemAt: [{ $split: ['$client.name', ' '] }, 0] },
         whatsapp: '$client.whatsapp',
         totalPuntos: 1,
         puntosPronosticos: 1,
-        puntosCompras: 1,
-      }
-    }
+        puntosBonus: 1,
+        puntosCompras: '$puntosBonus',
+      },
+    },
   ]);
 
-  // Agregar cantidad de pedidos en el período activo
-  const cfg = await getProdeConfig();
   for (const r of ranking) {
-    const { Order } = require('../models/Order');
-    const filter = { client: r.clientId };
-    if (cfg.startDate) filter.createdAt = { $gte: new Date(cfg.startDate) };
-    if (cfg.endDate)   filter.createdAt = { ...filter.createdAt, $lte: new Date(cfg.endDate) };
-    r.pedidosEnPeriodo = await Order.countDocuments(filter);
+    const status = await resolveProdeStatus(r.clientId);
+    r.categoria         = status?.categoria || 'invitado';
+    r.categoriaLabel    = status?.categoriaLabel || 'Invitado';
+    r.premioSegmento    = status?.premioSegmento || 'invitado';
+    r.elegibleTop3      = status?.elegibleTop3 || false;
+    r.entregasEnPeriodo = status?.entregasEnPeriodo || 0;
+    r.entregasPreProde  = status?.entregasPreProde || 0;
+    r.pedidosEnPeriodo  = r.entregasEnPeriodo;
   }
 
   return ranking;
 }
 
+async function getTop3Competidores() {
+  const ranking = await getRanking();
+  return ranking.filter(r => r.elegibleTop3).slice(0, 3);
+}
+
+async function getPremiosAdmin() {
+  const cfg = await getProdeConfig();
+  const clientIds = await Pronostico.distinct('clientId');
+  if (clientIds.length === 0) {
+    return { invitados: [], clientes: [], top3: [] };
+  }
+
+  const statuses = await Promise.all(clientIds.map(id => resolveProdeStatus(id)));
+  const ranking  = await getRanking();
+  const rankMap  = {};
+  ranking.forEach((r, i) => { rankMap[String(r.clientId)] = { posicion: i + 1, totalPuntos: r.totalPuntos }; });
+
+  const invitados = [];
+  const clientes  = [];
+
+  for (const s of statuses) {
+    if (!s) continue;
+    const rank = rankMap[String(s.clientId)] || {};
+    const row = {
+      clientId: s.clientId,
+      nombre: s.nombre,
+      totalPuntos: rank.totalPuntos || s.totalPuntos,
+      posicion: rank.posicion || null,
+      cuponInvitado: s.cuponInvitado,
+      premio: premioDescripcion(s.premioSegmento, cfg),
+    };
+
+    if (s.premioSegmento === 'invitado') invitados.push(row);
+    else if (s.premioSegmento === 'cliente') clientes.push(row);
+  }
+
+  const top3 = ranking.filter(r => r.elegibleTop3).slice(0, 3).map((r, i) => ({
+    posicion: i + 1,
+    clientId: r.clientId,
+    nombre: r.nombre?.split(' ')[0] || r.nombre,
+    totalPuntos: r.totalPuntos,
+    categoria: r.categoriaLabel,
+    premio: [cfg.prize1, cfg.prize2, cfg.prize3][i] || '',
+  }));
+
+  return { invitados, clientes, top3, cfg: {
+    prizeInvitado: cfg.prizeInvitado,
+    prizeCliente: cfg.prizeCliente,
+    prize1: cfg.prize1,
+    prize2: cfg.prize2,
+    prize3: cfg.prize3,
+  }};
+}
+
+// Legacy: usado por prode-test — redirige a processProdeCategoryOnDelivery
+async function addProdePointsForOrder(clientId, orderId) {
+  return processProdeCategoryOnDelivery(clientId, orderId);
+}
+
 module.exports = {
+  BONUS,
   getProdeConfig,
   isProdeActive,
   syncFixture,
   seedMockFixture,
+  processProdeCategoryOnDelivery,
   addProdePointsForOrder,
+  registerProdeGuest,
+  markProdeRegistered,
+  findClientByPhone,
+  resolveProdeStatus,
   evaluateMatch,
   getTotalPoints,
   getRanking,
+  getTop3Competidores,
+  getPremiosAdmin,
+  normalizePhone,
+  phoneKey,
 };

@@ -3,6 +3,7 @@ const router = express.Router();
 const Config = require('../models/Config');
 const { Product } = require('../models/Product');
 const { auth, adminOnly } = require('../middleware/auth');
+const { getNextArgentinaMatch, getAllArgentinaMatches } = require('../services/mundial.service');
 
 const DEFAULTS = {
   indirectCosts: { luz: 5, gas: 3, packaging: 4, otros: 3 },
@@ -81,7 +82,16 @@ const DEFAULTS = {
     month:       ''
   },
   // Templates de mensajes WhatsApp (null = usa el hardcoded del servicio)
-  whatsappTemplates: null
+  whatsappTemplates: null,
+  // Modo Mundial
+  mundialMode:   false,
+  argentinaGano: false,
+  nextMatch:     null,
+  // Imagen del hero (portada pública)
+  heroImage: { url: null, publicId: null },
+  // Excepciones de apertura por fecha específica
+  // [{ date: 'YYYY-MM-DD', status: 'closed'|'open', message: '' }]
+  operationOverrides: [],
 };
 
 async function upsert(key, value, label = '') {
@@ -150,15 +160,41 @@ router.get('/', auth, adminOnly, async (req, res) => {
 // ── GET config pública ─────────────────────────────────────────────────────
 router.get('/public', async (req, res) => {
   try {
-    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder', 'max-orders-per-slot', 'cajaGoals'];
+    const keys = ['schedule', 'zones', 'transferAlias', 'loyalty', 'hourlyDiscount', 'notesPlaceholder', 'max-orders-per-slot', 'cajaGoals', 'mundialMode', 'argentinaGano', 'nextMatch', 'heroImage', 'operationOverrides'];
     // Normalizar la key con guiones a camelCase para el frontend
     const keyMap = { 'max-orders-per-slot': 'maxOrdersPerSlot' };
     const configs = await Config.find({ key: { $in: keys } });
     const result = {};
     keys.forEach(k => { const mapped = keyMap[k] || k; result[mapped] = DEFAULTS[k] !== undefined ? DEFAULTS[k] : null; });
     configs.forEach(cfg => { const k = keyMap[cfg.key] || cfg.key; result[k] = cfg.value; });
+
+    // ── Auto-detección del próximo partido de Argentina ─────────────────────
+    // Si mundialMode está activo y nextMatch no fue configurado manualmente
+    // (o no tiene opponent), se consulta la API pública de openfootball.
+    if (result.mundialMode && (!result.nextMatch || !result.nextMatch.opponent)) {
+      try {
+        const autoMatch = await getNextArgentinaMatch();
+        if (autoMatch) result.nextMatch = autoMatch;
+      } catch (e) {
+        console.error('[Mundial] Error auto-fetching next match:', e.message);
+      }
+    }
+
     res.json(result);
   } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET próximo partido Argentina (admin — para el panel de config) ─────────
+router.get('/next-match-arg', auth, adminOnly, async (req, res) => {
+  try {
+    const [next, all] = await Promise.all([
+      getNextArgentinaMatch(),
+      getAllArgentinaMatches(),
+    ]);
+    res.json({ next, all });
+  } catch (err) {
+    res.status(500).json({ message: 'No se pudo obtener el fixture', error: err.message });
+  }
 });
 
 // ── PUT alias ─────────────────────────────────────────────────────────────

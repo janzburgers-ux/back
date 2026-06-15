@@ -2,18 +2,20 @@ const mongoose = require('mongoose');
 
 // ── ProdeMatch — un partido del fixture ───────────────────────────────────────
 const ProdeMatchSchema = new mongoose.Schema({
-  apiId:      { type: String, unique: true, sparse: true }, // ID de API-Football (string)
-  homeTeam:   { type: String, required: true },
-  awayTeam:   { type: String, required: true },
-  homeLogo:   { type: String, default: '' },
-  awayLogo:   { type: String, default: '' },
-  matchDate:  { type: Date, required: true },
-  stage:      { type: String, default: 'Fase de Grupos' }, // Fase de Grupos, Octavos, etc.
-  group:      { type: String, default: '' },               // Grupo A, B, etc.
-  status:     { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
-  homeScore:  { type: Number, default: null },
-  awayScore:  { type: Number, default: null },
-  winner:     { type: String, enum: ['home', 'away', 'draw', null], default: null },
+  apiId:          { type: String, unique: true, sparse: true },
+  homeTeam:       { type: String, required: true },
+  awayTeam:       { type: String, required: true },
+  homeLogo:       { type: String, default: '' },
+  awayLogo:       { type: String, default: '' },
+  matchDate:      { type: Date, required: true },
+  stage:          { type: String, default: 'Fase de Grupos' },
+  group:          { type: String, default: '' },
+  status:         { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
+  homeScore:      { type: Number, default: null },
+  awayScore:      { type: Number, default: null },
+  winner:         { type: String, enum: ['home', 'away', 'draw', null], default: null },
+  // true = ambos equipos definidos; false = alguno es TBD (no se permiten pronósticos)
+  teamsConfirmed: { type: Boolean, default: true },
 }, { timestamps: true });
 
 // ── Pronostico — pronóstico de un cliente para un partido ─────────────────────
@@ -35,11 +37,16 @@ const ProdePointsSchema = new mongoose.Schema({
   matchId:     { type: mongoose.Schema.Types.ObjectId, ref: 'ProdeMatch', default: null },
   orderId:     { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
   puntos:      { type: Number, required: true },
-  tipo:        { type: String, enum: ['pronostico', 'compra', 'bonificacion'], default: 'compra' },
+  tipo:        { type: String, enum: ['pronostico', 'compra', 'bonificacion'], default: 'bonificacion' },
+  subtipo:     { type: String, default: '' },
   descripcion: { type: String, default: '' },
 }, { timestamps: true });
 
 ProdePointsSchema.index({ clientId: 1 });
+ProdePointsSchema.index(
+  { clientId: 1, subtipo: 1 },
+  { unique: true, partialFilterExpression: { subtipo: { $type: 'string', $ne: '' } } }
+);
 
 // ── ProdeConfig — configuración general del prode ─────────────────────────────
 const ProdeConfigSchema = new mongoose.Schema({

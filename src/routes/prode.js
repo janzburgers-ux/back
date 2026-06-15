@@ -10,44 +10,79 @@ const {
   evaluateMatch,
   getRanking,
   getTotalPoints,
+  resolveProdeStatus,
+  markProdeRegistered,
+  registerProdeGuest,
+  findClientByPhone,
+  getPremiosAdmin,
+  normalizePhone,
+  phoneKey,
 } = require('../services/prode.service');
 
-// ── POST acceso al prode por número de WhatsApp (público, sin auth) ──────────
+// ── POST registro invitado (nombre + WhatsApp, sin pedido previo) ─────────────
+router.post('/registro', async (req, res) => {
+  try {
+    const { nombre, whatsapp } = req.body;
+    if (!nombre?.trim() || !whatsapp) {
+      return res.status(400).json({ message: 'Nombre y WhatsApp son requeridos' });
+    }
+
+    const { client, couponCode } = await registerProdeGuest({ nombre, whatsapp });
+    const key = phoneKey(whatsapp);
+    const { requestOTP } = require('../utils/otp');
+    const result = requestOTP(key, String(client._id));
+
+    if (!result.ok) {
+      const secsLeft = Math.ceil((result.resendAt - Date.now()) / 1000);
+      return res.status(429).json({ message: `Aguardá ${secsLeft} segundos antes de pedir otro código.` });
+    }
+
+    const cfg = await getProdeConfig();
+    const guestPercent = cfg.guestCouponPercent || 20;
+
+    const waNum = client.whatsapp || client.phone || normalizePhone(whatsapp);
+    const { sendMessage } = require('../services/whatsapp');
+    let msg =
+      `🏆 *¡Bienvenido al Prode Janz!*\n\n` +
+      `Tu código de verificación es: *${result.code}*\n\n` +
+      `Válido por 5 minutos.\n\n`;
+    if (couponCode) {
+      msg += `🎟️ Tu cupón de invitado: *${couponCode}* (${guestPercent}% OFF en tu primera compra)\n\n`;
+    }
+    msg += `_Janz Burgers_ 🍔⚽`;
+    await sendMessage(waNum, msg);
+
+    res.json({
+      sent: true,
+      nombre: client.name.split(' ')[0],
+      cuponInvitado: couponCode || null,
+    });
+  } catch (err) {
+    res.status(err.message?.includes('activo') ? 403 : 500).json({ message: err.message });
+  }
+});
+
+// ── POST acceso al prode por número de WhatsApp (legacy, sin OTP) ─────────────
 router.post('/acceso', async (req, res) => {
   try {
     let { whatsapp } = req.body;
     if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
 
-    // Normalizar: limpiar caracteres no numéricos
-    const clean = whatsapp.replace(/\D/g, '');
-
-    // Buscar cliente por whatsapp o phone (con variantes de formato)
-    const { Client, Order } = require('../models/Order');
-    const client = await Client.findOne({
-      $or: [
-        { whatsapp: { $regex: clean.slice(-8) } }, // últimos 8 dígitos
-        { phone:    { $regex: clean.slice(-8) } },
-      ],
-      active: true,
-    });
-
+    const client = await findClientByPhone(whatsapp);
     if (!client) {
       return res.status(404).json({
-        message: 'No encontramos ese número. ¿Seguro que compraste con este WhatsApp?'
+        message: 'No encontramos este número. Registrate como invitado si nunca compraste en Janz.',
+        code: 'CLIENT_NOT_FOUND',
       });
     }
 
-    // Verificar que tenga al menos un pedido
-    const pedidos = await Order.countDocuments({ client: client._id });
-    if (pedidos < 1) {
-      return res.status(403).json({
-        message: 'Para participar del prode necesitás haber realizado al menos un pedido en Janz.'
-      });
-    }
+    await markProdeRegistered(client._id);
+    const estado = await resolveProdeStatus(client._id);
 
     res.json({
       clientId: client._id,
       nombre: client.name.split(' ')[0],
+      estado,
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -58,25 +93,14 @@ router.post('/acceso/codigo', async (req, res) => {
     let { whatsapp } = req.body;
     if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
 
-    const clean = whatsapp.replace(/\D/g, '');
-    const key   = clean.slice(-8); // últimos 8 dígitos como clave
-
-    const { Client, Order } = require('../models/Order');
-    const client = await Client.findOne({
-      $or: [
-        { whatsapp: { $regex: key } },
-        { phone:    { $regex: key } },
-      ],
-      active: true,
-    });
+    const key = phoneKey(whatsapp);
+    const client = await findClientByPhone(whatsapp);
 
     if (!client) {
-      return res.status(404).json({ message: 'No encontramos ese número. ¿Seguro que compraste con este WhatsApp?' });
-    }
-
-    const pedidos = await Order.countDocuments({ client: client._id });
-    if (pedidos < 1) {
-      return res.status(403).json({ message: 'Para participar necesitás haber realizado al menos un pedido en Janz.' });
+      return res.status(404).json({
+        message: 'No encontramos este número. Registrate como invitado si nunca compraste en Janz.',
+        code: 'CLIENT_NOT_FOUND',
+      });
     }
 
     const { requestOTP } = require('../utils/otp');
@@ -87,7 +111,6 @@ router.post('/acceso/codigo', async (req, res) => {
       return res.status(429).json({ message: `Aguardá ${secsLeft} segundos antes de pedir otro código.` });
     }
 
-    // Enviar por WhatsApp
     const { sendMessage } = require('../services/whatsapp');
     const waNum = client.whatsapp || client.phone || '';
     if (!waNum) return res.status(400).json({ message: 'No tenemos WhatsApp registrado para esta cuenta.' });
@@ -125,7 +148,23 @@ router.post('/acceso/verificar', async (req, res) => {
     const client = await Client.findById(result.clientId);
     if (!client) return res.status(404).json({ message: 'Cliente no encontrado' });
 
-    res.json({ clientId: client._id, nombre: client.name.split(' ')[0] });
+    await markProdeRegistered(client._id);
+    const estado = await resolveProdeStatus(client._id);
+
+    res.json({
+      clientId: client._id,
+      nombre: client.name.split(' ')[0],
+      estado,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET estado del participante (categoría, progreso, premio) ─────────────────
+router.get('/estado/:clientId', async (req, res) => {
+  try {
+    const estado = await resolveProdeStatus(req.params.clientId);
+    if (!estado) return res.status(404).json({ message: 'Participante no encontrado' });
+    res.json(estado);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -310,6 +349,15 @@ router.post('/pronosticos', async (req, res) => {
     // Verificar que el partido no haya empezado (cutoff)
     const match = await ProdeMatch.findById(matchId);
     if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
+
+    // ── Equipos no confirmados → no se puede pronosticar ─────────────────
+    if (match.teamsConfirmed === false) {
+      return res.status(400).json({
+        message: 'Los equipos de este partido aún no están confirmados. Podrás pronosticar una vez que se definan los clasificados.',
+        code: 'TEAMS_NOT_CONFIRMED',
+      });
+    }
+
     if (match.status !== 'scheduled') {
       return res.status(400).json({ message: 'El partido ya comenzó, no se pueden modificar pronósticos' });
     }
@@ -325,7 +373,37 @@ router.post('/pronosticos', async (req, res) => {
       { predictedWinner, predictedHome: predictedHome ?? null, predictedAway: predictedAway ?? null, evaluated: false, pointsEarned: 0 },
       { upsert: true, new: true }
     );
+
+    await markProdeRegistered(clientId);
+
     res.json(pronostico);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT confirmar equipos manualmente (admin) — cuando el sync tarda en actualizar ──
+router.put('/fixture/:id/teams', auth, adminOnly, async (req, res) => {
+  try {
+    const { homeTeam, awayTeam, homeLogo, awayLogo } = req.body;
+    if (!homeTeam || !awayTeam) {
+      return res.status(400).json({ message: 'homeTeam y awayTeam son requeridos' });
+    }
+    const match = await ProdeMatch.findByIdAndUpdate(
+      req.params.id,
+      { homeTeam, awayTeam, teamsConfirmed: true,
+        ...(homeLogo !== undefined && { homeLogo }),
+        ...(awayLogo !== undefined && { awayLogo }),
+      },
+      { new: true }
+    );
+    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
+    res.json(match);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+// ── GET premios segmentados (admin) ───────────────────────────────────────────
+router.get('/premios', auth, adminOnly, async (req, res) => {
+  try {
+    const premios = await getPremiosAdmin();
+    res.json(premios);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -342,10 +420,12 @@ router.get('/ranking/publico', async (req, res) => {
   try {
     const ranking = await getRanking();
     const top20 = ranking.slice(0, 20).map((r, i) => ({
-      posicion:    i + 1,
-      _id:         r.clientId,
-      nombre:      r.nombre,
-      totalPuntos: r.totalPuntos,
+      posicion:       i + 1,
+      _id:            r.clientId,
+      nombre:         r.apodo || r.nombre?.split(' ')[0] || r.nombre,
+      totalPuntos:    r.totalPuntos,
+      categoria:      r.categoriaLabel,
+      elegibleTop3:   r.elegibleTop3,
     }));
     res.json(top20);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -479,33 +559,27 @@ router.delete('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
 
 
 // ── GET lista completa de participantes con stats (admin) ─────────────────────
-// Incluye clientes con 0 puntos (todos los que hicieron al menos 1 pronóstico)
 router.get('/participantes', auth, adminOnly, async (req, res) => {
   try {
-    const { Client, Order } = require('../models/Order');
-    const { getProdeConfig } = require('../services/prode.service');
+    const { Client } = require('../models/Order');
 
-    // Todos los clientIds con al menos 1 pronóstico
     const clientIds = await Pronostico.distinct('clientId');
     if (clientIds.length === 0) return res.json([]);
 
-    // Info de clientes
-    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone').lean();
+    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone prodeGuestCouponCode').lean();
 
-    // Puntos acumulados por cliente
     const ptsByClient = await ProdePoints.aggregate([
-      { $match: { clientId: { $in: clientIds } } },
+      { $match: { clientId: { $in: clientIds }, tipo: { $in: ['pronostico', 'bonificacion'] } } },
       { $group: {
         _id: '$clientId',
-        total:          { $sum: '$puntos' },
-        porPronostico:  { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
-        porCompra:      { $sum: { $cond: [{ $eq: ['$tipo', 'compra']    }, '$puntos', 0] } },
+        total:         { $sum: '$puntos' },
+        porPronostico: { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
+        porBonus:      { $sum: { $cond: [{ $eq: ['$tipo', 'bonificacion'] }, '$puntos', 0] } },
       }}
     ]);
     const ptsMap = {};
     ptsByClient.forEach(p => { ptsMap[String(p._id)] = p; });
 
-    // Estadísticas de pronósticos por cliente
     const statsByClient = await Pronostico.aggregate([
       { $match: { clientId: { $in: clientIds } } },
       { $group: {
@@ -524,29 +598,28 @@ router.get('/participantes', auth, adminOnly, async (req, res) => {
     const statsMap = {};
     statsByClient.forEach(s => { statsMap[String(s._id)] = s; });
 
-    // Config (para filtro de fechas en pedidos)
-    const cfg = await getProdeConfig();
-
-    // Construir resultado con pedidos en período (N+1 aceptable para el volumen de Janz)
     const result = await Promise.all(clients.map(async c => {
       const cid = String(c._id);
-      const filter = { client: c._id };
-      if (cfg.startDate) filter.createdAt = { $gte: new Date(cfg.startDate) };
-      if (cfg.endDate)   filter.createdAt = { ...(filter.createdAt || {}), $lte: new Date(cfg.endDate) };
-      const pedidosEnPeriodo = await Order.countDocuments(filter);
+      const status = await resolveProdeStatus(c._id);
       return {
         clientId: c._id,
         nombre:   c.name,
         whatsapp: c.whatsapp || c.phone || '',
-        puntos:          ptsMap[cid]?.total          || 0,
-        puntosPronostico:ptsMap[cid]?.porPronostico  || 0,
-        puntosCompra:    ptsMap[cid]?.porCompra      || 0,
+        puntos:           ptsMap[cid]?.total         || 0,
+        puntosPronostico: ptsMap[cid]?.porPronostico || 0,
+        puntosBonus:      ptsMap[cid]?.porBonus      || 0,
+        puntosCompra:     ptsMap[cid]?.porBonus      || 0,
+        categoria:        status?.categoriaLabel || 'Invitado',
+        premioSegmento:   status?.premioSegmento || 'invitado',
+        elegibleTop3:     status?.elegibleTop3 || false,
+        cuponInvitado:    c.prodeGuestCouponCode || status?.cuponInvitado || null,
         pronosticos: {
-          total:    statsMap[cid]?.total    || 0,
-          acertados:statsMap[cid]?.acertados|| 0,
-          exactos:  statsMap[cid]?.exactos  || 0,
+          total:     statsMap[cid]?.total     || 0,
+          acertados: statsMap[cid]?.acertados || 0,
+          exactos:   statsMap[cid]?.exactos   || 0,
         },
-        pedidosEnPeriodo,
+        entregasEnPeriodo: status?.entregasEnPeriodo || 0,
+        pedidosEnPeriodo:  status?.entregasEnPeriodo || 0,
       };
     }));
 
@@ -576,6 +649,36 @@ router.delete('/reset-all', auth, adminOnly, async (req, res) => {
     ]);
     // No tocamos ProdeMatch — los scores vienen de la API y se regeneran solos
     res.json({ pronosticosEliminados: p.deletedCount, puntosEliminados: pts.deletedCount });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE eliminar participante del prode (admin) ───────────────────────────
+// Borra pronósticos, puntos y el cupón prode. Deja al cliente en la BD.
+router.delete('/participante/:clientId', auth, adminOnly, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const { Client } = require('../models/Order');
+    const Coupon = require('../models/Coupon');
+
+    // Buscar cupón prode antes de modificar el cliente
+    const client = await Client.findById(clientId).select('prodeGuestCouponCode').lean();
+    if (client?.prodeGuestCouponCode) {
+      await Coupon.deleteOne({ code: client.prodeGuestCouponCode });
+    }
+
+    const [p, pts] = await Promise.all([
+      Pronostico.deleteMany({ clientId }),
+      ProdePoints.deleteMany({ clientId }),
+      Client.findByIdAndUpdate(clientId, {
+        $unset: { prodeRegisteredAt: '', prodeGuestCouponCode: '' },
+      }),
+    ]);
+
+    res.json({
+      pronosticosEliminados: p.deletedCount,
+      puntosEliminados: pts.deletedCount,
+      cuponEliminado: !!client?.prodeGuestCouponCode,
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

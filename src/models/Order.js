@@ -23,7 +23,10 @@ const clientSchema = new mongoose.Schema({
   // isTestClient: pedidos de este cliente no cuentan en reportes ni analytics
   isTestClient: { type: Boolean, default: false },
   // Difusión masiva: si true, este cliente no recibe mensajes de broadcast
-  broadcastOptOut: { type: Boolean, default: false }
+  broadcastOptOut: { type: Boolean, default: false },
+  // Prode Mundial
+  prodeRegisteredAt:    { type: Date, default: null },
+  prodeGuestCouponCode: { type: String, default: null, trim: true },
 }, { timestamps: true });
 
 const orderItemAdditionalSchema = new mongoose.Schema({

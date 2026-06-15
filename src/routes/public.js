@@ -25,13 +25,30 @@ function todayRangeAR() {
   };
 }
 
-// Horario desde Config
+// Horario desde Config (con soporte de excepciones por fecha)
+function todayStrAR() {
+  const ar = nowAR();
+  return `${ar.getFullYear()}-${String(ar.getMonth() + 1).padStart(2, '0')}-${String(ar.getDate()).padStart(2, '0')}`;
+}
+
+async function getTodayOverride() {
+  try {
+    const cfg = await Config.findOne({ key: 'operationOverrides' });
+    const overrides = cfg?.value || [];
+    return overrides.find(o => o.date === todayStrAR()) || null;
+  } catch { return null; }
+}
+
 async function isOpen() {
   try {
+    const todayOverride = await getTodayOverride();
+
+    // Excepción explícita: cerrado hoy sin importar el día
+    if (todayOverride?.status === 'closed') return false;
+
     const cfg = await Config.findOne({ key: 'schedule' });
     const schedule = cfg?.value || { days: [5, 6, 0], openHour: '19:00', closeHour: '23:00' };
     const now = nowAR();
-    const day = now.getDay();
     const nowStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     const toTimeStr = v => {
       if (typeof v === 'string' && v.includes(':')) return v;
@@ -39,7 +56,13 @@ async function isOpen() {
     };
     const openHour  = toTimeStr(schedule.openHour);
     const closeHour = toTimeStr(schedule.closeHour);
-    return schedule.days.map(Number).includes(day) && nowStr >= openHour && nowStr < closeHour;
+    const withinHours = nowStr >= openHour && nowStr < closeHour;
+
+    // Excepción explícita: abierto hoy (día normalmente cerrado), sólo chequea horario
+    if (todayOverride?.status === 'open') return withinHours;
+
+    // Comportamiento normal
+    return schedule.days.map(Number).includes(now.getDay()) && withinHours;
   } catch {
     return [5, 6, 0].includes(nowAR().getDay());
   }
@@ -223,7 +246,10 @@ router.get('/menu', async (req, res) => {
       month:       monthlyProduct.monthlyLabel || ''
     } : null;
 
-    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger });
+    // Excepción del día (para mensajes personalizados en el banner)
+    const todayOverride = await getTodayOverride();
+
+    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger, todayOverride });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 

@@ -842,44 +842,61 @@ router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
     }
 
     const { Client } = require('../models/Order');
+    const { buildDailyProdeMessage: buildMsg } = require('../jobs/prode-notifications');
     const cfg = await getProdeConfig();
-    const destinatarios = [];
 
-    for (const [clientId, prons] of Object.entries(byClient)) {
-      const status = await resolveProdeStatus(clientId);
-      if (!status) continue;
+    // PERF FIX: este endpoint tenía el mismo problema que tenía antes
+    // /prode/ranking — resolvía cada participante de forma SECUENCIAL
+    // (resolveProdeStatus + Client.findById, uno atrás del otro). Con varios
+    // participantes esto superaba el timeout de 10s del frontend, el preview
+    // nunca cargaba, y por eso el botón "Enviar" no aparecía nunca (solo se
+    // muestra cuando el preview cargó bien). Ahora se resuelven todos los
+    // participantes EN PARALELO y se trae a todos los clientes en una sola
+    // consulta en vez de una por participante.
+    const clientIdsList = Object.keys(byClient);
+    const clientsDocs = await Client.find({ _id: { $in: clientIdsList } })
+      .select('name whatsapp phone').lean();
+    const clientMap = {};
+    clientsDocs.forEach(c => { clientMap[String(c._id)] = c; });
 
-      // Filtrar por segmento
-      if (segmento !== 'todos') {
-        const seg = status.premioSegmento; // 'invitado' | 'cliente' | 'competidor'
-        if (segmento === 'invitado'    && seg !== 'invitado')    continue;
-        if (segmento === 'cliente'     && seg !== 'cliente')     continue;
-        if (segmento === 'competidor'  && seg !== 'competidor')  continue;
-      }
+    const resultados = await Promise.all(
+      Object.entries(byClient).map(async ([clientId, prons]) => {
+        const status = await resolveProdeStatus(clientId, cfg);
+        if (!status) return null;
 
-      // Filtrar solo con puntos
-      if (soloConPuntos === '1' && status.totalPuntos === 0) continue;
+        // Filtrar por segmento
+        if (segmento !== 'todos') {
+          const seg = status.premioSegmento; // 'invitado' | 'cliente' | 'competidor'
+          if (segmento === 'invitado'    && seg !== 'invitado')    return null;
+          if (segmento === 'cliente'     && seg !== 'cliente')     return null;
+          if (segmento === 'competidor'  && seg !== 'competidor')  return null;
+        }
 
-      const client = await Client.findById(clientId).select('name whatsapp phone').lean();
-      if (!client) continue;
-      const waNum = client.whatsapp || client.phone || '';
+        // Filtrar solo con puntos
+        if (soloConPuntos === '1' && status.totalPuntos === 0) return null;
 
-      // Construir preview del mensaje usando la función del job
-      const { buildDailyProdeMessage: buildMsg } = require('../jobs/prode-notifications');
-      const msg = buildMsg(status, prons, cfg);
+        const client = clientMap[String(clientId)];
+        if (!client) return null;
+        const waNum = client.whatsapp || client.phone || '';
 
-      destinatarios.push({
-        clientId,
-        nombre:    client.name,
-        whatsapp:  waNum,
-        segmento:  status.premioSegmento,
-        categoria: status.categoriaLabel,
-        puntos:    status.totalPuntos,
-        partidos:  prons.length,
-        sinWa:     !waNum,
-        msgPreview: msg,
-      });
-    }
+        // Construir preview del mensaje usando la función del job
+        const msg = buildMsg(status, prons, cfg);
+
+        return {
+          clientId,
+          nombre:    client.name,
+          whatsapp:  waNum,
+          segmento:  status.premioSegmento,
+          categoria: status.categoriaLabel,
+          puntos:    status.totalPuntos,
+          partidos:  prons.length,
+          sinWa:     !waNum,
+          msgPreview: msg,
+        };
+      })
+    );
+
+    const destinatarios = resultados.filter(Boolean);
 
     // Ordenar: primero los que tienen WA, luego por puntos desc
     destinatarios.sort((a, b) => {

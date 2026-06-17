@@ -10,6 +10,15 @@ function buildDailyProdeMessage(status, prons, cfg = {}) {
   const nombre = status.nombre || 'Participante';
   const pct    = cfg.guestCouponPercent || 15;
 
+  // Fecha de hoy (hora Argentina), en español, ej: "Miércoles 17 de junio"
+  const fechaRaw = new Intl.DateTimeFormat('es-AR', {
+    weekday: 'long',
+    day:     'numeric',
+    month:   'long',
+    timeZone: 'America/Argentina/Buenos_Aires',
+  }).format(new Date());
+  const fechaHoy = fechaRaw.charAt(0).toUpperCase() + fechaRaw.slice(1);
+
   // ── Líneas de partidos ──
   const acertados = [];
   const fallados  = [];
@@ -73,7 +82,8 @@ function buildDailyProdeMessage(status, prons, cfg = {}) {
   }
 
   return (
-    `⚽ *Prode Janz — Resumen del día*\n\n` +
+    `⚽ *Prode Janz — Resumen del día*\n` +
+    `📅 ${fechaHoy}\n\n` +
     `¡Hola ${nombre}! Acá va el balance de los partidos de hoy:\n\n` +
     lineas +
     `\n\n` +

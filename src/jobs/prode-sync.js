@@ -20,11 +20,8 @@ async function evaluatePendingMatches() {
   }
 }
 
-// ── Sync inteligente: cada 5 min entre 10:00 y 02:00 hora Argentina ───────────
-// Argentina = UTC-3
-// 10:00 AR = 13:00 UTC  →  02:00 AR = 05:00 UTC
-// Expresión cron UTC:  */5 13-23,0-4 * * *
-// Activo solo durante el Mundial (11 Jun - 19 Jul)
+// ── Sync: cada 5 min, ventana ampliada 08:00 a 03:00 hora Argentina ───────────
+// Activo solo entre el 11 Jun y el 19 Jul (chequeo de fecha más abajo)
 async function runProdeSync() {
   const now = new Date();
   const arDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
@@ -49,8 +46,13 @@ async function runProdeSync() {
 }
 
 function startProdeSync() {
-  // Cada 5 minutos entre 13:00 y 05:00 UTC (= 10:00-02:00 AR)
-  cron.schedule('*/5 13-23,0-4 * * *', async () => {
+  // Cada 5 minutos entre 08:00 y 03:00 hora Argentina (ventana ampliada;
+  // antes era 10:00-02:00). Argentina = UTC-3, así que:
+  //   08:00 AR = 11:00 UTC   →   03:00 AR (día siguiente) = 06:00 UTC
+  // Expresión cron en UTC: horas 11 a 23, y 0 a 5.
+  // Con esto se cubren ~228 consultas/día (19hs × 12 corridas/hora), muy por
+  // debajo del límite de 10/min de football-data.org.
+  cron.schedule('*/5 11-23,0-5 * * *', async () => {
     try {
       await runProdeSync();
     } catch (err) {
@@ -58,7 +60,7 @@ function startProdeSync() {
     }
   });
 
-  console.log('⚽ Prode sync job iniciado (cada 5 min, 10:00-02:00 AR, activo 11 Jun - 19 Jul)');
+  console.log('⚽ Prode sync job iniciado (cada 5 min, 08:00-03:00 AR, activo 11 Jun - 19 Jul)');
 }
 
 module.exports = { startProdeSync };

@@ -144,20 +144,47 @@ async function runProdeNotifications() {
   return { sent, skipped };
 }
 
-// ── Registrar cron: todos los días a las 09:00hs Argentina ───────────────────
+// ── Registrar cron: hora configurable desde ProdeConfig ──────────────────────
 let cronJob = null;
+let lastFiredDate = null; // guard: evitar doble disparo en el mismo día/hora
+
+async function getNotifHour() {
+  try {
+    const { getProdeConfig } = require('../services/prode.service');
+    const cfg = await getProdeConfig();
+    // notifHour: número 0-23 (hora en Argentina). Default: 9
+    const h = Number(cfg.notifHour);
+    if (!isNaN(h) && h >= 0 && h <= 23) return h;
+  } catch (e) { /* ignorar */ }
+  return 9;
+}
 
 function startProdeNotificationsJob() {
   if (cronJob) cronJob.stop();
 
-  // 09:00 AR = 12:00 UTC (UTC-3)
-  cronJob = cron.schedule('0 12 * * *', () => {
-    runProdeNotifications().catch(err =>
-      console.error('❌ [ProdeNotif] Error en cron:', err.message)
-    );
+  // Programar cron dinámico que lee la hora de config en cada ejecución
+  cronJob = cron.schedule('* * * * *', async () => {
+    try {
+      const hora = await getNotifHour();
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
+      if (now.getHours() === hora && now.getMinutes() === 0) {
+        // Guard: no disparar más de una vez por hora (evita doble-fire)
+        const fireKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}-${hora}`;
+        if (lastFiredDate === fireKey) return;
+        lastFiredDate = fireKey;
+
+        runProdeNotifications().catch(err =>
+          console.error('❌ [ProdeNotif] Error en cron:', err.message)
+        );
+      }
+    } catch (e) {
+      console.error('❌ [ProdeNotif] Error leyendo hora config:', e.message);
+    }
   }, { timezone: 'America/Argentina/Buenos_Aires' });
 
-  console.log('⚽ [ProdeNotif] Cron registrado: todos los días a las 09:00hs (Argentina)');
+  getNotifHour().then(h =>
+    console.log(`⚽ [ProdeNotif] Cron registrado: todos los días a las ${String(h).padStart(2,'0')}:00hs (configurable en Configurar → Hora de reportes)`)
+  );
 }
 
 module.exports = { startProdeNotificationsJob, runProdeNotifications, buildDailyProdeMessage };

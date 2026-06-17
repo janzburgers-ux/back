@@ -469,6 +469,105 @@ router.post('/evaluar', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── POST re-evaluar FORZADO — resetea todos los pronósticos de partidos terminados
+//    y recalcula puntos desde cero (útil para corregir errores históricos) ──────
+router.post('/evaluar-forzado', auth, adminOnly, async (req, res) => {
+  try {
+    const matches = await ProdeMatch.find({ status: 'finished' });
+    let reseteados = 0;
+    let evaluados  = 0;
+
+    for (const m of matches) {
+      // 1) Borrar ProdePoints de pronósticos de este partido
+      await ProdePoints.deleteMany({ matchId: m._id, tipo: 'pronostico' });
+      // 2) Resetear flag en los pronósticos
+      await Pronostico.updateMany(
+        { matchId: m._id },
+        { $set: { evaluated: false, pointsEarned: 0 } }
+      );
+      reseteados++;
+      // 3) Re-evaluar con el resultado actual
+      await evaluateMatch(m._id);
+      evaluados++;
+    }
+
+    res.json({ reseteados, evaluados, message: `${evaluados} partidos re-evaluados desde cero` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET diagnóstico profundo del ranking (solo admin) ────────────────────────
+router.get('/ranking/diagnostico', auth, adminOnly, async (req, res) => {
+  try {
+    const { Client } = require('../models/Order');
+
+    // 1. Cuantos ProdePoints hay en total?
+    const totalPP = await ProdePoints.countDocuments();
+
+    // 2. Como son los clientId en ProdePoints? ObjectId o String?
+    const muestras = await ProdePoints.find({}).limit(5).select('clientId tipo puntos').lean();
+    const tiposClientId = muestras.map(p => ({
+      clientId: String(p.clientId),
+      tipo_js: typeof p.clientId,
+      es_objectid: p.clientId?.constructor?.name === 'ObjectId',
+      tipo_prode: p.tipo,
+      puntos: p.puntos,
+    }));
+
+    // 3. El aggregate inicial devuelve algo?
+    const aggResult = await ProdePoints.aggregate([
+      { $match: { tipo: { $in: ['pronostico', 'bonificacion'] }, clientId: { $exists: true, $ne: null } } },
+      { $group: { _id: '$clientId', total: { $sum: '$puntos' } } },
+    ]);
+
+    // 4. Para cada clientId del aggregate, existe en la coleccion clients?
+    const lookupTests = await Promise.all(aggResult.slice(0, 5).map(async r => {
+      const byId = await Client.findById(r._id).select('name').lean();
+      return {
+        clientId: String(r._id),
+        tipo_js: typeof r._id,
+        es_objectid: r._id?.constructor?.name === 'ObjectId',
+        totalPuntos: r.total,
+        encontrado: !!byId,
+        nombre: byId?.name || null,
+      };
+    }));
+
+    // 5. Cuantos Pronosticos y con que clientIds?
+    const totalPronos = await Pronostico.countDocuments();
+    const pronoClientIds = await Pronostico.distinct('clientId');
+
+    // 6. El aggregate completo con lookup devuelve algo?
+    const aggConLookup = await ProdePoints.aggregate([
+      { $match: { tipo: { $in: ['pronostico', 'bonificacion'] }, clientId: { $exists: true, $ne: null } } },
+      { $group: { _id: '$clientId', total: { $sum: '$puntos' } } },
+      { $lookup: { from: 'clients', localField: '_id', foreignField: '_id', as: 'client' } },
+      { $addFields: { clientFound: { $gt: [{ $size: '$client' }, 0] } } },
+    ]);
+    const conCliente = aggConLookup.filter(r => r.clientFound).length;
+    const sinCliente = aggConLookup.filter(r => !r.clientFound).length;
+
+    res.json({
+      resumen: {
+        totalProdePoints: totalPP,
+        totalPronosticos: totalPronos,
+        clientIdsConPronosticos: pronoClientIds.length,
+        aggSinLookup: aggResult.length,
+        aggConLookup_conCliente: conCliente,
+        aggConLookup_sinCliente: sinCliente,
+        diagnostico: aggResult.length === 0
+          ? 'SIN_DATOS: No hay ProdePoints en la BD. El ranking esta vacio porque nadie tiene puntos aun.'
+          : conCliente === 0
+            ? 'PROBLEMA_LOOKUP: El lookup no encuentra ningun cliente. clientId en ProdePoints no matchea con _id en clients.'
+            : conCliente + ' clientes encontrados, ' + sinCliente + ' sin match en clients',
+      },
+      muestras_ProdePoints: tiposClientId,
+      lookup_tests: lookupTests,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── GET estadísticas del prode para el admin ──────────────────────────────────
 router.get('/stats', auth, adminOnly, async (req, res) => {
   try {
@@ -702,7 +801,6 @@ router.delete('/participante/:clientId', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-module.exports = router;
 // ── GET preview destinatarios de notificación manual ─────────────────────────
 // Devuelve la lista de participantes que recibirían el mensaje según el filtro,
 // junto con un preview del mensaje de cada uno.
@@ -904,3 +1002,5 @@ router.post('/notificaciones/enviar', auth, adminOnly, async (req, res) => {
     res.json(results);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
+
+module.exports = router;

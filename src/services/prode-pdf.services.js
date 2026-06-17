@@ -186,7 +186,14 @@ function buildProdeHTML(status, pronosticos, cfg) {
 
   // ── Resumen de puntos por tipo ─────────────────────────────────────────────
   const ptsPron  = pronosticos.reduce((s, p) => s + (p.pointsEarned || 0), 0);
-  const ptsBonus = totalPts - ptsPron;
+  // FIX: antes esto se calculaba como `totalPts - ptsPron`, una resta entre dos
+  // fuentes distintas (ProdePoints vs Pronostico.pointsEarned). Si esas dos
+  // colecciones no cuadraban perfectamente (por una re-evaluación, un
+  // pronóstico duplicado, etc.) el resultado podía dar negativo (ej: -6).
+  // `status.puntosBonus` ya es la suma real y directa de los puntos de
+  // bonificación (upgrade a Cliente/VIP) desde ProdePoints, así que la usamos
+  // directo en vez de inferirla por resta.
+  const ptsBonus = status.puntosBonus || 0;
   const acertados = pronosticos.filter(p => p.pointsEarned > 0 && p.matchId?.status === 'finished').length;
   const exactos   = pronosticos.filter(p => {
     const m = p.matchId;
@@ -343,16 +350,26 @@ async function generateProdePDF(clientId) {
   const puppeteer = require('puppeteer');
 
   // Cargar datos
-  const [status, pronosticos, cfg] = await Promise.all([
+  const [status, pronosticosRaw, cfg] = await Promise.all([
     resolveProdeStatus(clientId),
     Pronostico.find({ clientId })
       .populate('matchId')
-      .sort({ 'matchId.matchDate': 1 })
       .lean(),
     getProdeConfig(),
   ]);
 
   if (!status) throw new Error('Cliente no encontrado en el prode');
+
+  // FIX: el .sort({'matchId.matchDate':1}) anterior no ordenaba nada de verdad —
+  // Mongoose aplica el sort en el query a la colección Pronostico, ANTES del
+  // populate, cuando matchId todavía es sólo un ObjectId (sin matchDate). Por
+  // eso los pronósticos no salían ordenados por fecha en el PDF. Ahora se
+  // ordena en JS, una vez que matchId ya está populado con los datos del partido.
+  const pronosticos = pronosticosRaw.slice().sort((a, b) => {
+    const da = a.matchId?.matchDate ? new Date(a.matchId.matchDate).getTime() : 0;
+    const db = b.matchId?.matchDate ? new Date(b.matchId.matchDate).getTime() : 0;
+    return da - db;
+  });
 
   const html = buildProdeHTML(status, pronosticos, cfg);
 

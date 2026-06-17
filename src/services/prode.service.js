@@ -311,8 +311,8 @@ function buildProximoPaso(categoria, entregasPreProde, entregasEnPeriodo, cfg = 
 }
 
 // ── Estado del participante ─────────────────────────────────────────────────────
-async function resolveProdeStatus(clientId) {
-  const cfg = await getProdeConfig();
+async function resolveProdeStatus(clientId, cfgPreloaded = null) {
+  const cfg = cfgPreloaded || await getProdeConfig();
   const client = await Client.findById(clientId).select('name prodeRegisteredAt prodeGuestCouponCode').lean();
   if (!client) return null;
 
@@ -510,11 +510,12 @@ async function evaluateMatch(matchId) {
     let pts = 0;
     if (p.predictedWinner === match.winner) {
       pts += cfg.pointsWinner || 3;
+      // FIX: usar Number() para comparación robusta (evita fallos por tipo String vs Number)
       if (
         p.predictedHome !== null &&
         p.predictedAway !== null &&
-        p.predictedHome === match.homeScore &&
-        p.predictedAway === match.awayScore
+        Number(p.predictedHome) === Number(match.homeScore) &&
+        Number(p.predictedAway) === Number(match.awayScore)
       ) {
         pts += cfg.pointsExact || 3;
       }
@@ -546,6 +547,10 @@ async function evaluateMatch(matchId) {
         if (dupErr.code !== 11000) throw dupErr;
         // E11000 en upsert concurrente: el registro ya existe, no es error real
       }
+    } else {
+      // FIX: si pts=0 (re-evaluación con resultado corregido), eliminar puntos anteriores
+      // para que no queden puntos fantasma de una evaluación previa incorrecta
+      await ProdePoints.deleteOne({ clientId: p.clientId, matchId, tipo: 'pronostico' });
     }
   }
 
@@ -574,7 +579,7 @@ async function getRanking() {
   const cfg = await getProdeConfig();
 
   const ranking = await ProdePoints.aggregate([
-    // excluir registros sin clientId válido (datos corruptos)
+    // FIX: también aceptar clientId guardado como String (conversión defensiva)
     { $match: {
       tipo: { $in: ['pronostico', 'bonificacion'] },
       clientId: { $exists: true, $ne: null },
@@ -596,13 +601,15 @@ async function getRanking() {
         as: 'client',
       },
     },
-    { $unwind: '$client' },
+    // FIX: usar $addFields + $size en lugar de $unwind para no perder entradas sin lookup exitoso
+    { $addFields: { clientFound: { $gt: [{ $size: '$client' }, 0] }, clientData: { $arrayElemAt: ['$client', 0] } } },
+    { $match: { clientFound: true } },
     {
       $project: {
         clientId: '$_id',
-        nombre: '$client.name',
-        apodo: { $arrayElemAt: [{ $split: ['$client.name', ' '] }, 0] },
-        whatsapp: '$client.whatsapp',
+        nombre: '$clientData.name',
+        apodo: { $arrayElemAt: [{ $split: ['$clientData.name', ' '] }, 0] },
+        whatsapp: '$clientData.whatsapp',
         totalPuntos: 1,
         puntosPronosticos: 1,
         puntosBonus: 1,
@@ -632,9 +639,20 @@ async function getRanking() {
     }
   }
 
-  for (const r of ranking) {
-    if (!r.clientId) continue;  // guardia: saltar registros sin clientId
-    const status = await resolveProdeStatus(r.clientId);
+  // PERF FIX: antes este loop era secuencial (un await atrás de otro) y por cada
+  // participante volvía a pegarle a la DB ~8 veces (incluyendo dos consultas
+  // que recalculaban algo que el aggregate de arriba ya había calculado bien).
+  // Con varios participantes eso superaba fácil los 10s de timeout del front
+  // (por eso fallaban /prode/ranking y /prode/stats). Ahora:
+  //   1) se resuelven todos los participantes EN PARALELO (Promise.all), y
+  //   2) se le pasa el cfg ya cargado a resolveProdeStatus para no
+  //      volver a pedirlo a la DB en cada vuelta.
+  //   3) se eliminó el recálculo redundante de totalPuntos/puntosPronosticos/
+  //      puntosBonus — esos valores ya vienen correctos desde el aggregate
+  //      inicial (mismo $match, mismo $group), no hacía falta repetirlos.
+  await Promise.all(ranking.map(async (r) => {
+    if (!r.clientId) return;  // guardia: saltar registros sin clientId
+    const status = await resolveProdeStatus(r.clientId, cfg);
     r.categoria         = status?.categoria || 'invitado';
     r.categoriaLabel    = status?.categoriaLabel || 'Invitado';
     r.premioSegmento    = status?.premioSegmento || 'invitado';
@@ -642,7 +660,10 @@ async function getRanking() {
     r.entregasEnPeriodo = status?.entregasEnPeriodo || 0;
     r.entregasPreProde  = status?.entregasPreProde || 0;
     r.pedidosEnPeriodo  = r.entregasEnPeriodo;
-  }
+  }));
+
+  // Re-ordenar despues de resolver categorías/segmentos
+  ranking.sort((a, b) => b.totalPuntos - a.totalPuntos);
 
   return ranking;
 }

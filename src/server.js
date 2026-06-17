@@ -125,13 +125,28 @@ app.use('/api/broadcast',          require('./routes/broadcast'));
 app.use('/api/reviews',            require('./routes/reviews'));
 
 // ── Jobs automáticos ──────────────────────────────────────────────────────────
-const { startChurnJob }    = require('./jobs/churn-alert');
-const { startBirthdayJob } = require('./jobs/birthday-coupons');
-const { startProdeSync }   = require('./jobs/prode-sync');
-mongoose.connection.once('open', () => {
+const { startChurnJob }                = require('./jobs/churn-alert');
+const { startBirthdayJob }             = require('./jobs/birthday-coupons');
+const { startProdeSync }               = require('./jobs/prode-sync');
+const { startProdeNotificationsJob }   = require('./jobs/prode-notifications');
+mongoose.connection.once('open', async () => {
+  // ── Auto-fix índice corrupto en prodepoints (una sola vez) ──────────────────
+  try {
+    const ppColl = mongoose.connection.db.collection('prodepoints');
+    const idxs   = await ppColl.indexes();
+    const bad    = idxs.find(i => i.name === 'clientId_1_subtipo_1' && !i.partialFilterExpression);
+    if (bad) {
+      await ppColl.dropIndex('clientId_1_subtipo_1');
+      console.log('✅ [startup] Índice prodepoints corregido (se recreará con partial filter)');
+    }
+  } catch (e) {
+    console.warn('⚠️ [startup] No se pudo verificar índice prodepoints:', e.message);
+  }
+
   startChurnJob().catch(err => console.error('❌ Error iniciando churn job:', err.message));
   startBirthdayJob();
   startProdeSync();
+  startProdeNotificationsJob();
 });
 
 // ── WhatsApp: status, initiate bajo demanda, y QR ────────────────────────────

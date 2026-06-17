@@ -525,13 +525,27 @@ async function evaluateMatch(matchId) {
     await p.save();
 
     if (pts > 0) {
-      await ProdePoints.create({
-        clientId:    p.clientId,
-        matchId,
-        tipo:        'pronostico',
-        descripcion: `${match.homeTeam} vs ${match.awayTeam} — ${pts} pts`,
-        puntos:      pts,
-      });
+      // Upsert idempotente: evita E11000 si dos runs concurrentes procesan el mismo partido
+      try {
+        await ProdePoints.updateOne(
+          { clientId: p.clientId, matchId, tipo: 'pronostico' },
+          {
+            $set: {
+              puntos:      pts,
+              descripcion: `${match.homeTeam} vs ${match.awayTeam} — ${pts} pts`,
+            },
+            $setOnInsert: {
+              clientId: p.clientId,
+              matchId,
+              tipo: 'pronostico',
+            },
+          },
+          { upsert: true }
+        );
+      } catch (dupErr) {
+        if (dupErr.code !== 11000) throw dupErr;
+        // E11000 en upsert concurrente: el registro ya existe, no es error real
+      }
     }
   }
 
@@ -539,14 +553,20 @@ async function evaluateMatch(matchId) {
 }
 
 async function getTotalPoints(clientId) {
-  const result = await ProdePoints.aggregate([
-    { $match: {
-      clientId: new mongoose.Types.ObjectId(clientId),
-      tipo: { $in: ['pronostico', 'bonificacion'] },
-    }},
-    { $group: { _id: null, total: { $sum: '$puntos' } } },
-  ]);
-  return result[0]?.total || 0;
+  if (!clientId) return 0;
+  try {
+    const result = await ProdePoints.aggregate([
+      { $match: {
+        clientId: new mongoose.Types.ObjectId(String(clientId)),
+        tipo: { $in: ['pronostico', 'bonificacion'] },
+      }},
+      { $group: { _id: null, total: { $sum: '$puntos' } } },
+    ]);
+    return result[0]?.total || 0;
+  } catch (e) {
+    console.error('⚠️ getTotalPoints error para clientId', clientId, ':', e.message);
+    return 0;
+  }
 }
 
 // ── Ranking general ─────────────────────────────────────────────────────────────
@@ -554,7 +574,11 @@ async function getRanking() {
   const cfg = await getProdeConfig();
 
   const ranking = await ProdePoints.aggregate([
-    { $match: { tipo: { $in: ['pronostico', 'bonificacion'] } } },
+    // excluir registros sin clientId válido (datos corruptos)
+    { $match: {
+      tipo: { $in: ['pronostico', 'bonificacion'] },
+      clientId: { $exists: true, $ne: null },
+    }},
     {
       $group: {
         _id: '$clientId',
@@ -587,7 +611,29 @@ async function getRanking() {
     },
   ]);
 
+  // ── Agregar participantes con 0 puntos (hicieron pronósticos pero ningún partido evaluado aún) ──
+  const conPuntosIds = new Set(ranking.map(r => String(r.clientId)));
+  const sinPuntos = await Pronostico.distinct('clientId');
+  const nuevos = sinPuntos.filter(id => !conPuntosIds.has(String(id)));
+  if (nuevos.length > 0) {
+    const clients = await require('../models/Order').Client
+      .find({ _id: { $in: nuevos } }, 'name whatsapp').lean();
+    for (const c of clients) {
+      ranking.push({
+        clientId: c._id,
+        nombre: c.name,
+        apodo: c.name?.split(' ')[0] || c.name,
+        whatsapp: c.whatsapp,
+        totalPuntos: 0,
+        puntosPronosticos: 0,
+        puntosBonus: 0,
+        puntosCompras: 0,
+      });
+    }
+  }
+
   for (const r of ranking) {
+    if (!r.clientId) continue;  // guardia: saltar registros sin clientId
     const status = await resolveProdeStatus(r.clientId);
     r.categoria         = status?.categoria || 'invitado';
     r.categoriaLabel    = status?.categoriaLabel || 'Invitado';

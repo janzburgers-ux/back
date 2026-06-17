@@ -415,10 +415,12 @@ router.get('/ranking', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── GET ranking público — top 5, sin auth, solo nombre y total ────────────────
+// ── GET ranking público — top 20, sin auth ────────────────────────────────────
 router.get('/ranking/publico', async (req, res) => {
   try {
     const ranking = await getRanking();
+    // Re-ordenar: primero por puntos DESC, luego alfabético para empates
+    ranking.sort((a, b) => (b.totalPuntos - a.totalPuntos) || (a.nombre || '').localeCompare(b.nombre || ''));
     const top20 = ranking.slice(0, 20).map((r, i) => ({
       posicion:       i + 1,
       _id:            r.clientId,
@@ -628,6 +630,24 @@ router.get('/participantes', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── GET PDF de pronósticos de un cliente ──────────────────────────────────────
+// Accesible con auth de cliente (token en cookie/header) o sin auth (link directo con clientId)
+router.get('/pdf/:clientId', async (req, res) => {
+  try {
+    const { generateProdePDF } = require('../services/prode-pdf.services');
+    const pdfBuffer = await generateProdePDF(req.params.clientId);
+    res.set({
+      'Content-Type':        'application/pdf',
+      'Content-Disposition': `inline; filename="prode-janz-${req.params.clientId}.pdf"`,
+      'Content-Length':      pdfBuffer.length,
+    });
+    res.end(pdfBuffer);
+  } catch (err) {
+    console.error('[ProdePDF] Error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ── DELETE resetear predicciones de un cliente específico (admin/testing) ─────
 router.delete('/reset-cliente/:clientId', auth, adminOnly, async (req, res) => {
   try {
@@ -683,3 +703,204 @@ router.delete('/participante/:clientId', auth, adminOnly, async (req, res) => {
 });
 
 module.exports = router;
+// ── GET preview destinatarios de notificación manual ─────────────────────────
+// Devuelve la lista de participantes que recibirían el mensaje según el filtro,
+// junto con un preview del mensaje de cada uno.
+// Query params:
+//   segmento  : 'todos' | 'invitado' | 'cliente' | 'competidor'  (default: todos)
+//   periodo   : 'ultimas24h' | 'ultimas48h' | 'semana' | 'todo'  (default: ultimas24h)
+//   soloConPuntos : '1' — solo los que tienen al menos 1 pto (default: 0)
+router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
+  try {
+    const { segmento = 'todos', periodo = 'ultimas24h', soloConPuntos = '0' } = req.query;
+
+    // Calcular ventana temporal
+    const ahora = Date.now();
+    const ventanas = { ultimas24h: 24, ultimas48h: 48, semana: 168, todo: 0 };
+    const horas = ventanas[periodo] ?? 24;
+    const desde = horas > 0 ? new Date(ahora - horas * 3_600_000) : null;
+
+    // Traer pronósticos evaluados en el período
+    const filtroBase = { evaluated: true };
+    if (desde) filtroBase.updatedAt = { $gte: desde };
+
+    const pronosticos = await Pronostico.find(filtroBase).populate('matchId').lean();
+
+    // Agrupar por cliente
+    const byClient = {};
+    for (const p of pronosticos) {
+      const cid = String(p.clientId);
+      if (!byClient[cid]) byClient[cid] = [];
+      byClient[cid].push(p);
+    }
+
+    // Si periodo=todo, incluir también participantes sin pronósticos evaluados
+    // (para mensajes de tipo "recordatorio")
+    if (!desde) {
+      const allClientIds = await Pronostico.distinct('clientId');
+      for (const cid of allClientIds) {
+        if (!byClient[String(cid)]) byClient[String(cid)] = [];
+      }
+    }
+
+    const { Client } = require('../models/Order');
+    const cfg = await getProdeConfig();
+    const destinatarios = [];
+
+    for (const [clientId, prons] of Object.entries(byClient)) {
+      const status = await resolveProdeStatus(clientId);
+      if (!status) continue;
+
+      // Filtrar por segmento
+      if (segmento !== 'todos') {
+        const seg = status.premioSegmento; // 'invitado' | 'cliente' | 'competidor'
+        if (segmento === 'invitado'    && seg !== 'invitado')    continue;
+        if (segmento === 'cliente'     && seg !== 'cliente')     continue;
+        if (segmento === 'competidor'  && seg !== 'competidor')  continue;
+      }
+
+      // Filtrar solo con puntos
+      if (soloConPuntos === '1' && status.totalPuntos === 0) continue;
+
+      const client = await Client.findById(clientId).select('name whatsapp phone').lean();
+      if (!client) continue;
+      const waNum = client.whatsapp || client.phone || '';
+
+      // Construir preview del mensaje usando la función del job
+      const { buildDailyProdeMessage: buildMsg } = require('../jobs/prode-notifications');
+      const msg = buildMsg(status, prons, cfg);
+
+      destinatarios.push({
+        clientId,
+        nombre:    client.name,
+        whatsapp:  waNum,
+        segmento:  status.premioSegmento,
+        categoria: status.categoriaLabel,
+        puntos:    status.totalPuntos,
+        partidos:  prons.length,
+        sinWa:     !waNum,
+        msgPreview: msg,
+      });
+    }
+
+    // Ordenar: primero los que tienen WA, luego por puntos desc
+    destinatarios.sort((a, b) => {
+      if (a.sinWa !== b.sinWa) return a.sinWa ? 1 : -1;
+      return b.puntos - a.puntos;
+    });
+
+    res.json({
+      total:       destinatarios.length,
+      conWa:       destinatarios.filter(d => !d.sinWa).length,
+      sinWa:       destinatarios.filter(d => d.sinWa).length,
+      destinatarios,
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST enviar mensajes de notificación manual ───────────────────────────────
+// Body JSON:
+//   segmento      : 'todos' | 'invitado' | 'cliente' | 'competidor'
+//   periodo       : 'ultimas24h' | 'ultimas48h' | 'semana' | 'todo'
+//   soloConPuntos : boolean
+//   mensajeCustom : string | null  — si viene, reemplaza el template automático
+//   clientIds     : string[] | null — si viene, envía SOLO a esos ids (ignore filtros)
+router.post('/notificaciones/enviar', auth, adminOnly, async (req, res) => {
+  try {
+    const {
+      segmento      = 'todos',
+      periodo       = 'ultimas24h',
+      soloConPuntos = false,
+      mensajeCustom = null,
+      clientIds     = null,
+    } = req.body;
+
+    const { buildDailyProdeMessage } = require('../jobs/prode-notifications');
+    const { sendMessage } = require('../services/whatsapp');
+    const { Client } = require('../models/Order');
+    const cfg = await getProdeConfig();
+
+    // ── Armar lista de destinatarios ─────────────────────────────────────────
+    let targetIds;
+
+    if (Array.isArray(clientIds) && clientIds.length > 0) {
+      // Envío selectivo (admin marcó participantes específicos)
+      targetIds = clientIds;
+    } else {
+      // Envío por segmento/período
+      const ahora = Date.now();
+      const ventanas = { ultimas24h: 24, ultimas48h: 48, semana: 168, todo: 0 };
+      const horas = ventanas[periodo] ?? 24;
+      const desde = horas > 0 ? new Date(ahora - horas * 3_600_000) : null;
+
+      const filtroBase = { evaluated: true };
+      if (desde) filtroBase.updatedAt = { $gte: desde };
+
+      const pronosticos = await Pronostico.find(filtroBase).lean();
+
+      // Si período=todo, incluir todos los participantes aunque no tengan prons evaluados
+      let allIds = [...new Set(pronosticos.map(p => String(p.clientId)))];
+      if (!desde) {
+        const todos = await Pronostico.distinct('clientId');
+        allIds = [...new Set([...allIds, ...todos.map(String)])];
+      }
+      targetIds = allIds;
+    }
+
+    const results = { sent: 0, skipped: 0, errors: 0, detalle: [] };
+
+    for (const clientId of targetIds) {
+      try {
+        const status = await resolveProdeStatus(clientId);
+        if (!status) { results.skipped++; continue; }
+
+        // Filtrar por segmento (solo si no es envío selectivo)
+        if (!Array.isArray(clientIds)) {
+          const seg = status.premioSegmento;
+          if (segmento !== 'todos') {
+            if (segmento === 'invitado'   && seg !== 'invitado')   { results.skipped++; continue; }
+            if (segmento === 'cliente'    && seg !== 'cliente')     { results.skipped++; continue; }
+            if (segmento === 'competidor' && seg !== 'competidor')  { results.skipped++; continue; }
+          }
+          if (soloConPuntos && status.totalPuntos === 0)            { results.skipped++; continue; }
+        }
+
+        const client = await Client.findById(clientId).select('name whatsapp phone').lean();
+        const waNum  = client?.whatsapp || client?.phone || '';
+
+        if (!waNum) {
+          results.skipped++;
+          results.detalle.push({ nombre: client?.name || clientId, estado: 'sin_wa' });
+          continue;
+        }
+
+        // Construir mensaje
+        let msg;
+        if (mensajeCustom?.trim()) {
+          // Reemplazar placeholder {{nombre}} si el admin lo usó
+          msg = mensajeCustom.replace(/\{\{nombre\}\}/g, status.nombre);
+        } else {
+          // Usar el período completo del prode para armar el resumen
+          const prons = await Pronostico.find({ clientId, evaluated: true })
+            .populate('matchId').lean();
+          msg = buildDailyProdeMessage(status, prons, cfg);
+        }
+
+        await sendMessage(waNum, msg);
+        results.sent++;
+        results.detalle.push({ nombre: client.name, estado: 'enviado', waNum });
+
+        // Pausa anti-spam
+        await new Promise(r => setTimeout(r, 1200));
+
+      } catch (e) {
+        console.error(`❌ [ProdeNotif Manual] Error con ${clientId}:`, e.message);
+        results.errors++;
+        results.detalle.push({ nombre: clientId, estado: 'error', error: e.message });
+      }
+    }
+
+    console.log(`📲 [ProdeNotif Manual] Fin: ${results.sent} enviados, ${results.skipped} saltados, ${results.errors} errores`);
+    res.json(results);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});

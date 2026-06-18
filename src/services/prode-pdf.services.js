@@ -91,7 +91,7 @@ function buildProdeHTML(status, pronosticos, cfg) {
     }
 
     return `
-      <div style="background:#141414;border:1px solid #1c1c1c;border-left:3px solid ${borderLeft};border-radius:12px;padding:14px 16px;margin-bottom:8px;">
+      <div class="match-card" style="background:#141414;border:1px solid #1c1c1c;border-left:3px solid ${borderLeft};border-radius:12px;padding:14px 16px;margin-bottom:8px;">
         <!-- Fecha y etapa -->
         <div style="font-size:10px;color:#555;letter-spacing:0.06em;margin-bottom:10px;text-transform:uppercase;">
           ${fmtDate(m.matchDate)} · ${fmtTime(m.matchDate)}
@@ -169,7 +169,7 @@ function buildProdeHTML(status, pronosticos, cfg) {
     const matches = byStage[stage];
     const ptsStage = matches.reduce((s, p) => s + (p.pointsEarned || 0), 0);
     return `
-      <div style="margin-bottom:24px;">
+      <div class="stage-section" style="margin-bottom:24px;">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
           <div style="display:flex;align-items:center;gap:8px;">
             <div style="width:3px;height:16px;background:#E8B84B;border-radius:99px;"></div>
@@ -224,13 +224,34 @@ function buildProdeHTML(status, pronosticos, cfg) {
       print-color-adjust: exact;
     }
     .page { max-width: 760px; margin: 0 auto; padding: 32px 28px 48px; }
+
+    /* ── Estilos para impresión ── */
+    @media print {
+      body { background: #fff; color: #111; }
+      .page { padding: 16px; max-width: 100%; }
+
+      /* Evitar que una tarjeta de partido se corte entre páginas */
+      .match-card { page-break-inside: avoid; break-inside: avoid; }
+
+      /* Salto de página entre etapas */
+      .stage-section { page-break-inside: avoid; break-inside: avoid; }
+
+      /* Header siempre en la primera página */
+      .pdf-header { page-break-after: avoid; break-after: avoid; }
+
+      /* Fondo blanco en impresora para ahorrar tinta */
+      @page {
+        margin: 1.5cm;
+        size: A4 portrait;
+      }
+    }
   </style>
 </head>
 <body>
 <div class="page">
 
   <!-- ── HEADER ─────────────────────────────────────────────────────────── -->
-  <div style="position:relative;background:linear-gradient(135deg,#0d1a06 0%,#080808 60%);border:1px solid #1c1c1c;border-radius:20px;padding:28px 28px 24px;margin-bottom:24px;overflow:hidden;">
+  <div class="pdf-header" style="position:relative;background:linear-gradient(135deg,#0d1a06 0%,#080808 60%);border:1px solid #1c1c1c;border-radius:20px;padding:28px 28px 24px;margin-bottom:24px;overflow:hidden;">
     <!-- Glow fondo -->
     <div style="position:absolute;top:-60px;right:-60px;width:240px;height:240px;border-radius:50%;background:radial-gradient(circle,rgba(232,184,75,0.07) 0%,transparent 70%);pointer-events:none;"></div>
 
@@ -348,11 +369,19 @@ function buildProdeHTML(status, pronosticos, cfg) {
 async function generateProdePDF(clientId) {
   // Puppeteer es dependencia transitiva de whatsapp-web.js — ya está en node_modules
   const puppeteer = require('puppeteer');
+  const mongoose  = require('mongoose');
+
+  // FIX: el clientId llega como String desde la URL. El modelo Pronostico
+  // declara clientId como ObjectId, así que Mongoose no matchea si se pasa
+  // un String directamente — los pronósticos nuevos no aparecían en el PDF.
+  const clientObjId = mongoose.Types.ObjectId.isValid(clientId)
+    ? new mongoose.Types.ObjectId(clientId)
+    : clientId;
 
   // Cargar datos
   const [status, pronosticosRaw, cfg] = await Promise.all([
     resolveProdeStatus(clientId),
-    Pronostico.find({ clientId })
+    Pronostico.find({ clientId: clientObjId })
       .populate('matchId')
       .lean(),
     getProdeConfig(),

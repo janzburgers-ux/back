@@ -419,15 +419,16 @@ router.get('/ranking', auth, async (req, res) => {
 router.get('/ranking/publico', async (req, res) => {
   try {
     const ranking = await getRanking();
-    // Re-ordenar: primero por puntos DESC, luego alfabético para empates
-    ranking.sort((a, b) => (b.totalPuntos - a.totalPuntos) || (a.nombre || '').localeCompare(b.nombre || ''));
+    // El orden ya viene aplicado desde getRanking() con las 4 reglas de desempate.
+    // No re-sortear aquí para no pisar esas reglas.
     const top20 = ranking.slice(0, 20).map((r, i) => ({
-      posicion:       i + 1,
-      _id:            r.clientId,
-      nombre:         r.apodo || r.nombre?.split(' ')[0] || r.nombre,
-      totalPuntos:    r.totalPuntos,
-      categoria:      r.categoriaLabel,
-      elegibleTop3:   r.elegibleTop3,
+      posicion:          i + 1,
+      _id:               r.clientId,
+      nombre:            r.apodo || r.nombre?.split(' ')[0] || r.nombre,
+      totalPuntos:       r.totalPuntos,
+      categoria:         r.categoriaLabel,
+      elegibleTop3:      r.elegibleTop3,
+      marcadoresExactos: r.marcadoresExactos || 0,
     }));
     res.json(top20);
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -731,13 +732,17 @@ router.get('/participantes', auth, adminOnly, async (req, res) => {
 
 // ── GET PDF de pronósticos de un cliente ──────────────────────────────────────
 // Accesible con auth de cliente (token en cookie/header) o sin auth (link directo con clientId)
+// ?download=1 → fuerza descarga (attachment), sin parámetro → abre en navegador (inline/imprimir)
 router.get('/pdf/:clientId', async (req, res) => {
   try {
     const { generateProdePDF } = require('../services/prode-pdf.services');
-    const pdfBuffer = await generateProdePDF(req.params.clientId);
+    const pdfBuffer    = await generateProdePDF(req.params.clientId);
+    const disposition  = req.query.download === '1'
+      ? `attachment; filename="prode-janz-${req.params.clientId}.pdf"`
+      : `inline; filename="prode-janz-${req.params.clientId}.pdf"`;
     res.set({
       'Content-Type':        'application/pdf',
-      'Content-Disposition': `inline; filename="prode-janz-${req.params.clientId}.pdf"`,
+      'Content-Disposition': disposition,
       'Content-Length':      pdfBuffer.length,
     });
     res.end(pdfBuffer);
@@ -843,6 +848,7 @@ router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
 
     const { Client } = require('../models/Order');
     const { buildDailyProdeMessage: buildMsg } = require('../jobs/prode-notifications');
+    const { getRanking } = require('../services/prode.service');
     const cfg = await getProdeConfig();
 
     // PERF FIX: este endpoint tenía el mismo problema que tenía antes
@@ -858,6 +864,15 @@ router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
       .select('name whatsapp phone').lean();
     const clientMap = {};
     clientsDocs.forEach(c => { clientMap[String(c._id)] = c; });
+
+    // Cargar ranking una sola vez para el preview (igual que en el job de notificaciones)
+    let rankingMap = {};
+    try {
+      const ranking = await getRanking();
+      ranking.forEach((r, i) => { rankingMap[String(r.clientId || r._id)] = i + 1; });
+    } catch (e) {
+      console.error('[preview] No se pudo cargar el ranking:', e.message);
+    }
 
     const resultados = await Promise.all(
       Object.entries(byClient).map(async ([clientId, prons]) => {
@@ -879,8 +894,9 @@ router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
         if (!client) return null;
         const waNum = client.whatsapp || client.phone || '';
 
-        // Construir preview del mensaje usando la función del job
-        const msg = buildMsg(status, prons, cfg);
+        // Construir preview del mensaje con ranking incluido
+        const rankingPos = rankingMap[String(clientId)] || null;
+        const msg = buildMsg(status, prons, cfg, rankingPos);
 
         return {
           clientId,

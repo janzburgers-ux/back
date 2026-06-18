@@ -58,8 +58,8 @@ function buildDailyProdeMessage(status, prons, cfg = {}, rankingPos = null) {
 
   // ── Línea de ranking ──
   const rankingLine = rankingPos
-    ? `📍 Vas #${rankingPos} en el ranking. Seguí pronosticando y sumando puntos — ¡esto recién empieza!`
-    : `📍 Seguí pronosticando y sumando puntos — ¡esto recién empieza!`;
+    ? `📍 Vas #${rankingPos} en el ranking. Seguí pronosticando — aunque no estés cerca de la cima, si cumplís las condiciones y los de arriba no, el premio es tuyo.\n💡 Los torneos se definen al final — el único que no puede ganar es el que deja de jugar.`
+    : `📍 Seguí pronosticando — aunque no estés cerca de la cima, si cumplís las condiciones y los de arriba no, el premio es tuyo.\n💡 Los torneos se definen al final — el único que no puede ganar es el que deja de jugar.`;
 
   // ── Bloque de situación según compras durante el mundial ──
   // Todos necesitan 2 compras durante el mundial para llegar a VIP, sin excepción.
@@ -114,7 +114,8 @@ function buildDailyProdeMessage(status, prons, cfg = {}, rankingPos = null) {
     `🏷️ Categoría: *${status.categoriaLabel}*\n\n` +
     rankingLine + `\n\n` +
     situacionMsg +
-    `\n\n_Janz Burgers_ 🍔⚽`
+    `\n\n🔗 Entrá al prode: https://janz.vercel.app/prode-publico` +
+    `\n_Janz Burgers_ 🍔⚽`
   );
 }
 

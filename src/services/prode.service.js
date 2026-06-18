@@ -578,18 +578,20 @@ async function getTotalPoints(clientId) {
 async function getRanking() {
   const cfg = await getProdeConfig();
 
+  // ── Aggregate principal: puntos + fecha del primer punto (criterio 4) ──────
   const ranking = await ProdePoints.aggregate([
-    // FIX: también aceptar clientId guardado como String (conversión defensiva)
     { $match: {
       tipo: { $in: ['pronostico', 'bonificacion'] },
       clientId: { $exists: true, $ne: null },
     }},
     {
       $group: {
-        _id: '$clientId',
+        _id:               '$clientId',
         totalPuntos:       { $sum: '$puntos' },
         puntosPronosticos: { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
         puntosBonus:       { $sum: { $cond: [{ $eq: ['$tipo', 'bonificacion'] }, '$puntos', 0] } },
+        // Criterio 4: el que llegó antes al puntaje va primero en caso de empate total
+        primerPunto:       { $min: '$createdAt' },
       },
     },
     { $sort: { totalPuntos: -1 } },
@@ -601,69 +603,105 @@ async function getRanking() {
         as: 'client',
       },
     },
-    // FIX: usar $addFields + $size en lugar de $unwind para no perder entradas sin lookup exitoso
-    { $addFields: { clientFound: { $gt: [{ $size: '$client' }, 0] }, clientData: { $arrayElemAt: ['$client', 0] } } },
+    { $addFields: {
+      clientFound: { $gt: [{ $size: '$client' }, 0] },
+      clientData:  { $arrayElemAt: ['$client', 0] },
+    }},
     { $match: { clientFound: true } },
     {
       $project: {
-        clientId: '$_id',
-        nombre: '$clientData.name',
-        apodo: { $arrayElemAt: [{ $split: ['$clientData.name', ' '] }, 0] },
-        whatsapp: '$clientData.whatsapp',
-        totalPuntos: 1,
+        clientId:          '$_id',
+        nombre:            '$clientData.name',
+        apodo:             { $arrayElemAt: [{ $split: ['$clientData.name', ' '] }, 0] },
+        whatsapp:          '$clientData.whatsapp',
+        totalPuntos:       1,
         puntosPronosticos: 1,
-        puntosBonus: 1,
-        puntosCompras: '$puntosBonus',
+        puntosBonus:       1,
+        puntosCompras:     '$puntosBonus',
+        primerPunto:       1,
       },
     },
   ]);
 
-  // ── Agregar participantes con 0 puntos (hicieron pronósticos pero ningún partido evaluado aún) ──
+  // ── Agregar participantes con 0 puntos ────────────────────────────
   const conPuntosIds = new Set(ranking.map(r => String(r.clientId)));
-  const sinPuntos = await Pronostico.distinct('clientId');
-  const nuevos = sinPuntos.filter(id => !conPuntosIds.has(String(id)));
+  const sinPuntos    = await Pronostico.distinct('clientId');
+  const nuevos       = sinPuntos.filter(id => !conPuntosIds.has(String(id)));
   if (nuevos.length > 0) {
     const clients = await require('../models/Order').Client
       .find({ _id: { $in: nuevos } }, 'name whatsapp').lean();
     for (const c of clients) {
       ranking.push({
-        clientId: c._id,
-        nombre: c.name,
-        apodo: c.name?.split(' ')[0] || c.name,
-        whatsapp: c.whatsapp,
-        totalPuntos: 0,
+        clientId:          c._id,
+        nombre:            c.name,
+        apodo:             c.name?.split(' ')[0] || c.name,
+        whatsapp:          c.whatsapp,
+        totalPuntos:       0,
         puntosPronosticos: 0,
-        puntosBonus: 0,
-        puntosCompras: 0,
+        puntosBonus:       0,
+        puntosCompras:     0,
+        primerPunto:       null,
       });
     }
   }
 
-  // PERF FIX: antes este loop era secuencial (un await atrás de otro) y por cada
-  // participante volvía a pegarle a la DB ~8 veces (incluyendo dos consultas
-  // que recalculaban algo que el aggregate de arriba ya había calculado bien).
-  // Con varios participantes eso superaba fácil los 10s de timeout del front
-  // (por eso fallaban /prode/ranking y /prode/stats). Ahora:
-  //   1) se resuelven todos los participantes EN PARALELO (Promise.all), y
-  //   2) se le pasa el cfg ya cargado a resolveProdeStatus para no
-  //      volver a pedirlo a la DB en cada vuelta.
-  //   3) se eliminó el recálculo redundante de totalPuntos/puntosPronosticos/
-  //      puntosBonus — esos valores ya vienen correctos desde el aggregate
-  //      inicial (mismo $match, mismo $group), no hacía falta repetirlos.
+  // ── Criterio 2: marcadores exactos ─────────────────────────────────────
+  // Calculamos cuántos pronósticos de cada cliente acertaron el marcador exacto.
+  // Se hace fuera del aggregate principal porque requiere cruzar Pronostico con
+  // ProdeMatch (homeScore/awayScore), lo que dentro del pipeline sería un doble
+  // $lookup anidado difícil de mantener.
+  const exactosPorCliente = {};
+  try {
+    const pronosticos = await Pronostico.find({ evaluated: true, pointsEarned: { $gt: 0 } })
+      .select('clientId predictedHome predictedAway matchId')
+      .populate('matchId', 'homeScore awayScore')
+      .lean();
+
+    for (const p of pronosticos) {
+      if (
+        p.predictedHome !== null && p.predictedAway !== null &&
+        p.matchId &&
+        p.predictedHome === p.matchId.homeScore &&
+        p.predictedAway === p.matchId.awayScore
+      ) {
+        const cid = String(p.clientId);
+        exactosPorCliente[cid] = (exactosPorCliente[cid] || 0) + 1;
+      }
+    }
+  } catch (e) {
+    console.error('⚠️ getRanking: error calculando exactos:', e.message);
+  }
+
+  for (const r of ranking) {
+    r.marcadoresExactos = exactosPorCliente[String(r.clientId)] || 0;
+  }
+
+  // ── Resolver categorías en paralelo ─────────────────────────────────
   await Promise.all(ranking.map(async (r) => {
-    if (!r.clientId) return;  // guardia: saltar registros sin clientId
+    if (!r.clientId) return;
     const status = await resolveProdeStatus(r.clientId, cfg);
-    r.categoria         = status?.categoria || 'invitado';
+    r.categoria         = status?.categoria      || 'invitado';
     r.categoriaLabel    = status?.categoriaLabel || 'Invitado';
     r.premioSegmento    = status?.premioSegmento || 'invitado';
-    r.elegibleTop3      = status?.elegibleTop3 || false;
+    r.elegibleTop3      = status?.elegibleTop3   || false;
     r.entregasEnPeriodo = status?.entregasEnPeriodo || 0;
-    r.entregasPreProde  = status?.entregasPreProde || 0;
+    r.entregasPreProde  = status?.entregasPreProde  || 0;
     r.pedidosEnPeriodo  = r.entregasEnPeriodo;
   }));
 
-  // Re-ordenar despues de resolver categorías/segmentos
-  ranking.sort((a, b) => b.totalPuntos - a.totalPuntos);
+  // ── Sort final con las 4 reglas de desempate ──────────────────────────
+  // Regla 1: mayor puntaje total
+  // Regla 2: más marcadores exactos (en caso de empate en puntos)
+  // Regla 3: más puntos solo de pronósticos, sin bonus (en caso de empate en exactos)
+  // Regla 4: el que llegó antes al puntaje — primerPunto más antiguo (last resort)
+  ranking.sort((a, b) => {
+    if (b.totalPuntos       !== a.totalPuntos)       return b.totalPuntos       - a.totalPuntos;
+    if (b.marcadoresExactos !== a.marcadoresExactos) return b.marcadoresExactos - a.marcadoresExactos;
+    if (b.puntosPronosticos !== a.puntosPronosticos) return b.puntosPronosticos - a.puntosPronosticos;
+    const tA = a.primerPunto ? new Date(a.primerPunto).getTime() : Infinity;
+    const tB = b.primerPunto ? new Date(b.primerPunto).getTime() : Infinity;
+    return tA - tB;
+  });
 
   return ranking;
 }

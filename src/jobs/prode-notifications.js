@@ -2,11 +2,12 @@ const cron = require('node-cron');
 const { Pronostico }                   = require('../models/Prode');
 const { Client }                       = require('../models/Order');
 const { resolveProdeStatus,
-        getProdeConfig }               = require('../services/prode.service');
+        getProdeConfig,
+        getRanking }                   = require('../services/prode.service');
 const { sendMessage }                  = require('../services/whatsapp');
 
 // ── Construir mensaje resumen diario ─────────────────────────────────────────
-function buildDailyProdeMessage(status, prons, cfg = {}) {
+function buildDailyProdeMessage(status, prons, cfg = {}, rankingPos = null) {
   const nombre = status.nombre || 'Participante';
   const pct    = cfg.guestCouponPercent || 15;
 
@@ -45,9 +46,7 @@ function buildDailyProdeMessage(status, prons, cfg = {}) {
 
       acertados.push(`✅ *${resultado}*\n   ${detalle}`);
     } else {
-      acertados.length === 0 && fallados.length === 0
-        ? fallados.push(`❌ *${resultado}*\n   Pronosticaste: ${predLabel}`)
-        : fallados.push(`❌ *${resultado}*\n   Pronosticaste: ${predLabel}`);
+      fallados.push(`❌ *${resultado}*\n   Pronosticaste: ${predLabel}`);
     }
   }
 
@@ -57,28 +56,51 @@ function buildDailyProdeMessage(status, prons, cfg = {}) {
     ? `\n🎯 *Sumaste hoy: +${totalHoy} pts*`
     : `\n😔 Sin puntos hoy — ¡el próximo partido es el tuyo!`;
 
-  // ── Situación actual ──
-  let situacionMsg = '';
-  if (status.premioSegmento === 'competidor') {
-    situacionMsg =
-      `🏆 *¡Estás en los premios exclusivos!*\n` +
-      `Con 2+ compras en el Mundial competís por el podio (Top 3).\n` +
-      `¡Seguí pronosticando para escalar posiciones!`;
+  // ── Línea de ranking ──
+  const rankingLine = rankingPos
+    ? `📍 Vas #${rankingPos} en el ranking. Seguí pronosticando y sumando puntos — ¡esto recién empieza!`
+    : `📍 Seguí pronosticando y sumando puntos — ¡esto recién empieza!`;
 
-  } else if (status.premioSegmento === 'cliente') {
-    if (status.entregasEnPeriodo >= 1) {
-      situacionMsg =
-        `✅ *Participás por el Combo Doble.*\n` +
-        `Con 1 compra más (total 2) durante el Mundial → *premios exclusivos*. 🔥`;
-    } else {
-      situacionMsg =
-        `✅ *Ya sos cliente → competís por el Combo Doble a elección.*\n` +
-        `Hacé 2 compras durante el Mundial → *premios exclusivos*. 🔥`;
-    }
-  } else {
+  // ── Bloque de situación según compras durante el mundial ──
+  // Todos necesitan 2 compras durante el mundial para llegar a VIP, sin excepción.
+  // entregasEnPeriodo: compras entregadas DURANTE el mundial (el único contador que importa)
+  // entregasPreProde:  compras previas al mundial (solo sirve para saber si mostrar el cupón)
+  const ep  = status.entregasEnPeriodo;   // 0, 1, ≥2
+  const epp = status.entregasPreProde;    // 0 = nunca compró antes
+
+  let situacionMsg = '';
+
+  if (ep >= 2) {
+    // VIP — ya llegó, solo motivación de ranking
     situacionMsg =
-      `👋 *Sos Invitado* — Tenés un *cupón del ${pct}%* para tu primera compra.\n` +
-      `Hacé 1 compra en Janz durante el Mundial y empezás a competir por premios. 🎁`;
+      `🏆 *¡Sos Cliente VIP!* Estás compitiendo por los premios principales.\n` +
+      `El ranking se mueve partido a partido — cada pronóstico acertado te acerca al podio.\n` +
+      `¡Seguí así!`;
+
+  } else if (ep === 1) {
+    // 1 compra durante el mundial — le falta 1 para VIP (aplica a todos por igual)
+    situacionMsg =
+      `✅ *Ya estás compitiendo por el Combo Doble.* ¡Bien!\n` +
+      `Te falta *1 sola compra más* durante el Mundial para subir a *VIP*:\n` +
+      `→ Entrás a los premios principales y competís por el podio del ranking. 🏆\n` +
+      `¡Estás a un paso!`;
+
+  } else if (epp === 0) {
+    // 0 compras durante el mundial + nunca compró antes = Invitado puro → mostrar cupón
+    situacionMsg =
+      `🎁 *Todavía no compraste en Janz* — ¡pero podés sumar premios!\n` +
+      `Tenés un cupón del *${pct}%* para tu primera compra.\n\n` +
+      `Con tus compras durante el Mundial:\n` +
+      `→ 1 compra → *Cliente:* competís por un Combo Doble 🍔🍔\n` +
+      `→ 2 compras → *VIP:* entrás a los premios principales del ranking 🏆`;
+
+  } else {
+    // 0 compras durante el mundial + ya compró antes = Cliente viejo sin compras del mundial
+    situacionMsg =
+      `🍔 *Ya sos cliente de Janz* — ahora sumá puntos adentro del Mundial también.\n` +
+      `Con tus compras durante el torneo:\n` +
+      `→ 1 compra → competís por un Combo Doble 🍔🍔\n` +
+      `→ 2 compras → *VIP:* entrás a los premios principales del ranking 🏆`;
   }
 
   return (
@@ -90,6 +112,7 @@ function buildDailyProdeMessage(status, prons, cfg = {}) {
     resumenPts + `\n` +
     `📊 *Total acumulado: ${status.totalPuntos} pts*\n` +
     `🏷️ Categoría: *${status.categoriaLabel}*\n\n` +
+    rankingLine + `\n\n` +
     situacionMsg +
     `\n\n_Janz Burgers_ 🍔⚽`
   );
@@ -119,6 +142,18 @@ async function runProdeNotifications() {
   }
 
   const cfg = await getProdeConfig();
+
+  // Cargar ranking una sola vez para todos — más eficiente que consultar por cliente
+  let rankingMap = {};
+  try {
+    const ranking = await getRanking();
+    ranking.forEach((r, i) => {
+      rankingMap[String(r.clientId || r._id)] = i + 1;
+    });
+  } catch (e) {
+    console.error('⚽ [ProdeNotif] No se pudo cargar el ranking:', e.message);
+  }
+
   let sent = 0, skipped = 0;
 
   for (const [clientId, prons] of Object.entries(byClient)) {
@@ -135,11 +170,12 @@ async function runProdeNotifications() {
       const status = await resolveProdeStatus(clientId);
       if (!status) { skipped++; continue; }
 
-      const msg = buildDailyProdeMessage(status, prons, cfg);
+      const rankingPos = rankingMap[String(clientId)] || null;
+      const msg = buildDailyProdeMessage(status, prons, cfg, rankingPos);
       await sendMessage(waNum, msg);
       sent++;
 
-      console.log(`✅ [ProdeNotif] Resumen enviado a ${client.name} (${prons.length} partidos)`);
+      console.log(`✅ [ProdeNotif] Resumen enviado a ${client.name} (${prons.length} partidos, #${rankingPos ?? '?'} en ranking)`);
 
       // Pausa entre mensajes para no saturar WhatsApp
       await new Promise(r => setTimeout(r, 1500));

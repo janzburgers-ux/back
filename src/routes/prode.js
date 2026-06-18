@@ -1036,4 +1036,83 @@ router.post('/notificaciones/enviar', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── Cache liviano del ranking (evita recalcular en cada request) ──────────────
+let _rankingCache     = null;
+let _rankingCacheAt   = 0;
+const RANKING_CACHE_MS = 5 * 60 * 1000; // 5 minutos
+
+async function getCachedRanking() {
+  if (_rankingCache && Date.now() - _rankingCacheAt < RANKING_CACHE_MS) {
+    return _rankingCache;
+  }
+  _rankingCache   = await getRanking();
+  _rankingCacheAt = Date.now();
+  return _rankingCache;
+}
+
+// ── GET predicciones públicas de un partido (sin auth) ────────────────────────
+// Se revelan 5 minutos después del inicio del partido para que nadie copie
+// las predicciones del top 10 antes de que arranque.
+router.get('/predicciones-publicas/:matchId', async (req, res) => {
+  try {
+    const match = await ProdeMatch.findById(req.params.matchId).lean();
+    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
+
+    const REVEAL_MS = 5 * 60 * 1000;
+    const revealAt  = new Date(match.matchDate.getTime() + REVEAL_MS);
+    const revealed  = Date.now() >= revealAt.getTime();
+
+    const matchPublic = {
+      homeTeam:  match.homeTeam,
+      awayTeam:  match.awayTeam,
+      homeLogo:  match.homeLogo,
+      awayLogo:  match.awayLogo,
+      matchDate: match.matchDate,
+      stage:     match.stage,
+      status:    match.status,
+      homeScore: match.homeScore,
+      awayScore: match.awayScore,
+      winner:    match.winner,
+    };
+
+    if (!revealed) {
+      return res.json({ revealed: false, revealAt, match: matchPublic });
+    }
+
+    // Top 10 del ranking (cacheado 5 min para no recalcular en cada request)
+    const ranking = await getCachedRanking();
+    const top10   = ranking.slice(0, 10);
+
+    // Sus predicciones para este partido en una sola query
+    const clientIds   = top10.map(r => r.clientId);
+    const pronosticos = await Pronostico.find({
+      matchId:  match._id,
+      clientId: { $in: clientIds },
+    }).lean();
+
+    const pronoByClient = {};
+    for (const p of pronosticos) {
+      pronoByClient[String(p.clientId)] = p;
+    }
+
+    const predicciones = top10.map((r, i) => {
+      const p = pronoByClient[String(r.clientId)];
+      return {
+        position:    i + 1,
+        apodo:       r.apodo,        // solo primer nombre, sin datos de contacto
+        totalPuntos: r.totalPuntos,
+        prediccion:  p ? {
+          winner: p.predictedWinner,
+          home:   p.predictedHome,   // null si no ingresó marcador
+          away:   p.predictedAway,
+        } : null,                    // null = no pronosticó este partido
+      };
+    });
+
+    res.json({ revealed: true, match: matchPublic, predicciones });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;

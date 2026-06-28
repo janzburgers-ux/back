@@ -56,6 +56,10 @@ const productSchema = new mongoose.Schema({
   monthlyLabel:        { type: String, default: '' }    // ej: "Abril 2025"
 }, { timestamps: true });
 
+// Índice para el filtro exacto que usa /api/public/menu (la ruta que carga
+// la página pública de pedidos): active=true, visible != false.
+productSchema.index({ active: 1, visible: 1 });
+
 const Recipe = mongoose.model('Recipe', recipeSchema);
 const Product = mongoose.model('Product', productSchema);
 

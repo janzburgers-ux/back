@@ -109,6 +109,16 @@ const orderSchema = new mongoose.Schema({
   idempotencyKey: { type: String, default: null, index: true, sparse: true }
 }, { timestamps: true });
 
+// ── Índices ──────────────────────────────────────────────────────────────
+// Estas dos consultas se repiten en varias rutas (listado de pedidos en el
+// panel admin, conteo diario para el límite de pedidos en /public/menu) y
+// hoy no tenían ningún índice que las respalde más allá del _id: Mongo
+// terminaba escaneando toda la colección. Sin índices esto no se nota
+// con pocos pedidos, pero se va a poner cada vez más lento a medida que
+// crece el historial.
+orderSchema.index({ status: 1, createdAt: -1 }); // filtrar por estado y ordenar por fecha
+orderSchema.index({ createdAt: -1 });             // rango de fechas sin filtrar por estado
+
 function generatePublicCode() {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
   let code = '';

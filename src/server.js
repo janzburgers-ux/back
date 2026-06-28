@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
@@ -37,6 +38,13 @@ io.on('connection', (socket) => {
 
 // ── Seguridad ─────────────────────────────────────────────────────────────────
 app.disable('x-powered-by'); // no exponer que es Express
+
+// Comprime todas las respuestas (gzip/brotli según soporte del cliente).
+// Antes el JSON de /api/public/menu, /api/products, etc. viajaba sin
+// comprimir; esto reduce ese peso entre 60% y 80% sin tocar el contenido
+// de las respuestas.
+app.use(compression());
+
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {

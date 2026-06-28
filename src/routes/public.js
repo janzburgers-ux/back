@@ -172,16 +172,33 @@ router.patch('/client-update', async (req, res) => {
 // GET menú público
 router.get('/menu', async (req, res) => {
   try {
-    const open = await isOpen();
-    const products = await Product.find({ active: true, visible: { $ne: false } }).sort('name variant');
-    const additionals = await Additional.find({ active: true }).sort('name')
-      .select('name description price emoji category appliesTo available ingredient consumesQuantity consumesUnit');
+    // Modelos que se usaban con require() perezoso dentro del handler;
+    // se mantienen igual, solo se adelantan para poder usarlos en el
+    // Promise.all de abajo.
+    const Stock = require('../models/Stock');
+    const { Recipe } = require('../models/Product');
 
-    const zonesCfg = await Config.findOne({ key: 'zones' });
-    const zones = zonesCfg?.value || [{ id: 'default', name: 'Barrio La Rotonda', cost: 0, freeFrom: 0 }];
+    // ── Consultas independientes en paralelo ──────────────────────────────
+    // Antes: isOpen(), products, additionals, 3x Config.findOne() y
+    // Stock.find() se esperaban una por una (7 round-trips secuenciales a
+    // Mongo). Ninguna depende del resultado de otra, así que se piden todas
+    // juntas. Los 3 Config.findOne además se combinan en un solo find($in).
+    const [open, products, additionals, configDocs, allStocks] = await Promise.all([
+      isOpen(),
+      Product.find({ active: true, visible: { $ne: false } }).sort('name variant').lean(),
+      Additional.find({ active: true }).sort('name')
+        .select('name description price emoji category appliesTo available ingredient consumesQuantity consumesUnit')
+        .lean(),
+      Config.find({ key: { $in: ['zones', 'orderLimits', 'business'] } }).lean(),
+      Stock.find().select('ingredient status').lean(),
+    ]);
 
-    const limitCfg = await Config.findOne({ key: 'orderLimits' });
-    const limits = limitCfg?.value || { enabled: false, dailyMax: 50 };
+    const configByKey = {};
+    configDocs.forEach(c => { configByKey[c.key] = c.value; });
+
+    const zones = configByKey.zones || [{ id: 'default', name: 'Barrio La Rotonda', cost: 0, freeFrom: 0 }];
+
+    const limits = configByKey.orderLimits || { enabled: false, dailyMax: 50 };
     let todayCount = 0;
     let limitReached = false;
     if (limits.enabled) {
@@ -190,36 +207,37 @@ router.get('/menu', async (req, res) => {
       limitReached = todayCount >= limits.dailyMax;
     }
 
-    const businessCfg = await Config.findOne({ key: 'business' });
-    const businessWhatsapp = businessCfg?.value?.whatsappNumber || '';
-
-    // Agregar también el modelo Stock para los indicadores
-    const Stock = require('../models/Stock');
+    const businessWhatsapp = configByKey.business?.whatsappNumber || '';
 
     // ── Calcular stockWarning por producto ──────────────────────────────────
     // Para cada producto, verificar si algún ingrediente de su receta está en 'low' o 'out'
-    const allStocks = await Stock.find();
     const stockStatusMap = {}; // ingredientId -> status
     allStocks.forEach(s => { stockStatusMap[s.ingredient.toString()] = s.status; });
 
+    // ── Recetas: una sola consulta para todas, en vez de 1 por producto ────
+    // Antes este `for` hacía `await Recipe.findById(...)` adentro, es decir
+    // una consulta secuencial a Mongo por cada producto con receta. Ahora se
+    // traen todas las recetas necesarias de una sola vez con $in y se arma
+    // un mapa en memoria; el resultado final (stockWarning por producto) es
+    // exactamente el mismo.
+    const recipeIds = [...new Set(products.filter(p => p.recipe).map(p => p.recipe.toString()))];
+    const recipes = recipeIds.length
+      ? await Recipe.find({ _id: { $in: recipeIds } }).select('ingredients').populate('ingredients.ingredient', '_id').lean()
+      : [];
+    const recipeWarningMap = {}; // recipeId -> boolean (algún ingrediente low/out)
+    recipes.forEach(recipe => {
+      const hasWarning = recipe.ingredients.some(ri => {
+        const ingId = ri.ingredient?._id?.toString();
+        return ingId && (stockStatusMap[ingId] === 'low' || stockStatusMap[ingId] === 'out');
+      });
+      recipeWarningMap[recipe._id.toString()] = hasWarning;
+    });
+
     // Agrupar productos por nombre (con stockWarning calculado)
-    const { Recipe } = require('../models/Product');
     const menu = {};
     for (const p of products) {
       if (!menu[p.name]) menu[p.name] = [];
-      let stockWarning = false;
-      if (p.recipe) {
-        const recipe = await Recipe.findById(p.recipe).select('ingredients').populate('ingredients.ingredient', '_id');
-        if (recipe) {
-          for (const ri of recipe.ingredients) {
-            const ingId = ri.ingredient?._id?.toString();
-            if (ingId && (stockStatusMap[ingId] === 'low' || stockStatusMap[ingId] === 'out')) {
-              stockWarning = true;
-              break;
-            }
-          }
-        }
-      }
+      const stockWarning = p.recipe ? !!recipeWarningMap[p.recipe.toString()] : false;
       menu[p.name].push({
         _id: p._id, name: p.name, variant: p.variant,
         salePrice: p.salePrice, available: p.available,

@@ -29,8 +29,8 @@ function mapGroup(group = '') {
   return group ? group.replace('GROUP_', 'Grupo ') : '';
 }
 
-const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME'];
-const FINISHED_STATUSES = ['FINISHED'];
+const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME', 'EXTRA_TIME', 'PENALTY_SHOOTOUT'];
+const FINISHED_STATUSES = ['FINISHED', 'FINISHED_AET', 'FINISHED_AP'];
 
 function mapWinner(winner) {
   if (winner === 'HOME_TEAM') return 'home';

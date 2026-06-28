@@ -2,18 +2,137 @@ const Stock = require('../models/Stock');
 const { Recipe, Product } = require('../models/Product');
 const Ingredient = require('../models/Ingredient');
 
+// ── Reservar stock atómicamente (Fase 1: race condition) ─────────────────────
+// Intenta descontar todos los ingredientes necesarios con findOneAndUpdate atómico.
+// Si alguno falla por stock insuficiente, revierte todo lo que ya se descontó.
+// Devuelve { ok: true } o { ok: false, unavailableItems, adjustedItems, adjustedTotal }
+async function reserveStockForOrder(orderItems) {
+  const Additional = require('../models/Additional');
+
+  // 1. Calcular ingredientes necesarios por item de pedido
+  const itemIngredients = [];
+
+  for (let idx = 0; idx < orderItems.length; idx++) {
+    const item = orderItems[idx];
+    // ── Ingredientes del producto base ──
+    const product = await Product.findById(item.product).populate('recipe');
+    if (product?.recipe) {
+      const recipe = await Recipe.findById(product.recipe).populate('ingredients.ingredient');
+      if (recipe) {
+        for (const ri of recipe.ingredients) {
+          const ingId = ri.ingredient._id.toString();
+          itemIngredients.push({
+            itemIdx: idx,
+            ingId,
+            ingName: ri.ingredient.name,
+            needed: ri.quantity * item.quantity,
+            productId: item.product.toString(),
+            productName: item.productName || product.name,
+            variant: item.variant || product.variant,
+            unitPrice: item.unitPrice || product.salePrice,
+            quantity: item.quantity,
+            additionals: item.additionals || []
+          });
+        }
+      }
+    }
+    // ── Ingredientes de adicionales vinculados ──
+    for (const a of (item.additionals || [])) {
+      const add = await Additional.findById(a.additional || a._id);
+      if (!add?.ingredient) continue;
+      const ingId = add.ingredient.toString();
+      itemIngredients.push({
+        itemIdx: idx,
+        ingId,
+        ingName: add.name,
+        needed: add.consumesQuantity * (a.quantity || 1),
+        productId: item.product.toString(),
+        productName: item.productName,
+        variant: item.variant,
+        unitPrice: item.unitPrice,
+        quantity: item.quantity,
+        additionals: item.additionals || []
+      });
+    }
+  }
+
+  // 2. Consolidar por ingrediente
+  const ingMap = {};
+  for (const ii of itemIngredients) {
+    if (!ingMap[ii.ingId]) ingMap[ii.ingId] = { ingName: ii.ingName, needed: 0, itemIdxs: new Set() };
+    ingMap[ii.ingId].needed += ii.needed;
+    ingMap[ii.ingId].itemIdxs.add(ii.itemIdx);
+  }
+
+  // 3. Intentar reserva atómica por ingrediente
+  const reserved = [];
+  const failedIngredients = new Set();
+  const failedItemIdxs = new Set();
+
+  for (const [ingId, { ingName, needed, itemIdxs }] of Object.entries(ingMap)) {
+    const result = await Stock.findOneAndUpdate(
+      { ingredient: ingId, currentStock: { $gte: needed } },
+      { $inc: { currentStock: -needed } },
+      { new: true }
+    );
+    if (result) {
+      reserved.push({ ingId, needed });
+    } else {
+      failedIngredients.add(ingId);
+      itemIdxs.forEach(i => failedItemIdxs.add(i));
+    }
+  }
+
+  // 4. Si todo ok, retornar éxito
+  if (failedIngredients.size === 0) {
+    return { ok: true };
+  }
+
+  // 5. Rollback de lo que ya se reservó
+  for (const { ingId, needed } of reserved) {
+    await Stock.findOneAndUpdate(
+      { ingredient: ingId },
+      { $inc: { currentStock: needed } }
+    );
+  }
+
+  // 6. Construir respuesta con items ajustados
+  const unavailableItems = orderItems
+    .filter((_, idx) => failedItemIdxs.has(idx))
+    .map(item => ({ productId: item.product.toString(), productName: item.productName, variant: item.variant }));
+
+  const adjustedItems = orderItems.filter((_, idx) => !failedItemIdxs.has(idx));
+  const adjustedTotal = adjustedItems.reduce((sum, item) => {
+    const addsCost = (item.additionals || []).reduce((s, a) => s + a.unitPrice * (a.quantity || 1), 0);
+    return sum + item.unitPrice * item.quantity + addsCost;
+  }, 0);
+
+  return { ok: false, unavailableItems, adjustedItems, adjustedTotal };
+}
+
 // ── Descontar stock al confirmar pedido ──────────────────────────────────────
 async function deductStockForOrder(orderItems) {
+  const Additional = require('../models/Additional');
   const deductions = {};
 
   for (const item of orderItems) {
+    // Ingredientes del producto base
     const product = await Product.findById(item.product).populate('recipe');
-    if (!product?.recipe) continue;
-    const recipe = await Recipe.findById(product.recipe).populate('ingredients.ingredient');
-    if (!recipe) continue;
-    for (const ri of recipe.ingredients) {
-      const ingId = ri.ingredient._id.toString();
-      deductions[ingId] = (deductions[ingId] || 0) + ri.quantity * item.quantity;
+    if (product?.recipe) {
+      const recipe = await Recipe.findById(product.recipe).populate('ingredients.ingredient');
+      if (recipe) {
+        for (const ri of recipe.ingredients) {
+          const ingId = ri.ingredient._id.toString();
+          deductions[ingId] = (deductions[ingId] || 0) + ri.quantity * item.quantity;
+        }
+      }
+    }
+    // Ingredientes de adicionales vinculados
+    for (const a of (item.additionals || [])) {
+      const add = await Additional.findById(a.additional || a._id);
+      if (!add?.ingredient) continue;
+      const ingId = add.ingredient.toString();
+      deductions[ingId] = (deductions[ingId] || 0) + add.consumesQuantity * (a.quantity || 1);
     }
   }
 
@@ -266,21 +385,78 @@ async function autoUpdateProductAvailability() {
   }
 }
 
-module.exports = { deductStockForOrder, returnStockForOrder, calcPackagingCost, calcPackagingForOrder, recalculateProductCosts, generateShoppingList, generateProductionShoppingList, autoUpdateProductAvailability };
+// ── Auto-deshabilitar adicionales cuando no hay stock para su ingrediente ─────
+async function autoUpdateAdditionalAvailability() {
+  try {
+    const Additional = require('../models/Additional');
+    const additionals = await Additional.find({ active: true, ingredient: { $ne: null } });
+    const stockMap = {};
+    const allStock = await Stock.find().populate('ingredient');
+    allStock.forEach(s => { stockMap[s.ingredient?._id?.toString()] = s; });
+
+    for (const add of additionals) {
+      const ingId = add.ingredient?.toString();
+      if (!ingId) continue;
+      const stock = stockMap[ingId];
+      const canMake = stock && stock.currentStock >= add.consumesQuantity;
+      if (add.available !== canMake) {
+        await Additional.findByIdAndUpdate(add._id, { available: canMake });
+        console.log(`📦 [Stock] Adicional "${add.name}" → ${canMake ? 'disponible' : 'sin stock'}`);
+      }
+    }
+  } catch (err) {
+    console.error('Error en autoUpdateAdditionalAvailability:', err.message);
+  }
+}
+
+// ── Auto-actualizar disponibilidad de promos ──────────────────────────────────
+// Una promo se apaga si cualquiera de sus productos componentes no está disponible.
+async function autoUpdatePromoAvailability() {
+  try {
+    const Promo = require('../models/Promo');
+    const promos = await Promo.find({ active: true });
+    for (const promo of promos) {
+      let available = true;
+      for (const c of promo.components) {
+        const prod = await Product.findById(c.product).select('available active');
+        if (!prod || !prod.active || !prod.available) { available = false; break; }
+      }
+      if (promo.available !== available) {
+        await Promo.findByIdAndUpdate(promo._id, { available });
+        console.log(`🎁 [Stock] Promo "${promo.name}" → ${available ? 'disponible' : 'sin stock'}`);
+      }
+    }
+  } catch (err) {
+    console.error('Error en autoUpdatePromoAvailability:', err.message);
+  }
+}
 
 // ── Devolver stock al cancelar un pedido ─────────────────────────────────────
 async function returnStockForOrder(orderItems) {
+  const Additional = require('../models/Additional');
   const additions = {};
+
   for (const item of orderItems) {
+    // Ingredientes del producto base
     const product = await Product.findById(item.product).populate('recipe');
-    if (!product?.recipe) continue;
-    const recipe = await Recipe.findById(product.recipe).populate('ingredients.ingredient');
-    if (!recipe) continue;
-    for (const ri of recipe.ingredients) {
-      const ingId = ri.ingredient._id.toString();
-      additions[ingId] = (additions[ingId] || 0) + ri.quantity * item.quantity;
+    if (product?.recipe) {
+      const recipe = await Recipe.findById(product.recipe).populate('ingredients.ingredient');
+      if (recipe) {
+        for (const ri of recipe.ingredients) {
+          const ingId = ri.ingredient._id.toString();
+          additions[ingId] = (additions[ingId] || 0) + ri.quantity * item.quantity;
+        }
+      }
+    }
+    // Ingredientes de adicionales vinculados
+    for (const a of (item.additionals || [])) {
+      const add = await Additional.findById(a.additional || a._id);
+      if (!add?.ingredient) continue;
+      const ingId = add.ingredient.toString();
+      additions[ingId] = (additions[ingId] || 0) + add.consumesQuantity * (a.quantity || 1);
     }
   }
+
   for (const [ingredientId, quantity] of Object.entries(additions)) {
     const stock = await Stock.findOne({ ingredient: ingredientId });
     if (!stock) continue;
@@ -289,3 +465,17 @@ async function returnStockForOrder(orderItems) {
     console.log(`📦 [Stock] Devuelto ${quantity} de ingrediente ${ingredientId}`);
   }
 }
+
+module.exports = {
+  reserveStockForOrder,
+  deductStockForOrder,
+  calcPackagingForOrder,
+  calcPackagingCost,
+  recalculateProductCosts,
+  generateShoppingList,
+  generateProductionShoppingList,
+  autoUpdateProductAvailability,
+  autoUpdateAdditionalAvailability,
+  autoUpdatePromoAvailability,
+  returnStockForOrder,
+};

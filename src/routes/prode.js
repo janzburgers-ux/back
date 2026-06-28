@@ -407,6 +407,26 @@ router.get('/premios', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── POST finalizar el Prode y premiar al top 3 automáticamente ───────────────
+// Genera y envía los cupones del top 3 (sistema de premios automáticos).
+// Es idempotente: si una posición ya fue premiada en esta temporada, se saltea.
+router.post('/finalizar-premios', auth, adminOnly, async (req, res) => {
+  try {
+    const { awardTop3Prizes } = require('../services/prode-prizes.service');
+    const result = await awardTop3Prizes();
+    res.json(result);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET auditoría de premios del top 3 ya entregados/programados ─────────────
+router.get('/premios-top3', auth, adminOnly, async (req, res) => {
+  try {
+    const { listPrizes } = require('../services/prode-prizes.service');
+    const prizes = await listPrizes();
+    res.json(prizes);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── GET ranking general (admin) ───────────────────────────────────────────────
 router.get('/ranking', auth, async (req, res) => {
   try {
@@ -493,6 +513,40 @@ router.post('/evaluar-forzado', auth, adminOnly, async (req, res) => {
     }
 
     res.json({ reseteados, evaluados, message: `${evaluados} partidos re-evaluados desde cero` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST re-evaluar puntos de UN cliente específico desde cero ────────────────
+// Resetea solo los pronósticos de ese cliente y recalcula partido por partido.
+// Los pronósticos de los demás clientes no se tocan.
+router.post('/evaluar-cliente/:clientId', auth, adminOnly, async (req, res) => {
+  try {
+    const { clientId } = req.params;
+
+    // 1) Borrar ProdePoints de tipo pronostico de este cliente solamente
+    await ProdePoints.deleteMany({ clientId, tipo: 'pronostico' });
+
+    // 2) Resetear los pronósticos evaluados de este cliente
+    await Pronostico.updateMany(
+      { clientId },
+      { $set: { evaluated: false, pointsEarned: 0 } }
+    );
+
+    // 3) Re-evaluar partido por partido (solo los terminados).
+    //    evaluateMatch solo procesa pronósticos con evaluated:false,
+    //    por lo que los demás clientes (evaluated:true) no se ven afectados.
+    const matches = await ProdeMatch.find({ status: 'finished' });
+    let evaluados = 0;
+    for (const m of matches) {
+      await evaluateMatch(m._id);
+      evaluados++;
+    }
+
+    res.json({
+      clientId,
+      evaluados,
+      message: `Puntos de ${clientId} recalculados sobre ${evaluados} partidos terminados`,
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -1039,18 +1093,96 @@ router.post('/notificaciones/enviar', auth, adminOnly, async (req, res) => {
 // ── Cache liviano del ranking (evita recalcular en cada request) ──────────────
 let _rankingCache     = null;
 let _rankingCacheAt   = 0;
+let _rankingInFlight  = null; // promesa en curso, evita "cache stampede"
 const RANKING_CACHE_MS = 5 * 60 * 1000; // 5 minutos
 
 async function getCachedRanking() {
   if (_rankingCache && Date.now() - _rankingCacheAt < RANKING_CACHE_MS) {
     return _rankingCache;
   }
-  _rankingCache   = await getRanking();
-  _rankingCacheAt = Date.now();
-  return _rankingCache;
+  // Si ya hay un cálculo en curso (p. ej. varios requests llegaron a la vez
+  // con el caché vencido), todos esperan el mismo resultado en vez de
+  // disparar getRanking() una vez por request.
+  if (_rankingInFlight) return _rankingInFlight;
+
+  _rankingInFlight = getRanking()
+    .then(result => {
+      _rankingCache   = result;
+      _rankingCacheAt = Date.now();
+      return result;
+    })
+    .finally(() => { _rankingInFlight = null; });
+
+  return _rankingInFlight;
 }
 
-// ── GET predicciones públicas de un partido (sin auth) ────────────────────────
+// ── GET predicciones públicas de TODOS los partidos revelados, en una sola
+//    consulta (sin auth) ────────────────────────────────────────────────────
+// Reemplaza N llamados individuales (uno por partido ya arrancado) por uno
+// solo. Evita que el frontend dispare decenas de requests simultáneos a
+// medida que avanza el Mundial y hay más partidos ya jugados.
+router.get('/predicciones-publicas', async (req, res) => {
+  try {
+    const matches = await ProdeMatch.find().select('matchDate').lean();
+
+    const REVEAL_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    const result = {};
+    const revealedIds = [];
+
+    for (const match of matches) {
+      const revealAt = new Date(match.matchDate.getTime() + REVEAL_MS);
+      const revealed = now >= revealAt.getTime();
+      if (revealed) {
+        revealedIds.push(match._id);
+      } else {
+        result[match._id] = { revealed: false, revealAt };
+      }
+    }
+
+    if (revealedIds.length > 0) {
+      // Ranking calculado UNA sola vez para todos los partidos revelados
+      // (en vez de una vez por partido como antes)
+      const ranking = await getCachedRanking();
+      const top10   = ranking.slice(0, 10);
+      const clientIds = top10.map(r => r.clientId);
+
+      // Pronósticos del top10 para TODOS los partidos revelados, en una sola query
+      const pronosticos = await Pronostico.find({
+        matchId:  { $in: revealedIds },
+        clientId: { $in: clientIds },
+      }).lean();
+
+      const pronoByKey = {};
+      for (const p of pronosticos) {
+        pronoByKey[`${p.matchId}_${p.clientId}`] = p;
+      }
+
+      for (const matchId of revealedIds) {
+        const predicciones = top10.map((r, i) => {
+          const p = pronoByKey[`${matchId}_${r.clientId}`];
+          return {
+            position:    i + 1,
+            apodo:       r.apodo,
+            totalPuntos: r.totalPuntos,
+            prediccion:  p ? {
+              winner: p.predictedWinner,
+              home:   p.predictedHome,
+              away:   p.predictedAway,
+            } : null,
+          };
+        });
+        result[matchId] = { revealed: true, predicciones };
+      }
+    }
+
+    res.json(result);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── GET predicciones públicas de un partido individual (sin auth) ────────────
+// Se mantiene por compatibilidad; el frontend ahora usa el endpoint batch
+// de arriba para no disparar un request por partido.
 // Se revelan 5 minutos después del inicio del partido para que nadie copie
 // las predicciones del top 10 antes de que arranque.
 router.get('/predicciones-publicas/:matchId', async (req, res) => {

@@ -465,9 +465,10 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
 
       await order.save();
 
+      const { reason, notes: rNotes, missingStock } = req.body;
+
       try {
         const RejectedOrder = require('../models/RejectedOrder');
-        const { reason, notes: rNotes, missingStock } = req.body;
         await new RejectedOrder({
           orderNumber: order.orderNumber,
           publicCode: order.publicCode,
@@ -480,14 +481,56 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         }).save();
       } catch (e) { console.error('Error guardando rechazo:', e.message); }
 
+      // ── CUPÓN DE DISCULPA (solo para cancelación por sin_stock) ───────────
+      let apologyCouponCode = null;
+      if (reason === 'sin_stock' && order.client?.whatsapp) {
+        try {
+          const Coupon   = require('../models/Coupon');
+          const { Client } = require('../models/Order');
+          const { generateCouponCode } = require('../services/loyalty');
+          const clientDoc = await Client.findById(order.client._id || order.client);
+          if (clientDoc) {
+            const code = generateCouponCode(clientDoc.nickname || clientDoc.name?.split(' ')[0] || 'CLI');
+            const existing = await Coupon.findOne({ code });
+            if (!existing) {
+              const expiresAt = new Date(Date.now() + 15 * 24 * 60 * 60 * 1000);
+              await Coupon.create({
+                code,
+                owner:           clientDoc._id,
+                ownerName:       clientDoc.name,
+                discountForUser: 10,
+                rewardPerUse:    0,
+                type:            'apology',
+                unlimited:       false,
+                singleUse:       true,
+                active:          true,
+                expiresAt,
+              });
+              apologyCouponCode = code;
+              console.log(`🎟️ [Cancelación] Cupón de disculpa: ${code} para ${clientDoc.name}`);
+            }
+          }
+        } catch (e) { console.error('Error generando cupón de disculpa:', e.message); }
+      }
+
       if (order.client?.whatsapp) {
-        sendOrderCancelled(order.client.whatsapp, friendlyName(order.client), order.publicCode, order.orderNumber)
-          .catch(err => console.error('Error WA cancelado:', err.message));
+        if (apologyCouponCode) {
+          const { sendOrderCancelledWithCoupon } = require('../services/whatsapp');
+          sendOrderCancelledWithCoupon(
+            order.client.whatsapp,
+            friendlyName(order.client),
+            order.publicCode || order.orderNumber,
+            apologyCouponCode
+          ).catch(err => console.error('Error WA cancelado+cupón:', err.message));
+        } else {
+          sendOrderCancelled(order.client.whatsapp, friendlyName(order.client), order.publicCode, order.orderNumber)
+            .catch(err => console.error('Error WA cancelado:', err.message));
+        }
       }
 
       const io = req.app.get('io');
       if (io) io.to(`order_${order.orderNumber}`).emit('order_status', { status: 'cancelled', order });
-      return res.json({ order, cancelled: true });
+      return res.json({ order, cancelled: true, apologyCouponCode });
     }
 
     // ── delivered ─────────────────────────────────────────────────────────────

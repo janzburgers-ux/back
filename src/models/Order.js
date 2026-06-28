@@ -76,7 +76,7 @@ const orderSchema = new mongoose.Schema({
   discountAmount: { type: Number, default: 0 },
   discountPercent: { type: Number, default: 0 },
   // 'order' = descuento sobre todo el pedido | 'product' = descuento sobre producto específico
-  discountType: { type: String, enum: ['order', 'product'], default: 'order' },
+  discountType: { type: String, enum: ['order', 'product', 'variant'], default: 'order' },
   stockDeducted: { type: Boolean, default: false },
   whatsappSent: { type: Boolean, default: false },
 
@@ -88,6 +88,7 @@ const orderSchema = new mongoose.Schema({
   confirmedAt: { type: Date },
   preparingAt: { type: Date },
   cookingStartedAt: { type: Date },  // inicio real del timer (al pasar a preparing)
+  kitchenAlertSentAt: { type: Date }, // Fase 5: cuando se mandó la alerta de WA a cocina
   readyAt: { type: Date },
   deliveredAt: { type: Date },
 
@@ -142,9 +143,9 @@ orderSchema.pre('save', async function(next) {
   subtotal += (this.additionals || 0);
 
   // Descuento:
-  // - discountType === 'product': discountAmount fue pre-calculado sobre el producto específico, no recalcular
+  // - discountType === 'product' | 'variant': discountAmount fue pre-calculado, no recalcular
   // - discountType === 'order': calcular desde discountPercent sobre todo el subtotal
-  if (this.discountType !== 'product' && this.discountPercent > 0) {
+  if (this.discountType !== 'product' && this.discountType !== 'variant' && this.discountPercent > 0) {
     this.discountAmount = Math.round(subtotal * this.discountPercent / 100);
   }
 

@@ -396,6 +396,17 @@ router.put('/reviewSettings', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── PUT kitchenAlertSettings ──────────────────────────────────────────────────
+router.put('/kitchenAlertSettings', auth, adminOnly, async (req, res) => {
+  try {
+    const { value } = req.body;
+    await upsert('kitchenAlertSettings', value, 'Configuración alerta de cocina');
+    res.json({ key: 'kitchenAlertSettings', value });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 module.exports = router;
 module.exports.recalcAllProducts = recalcAllProducts;
 

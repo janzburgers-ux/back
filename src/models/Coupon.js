@@ -6,8 +6,14 @@ const couponSchema = new mongoose.Schema({
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
   ownerName: { type: String },
 
-  // 'referral' | 'admin' | 'loyalty' | 'product'
-  type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product', 'reactivation', 'birthday'], default: 'referral' },
+  // 'referral' | 'admin' | 'loyalty' | 'product' | 'prode'
+  type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product', 'reactivation', 'birthday', 'apology', 'prode'], default: 'referral' },
+  // Restringe el cupón a una variante específica (ej: "doble"), sin importar el producto elegido.
+  applicableVariant: { type: String, default: null },
+  // Cantidad máxima de usos globales (distinto de singleUse: singleUse = 1 uso; maxUses = N usos).
+  maxUses: { type: Number, default: null },
+  // Restringe el uso del cupón a que el WhatsApp del pedido coincida con el del owner (premios Prode).
+  ownerOnly: { type: Boolean, default: false },
 
   // Descuento para quien usa el cupón
   discountForUser: { type: Number, default: 10 },

@@ -59,13 +59,34 @@ router.get('/', auth, async (req, res) => {
       ? Math.round(((todayRevenue - prevWeekSameDayRevenue) / prevWeekSameDayRevenue) * 100)
       : null;
 
-    // Tiempos de entrega del mes
-    const deliveryTimes = monthOrders
-      .filter(o => o.status === 'delivered' && o.receivedAt && o.deliveredAt)
-      .map(o => Math.round((new Date(o.deliveredAt) - new Date(o.receivedAt)) / 60000));
-    const avgDeliveryTime = deliveryTimes.length > 0
-      ? Math.round(deliveryTimes.reduce((s, t) => s + t, 0) / deliveryTimes.length)
-      : null;
+    // Tiempos de entrega del mes — tres tramos (Fase 7)
+    const calcOrderTramos = (o) => {
+      const tAceptacion = (o.confirmedAt && o.createdAt)
+        ? Math.round((new Date(o.confirmedAt) - new Date(o.createdAt)) / 60000) : null;
+      // Cocción: para programados desde cookingStartedAt, para inmediatos desde confirmedAt
+      const cookStart = o.isScheduled && o.cookingStartedAt
+        ? o.cookingStartedAt : o.confirmedAt;
+      const tCoccion = (cookStart && o.readyAt)
+        ? Math.round((new Date(o.readyAt) - new Date(cookStart)) / 60000) : null;
+      const tEntrega = (o.readyAt && o.deliveredAt)
+        ? Math.round((new Date(o.deliveredAt) - new Date(o.readyAt)) / 60000) : null;
+      const tTotal = (o.createdAt && o.deliveredAt)
+        ? Math.round((new Date(o.deliveredAt) - new Date(o.createdAt)) / 60000) : null;
+      return { tAceptacion, tCoccion, tEntrega, tTotal };
+    };
+    const deliveryOrders = monthOrders.filter(o => o.status === 'delivered' && o.createdAt && o.deliveredAt);
+    const tramos = deliveryOrders.map(calcOrderTramos);
+    const avg = (arr, key) => {
+      const vals = arr.map(t => t[key]).filter(v => v !== null && v >= 0);
+      return vals.length > 0 ? Math.round(vals.reduce((s, v) => s + v, 0) / vals.length) : null;
+    };
+    const avgDeliveryTime = avg(tramos, 'tTotal');
+    const avgTramos = {
+      aceptacion: avg(tramos, 'tAceptacion'),
+      coccion:    avg(tramos, 'tCoccion'),
+      entrega:    avg(tramos, 'tEntrega'),
+      total:      avgDeliveryTime,
+    };
 
     // Métodos de pago del mes
     const paymentMethods = monthOrders.reduce((acc, o) => {
@@ -96,6 +117,7 @@ router.get('/', auth, async (req, res) => {
         revenueTrend,
         ordersTrend,
         avgDeliveryTime,
+        avgTramos,
         paymentMethods,
         newClients: newClientsMonth
       },
@@ -158,17 +180,40 @@ router.get('/sales', auth, async (req, res) => {
     });
     const top5 = Object.values(productSales).sort((a, b) => b.units - a.units).slice(0, 5);
 
-    // Tiempos de entrega
-    const deliveryTimes = orders
-      .filter(o => o.status === 'delivered' && o.receivedAt && o.deliveredAt)
-      .map(o => ({
-        orderNumber: o.orderNumber,
-        minutes: Math.round((new Date(o.deliveredAt) - new Date(o.receivedAt)) / 60000),
-        day: arDayOfMonth(new Date(o.createdAt))
-      }));
-    const avgDeliveryTime = deliveryTimes.length > 0
-      ? Math.round(deliveryTimes.reduce((s, t) => s + t.minutes, 0) / deliveryTimes.length)
-      : null;
+    // Tiempos de entrega — tres tramos (Fase 7)
+    const calcTramos = (o) => {
+      const tAceptacion = (o.confirmedAt && o.createdAt)
+        ? Math.round((new Date(o.confirmedAt) - new Date(o.createdAt)) / 60000) : null;
+      const cookStart = o.isScheduled && o.cookingStartedAt ? o.cookingStartedAt : o.confirmedAt;
+      const tCoccion = (cookStart && o.readyAt)
+        ? Math.round((new Date(o.readyAt) - new Date(cookStart)) / 60000) : null;
+      const tEntrega = (o.readyAt && o.deliveredAt)
+        ? Math.round((new Date(o.deliveredAt) - new Date(o.readyAt)) / 60000) : null;
+      const tTotal = (o.createdAt && o.deliveredAt)
+        ? Math.round((new Date(o.deliveredAt) - new Date(o.createdAt)) / 60000) : null;
+      return { tAceptacion, tCoccion, tEntrega, tTotal };
+    };
+    const deliveryOrders2 = orders.filter(o => o.status === 'delivered' && o.createdAt && o.deliveredAt);
+    const deliveryTimes = deliveryOrders2.map(o => ({
+      orderNumber: o.orderNumber,
+      isScheduled: !!o.isScheduled,
+      tAceptacion: calcTramos(o).tAceptacion,
+      tCoccion:    calcTramos(o).tCoccion,
+      tEntrega:    calcTramos(o).tEntrega,
+      minutes:     calcTramos(o).tTotal,
+      day:         arDayOfMonth(new Date(o.createdAt))
+    }));
+    const avgArr = (key) => {
+      const vals = deliveryTimes.map(t => t[key]).filter(v => v !== null && v >= 0);
+      return vals.length > 0 ? Math.round(vals.reduce((s,v) => s+v, 0) / vals.length) : null;
+    };
+    const avgDeliveryTime = avgArr('minutes');
+    const avgTramos = {
+      aceptacion: avgArr('tAceptacion'),
+      coccion:    avgArr('tCoccion'),
+      entrega:    avgArr('tEntrega'),
+      total:      avgDeliveryTime,
+    };
 
     // Ranking clientes
     const clientMap = {};
@@ -247,6 +292,7 @@ router.get('/sales', auth, async (req, res) => {
       paymentMethods: Object.values(paymentData),
       top5,
       avgDeliveryTime,
+      avgTramos,
       deliveryTimes,
       topClients,
       profitDistribution,

@@ -8,7 +8,8 @@ const { sendOrderReceived, sendMessage } = require('../services/whatsapp');
 const Review = require('../models/Review');
 const Coupon = require('../models/Coupon');
 const PinVerification = require('../models/PinVerification');
-const { calcPackagingCost, deductStockForOrder, autoUpdateProductAvailability } = require('../services/stock.service');
+const { calcPackagingCost, reserveStockForOrder, deductStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability } = require('../services/stock.service');
+const Promo    = require('../models/Promo');
 const { estimateWaitTime } = require('../services/kitchen-capacity');
 
 // ── Helpers de timezone Argentina ─────────────────────────────────────────────
@@ -173,7 +174,8 @@ router.get('/menu', async (req, res) => {
   try {
     const open = await isOpen();
     const products = await Product.find({ active: true, visible: { $ne: false } }).sort('name variant');
-    const additionals = await Additional.find({ active: true }).sort('name');
+    const additionals = await Additional.find({ active: true }).sort('name')
+      .select('name description price emoji category appliesTo available ingredient consumesQuantity consumesUnit');
 
     const zonesCfg = await Config.findOne({ key: 'zones' });
     const zones = zonesCfg?.value || [{ id: 'default', name: 'Barrio La Rotonda', cost: 0, freeFrom: 0 }];
@@ -191,19 +193,64 @@ router.get('/menu', async (req, res) => {
     const businessCfg = await Config.findOne({ key: 'business' });
     const businessWhatsapp = businessCfg?.value?.whatsappNumber || '';
 
-    // Agrupar productos por nombre
-    const menu = products.reduce((acc, p) => {
-      if (!acc[p.name]) acc[p.name] = [];
-      acc[p.name].push({
+    // Agregar también el modelo Stock para los indicadores
+    const Stock = require('../models/Stock');
+
+    // ── Calcular stockWarning por producto ──────────────────────────────────
+    // Para cada producto, verificar si algún ingrediente de su receta está en 'low' o 'out'
+    const allStocks = await Stock.find();
+    const stockStatusMap = {}; // ingredientId -> status
+    allStocks.forEach(s => { stockStatusMap[s.ingredient.toString()] = s.status; });
+
+    // Agrupar productos por nombre (con stockWarning calculado)
+    const { Recipe } = require('../models/Product');
+    const menu = {};
+    for (const p of products) {
+      if (!menu[p.name]) menu[p.name] = [];
+      let stockWarning = false;
+      if (p.recipe) {
+        const recipe = await Recipe.findById(p.recipe).select('ingredients').populate('ingredients.ingredient', '_id');
+        if (recipe) {
+          for (const ri of recipe.ingredients) {
+            const ingId = ri.ingredient?._id?.toString();
+            if (ingId && (stockStatusMap[ingId] === 'low' || stockStatusMap[ingId] === 'out')) {
+              stockWarning = true;
+              break;
+            }
+          }
+        }
+      }
+      menu[p.name].push({
         _id: p._id, name: p.name, variant: p.variant,
         salePrice: p.salePrice, available: p.available,
         image: p.image, description: p.description,
         productType: p.productType || 'burger',
         isDailyBurger:   !!p.isDailyBurger,
-        isMonthlyBurger: !!p.isMonthlyBurger
+        isMonthlyBurger: !!p.isMonthlyBurger,
+        stockWarning
       });
-      return acc;
-    }, {});
+    }
+
+    const anyLowStock = Object.values(stockStatusMap).some(s => s === 'low' || s === 'out');
+
+    // ── Promos activas y disponibles ──────────────────────────────────────────
+    const promosDocs = await Promo.find({ active: true }).populate('components.product', 'name variant salePrice image available active');
+    const promos = promosDocs
+      .filter(p => p.available)
+      .map(p => ({
+        _id:         p._id,
+        name:        p.name,
+        description: p.description,
+        salePrice:   p.salePrice,
+        image:       p.image,
+        available:   p.available,
+        components:  p.components.map(c => ({
+          product:  c.product?._id,
+          name:     c.product?.name,
+          variant:  c.product?.variant,
+          quantity: c.quantity,
+        })),
+      }));
 
     // ── Hamburguesa del día y del mes (desde campos del producto) ──────────
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
@@ -249,7 +296,7 @@ router.get('/menu', async (req, res) => {
     // Excepción del día (para mensajes personalizados en el banner)
     const todayOverride = await getTodayOverride();
 
-    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger, todayOverride });
+    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger, todayOverride, anyLowStock, promos });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -294,7 +341,92 @@ router.post('/order', async (req, res) => {
       }
     }
 
-    const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone, scheduledFor, isScheduled, idempotencyKey: iKey } = req.body;
+    const { client: clientData, items: rawItems, paymentMethod, notes, deliveryType, couponCode, zone, scheduledFor, isScheduled, idempotencyKey: iKey, acceptPartial } = req.body;
+
+    // ── Determinar qué items procesar ──────────────────────────────────────────
+    // Si viene acceptPartial=true, el frontend ya filtró los items confirmados (adjustedItems)
+    // y los mandó como `items`. Saltear la reserva previa y crear el pedido directo.
+    const items = rawItems;
+
+    // ── Expandir ítems de promo en productos individuales (para stock) ────────
+    // Las promos se envían como { promo: id, quantity: N }. Para reservar stock
+    // y crear el pedido, se expanden en sus componentes como si fueran pedidos normales.
+    const expandedItems = [];
+    for (const item of items) {
+      if (item.promo) {
+        const promo = await Promo.findById(item.promo).populate('components.product');
+        if (!promo || !promo.active || !promo.available) {
+          return res.status(400).json({ message: `La promo "${promo?.name || item.promo}" ya no está disponible.` });
+        }
+        for (const c of promo.components) {
+          expandedItems.push({
+            product:     c.product._id,
+            productName: c.product.name,
+            variant:     c.product.variant,
+            quantity:    c.quantity * item.quantity,
+            unitPrice:   0, // el precio de la promo ya está en el total
+            additionals: [],
+            _fromPromo:  promo._id,
+            _promoName:  promo.name,
+            _promoPrice: promo.salePrice * item.quantity,
+            _promoQty:   item.quantity,
+          });
+        }
+      } else {
+        expandedItems.push(item);
+      }
+    }
+
+    // ── Reserva atómica de stock (Fase 1 — solo si no es confirmación parcial) ──
+    if (!acceptPartial) {
+      const itemsForReserve = [];
+      for (const item of expandedItems) {
+        const product = await Product.findById(item.product);
+        if (!product || !product.active || !product.available) {
+          const resolvedAdds = [];
+          for (const a of (item.additionals || [])) {
+            const add = await Additional.findById(a.additional);
+            if (add) resolvedAdds.push({ additional: add._id, name: add.name, unitPrice: add.price, quantity: a.quantity || 1 });
+          }
+          const unitPrice = (product?.isDailyBurger && product?.dailyDiscountPrice > 0)
+            ? product.dailyDiscountPrice : (product?.salePrice || 0);
+          itemsForReserve.push({ product: item.product, productName: product?.name || 'Producto', variant: product?.variant || '', quantity: item.quantity, unitPrice, additionals: resolvedAdds });
+        } else {
+          const resolvedAdds = [];
+          for (const a of (item.additionals || [])) {
+            const add = await Additional.findById(a.additional);
+            if (add) resolvedAdds.push({ additional: add._id, name: add.name, unitPrice: add.price, quantity: a.quantity || 1 });
+          }
+          const unitPrice = (product.isDailyBurger && product.dailyDiscountPrice > 0)
+            ? product.dailyDiscountPrice : product.salePrice;
+          itemsForReserve.push({ product: item.product, productName: product.name, variant: product.variant, quantity: item.quantity, unitPrice, additionals: resolvedAdds });
+        }
+      }
+
+      const reservation = await reserveStockForOrder(itemsForReserve);
+
+      if (!reservation.ok) {
+        // Si todos los items fallaron, no hay nada que ofrecer parcialmente
+        if (reservation.adjustedItems.length === 0) {
+          return res.status(409).json({
+            stockIssue: true,
+            unavailableItems: reservation.unavailableItems,
+            adjustedItems: [],
+            adjustedTotal: 0,
+            message: 'No tenemos stock disponible para ninguno de los productos de tu pedido.'
+          });
+        }
+        // Algunos items fallaron → devolver para que el cliente confirme el parcial
+        return res.status(409).json({
+          stockIssue: true,
+          unavailableItems: reservation.unavailableItems,
+          adjustedItems: reservation.adjustedItems,
+          adjustedTotal: reservation.adjustedTotal,
+          message: 'Algunos productos no tienen stock disponible. ¿Confirmás el pedido con lo que hay?'
+        });
+      }
+      // Stock reservado OK — el pedido se crea a continuación y el stock ya está descontado
+    }
 
     // ── Validar cupón ──────────────────────────────────────────────────────────
     let couponDoc = null;
@@ -366,6 +498,33 @@ router.post('/order', async (req, res) => {
           if (couponDoc.applicableProduct) {
             discountType = 'product';
             applicableProductId = couponDoc.applicableProduct.toString();
+          }
+          // Cupón restringido por variante (premios Prode → solo "doble")
+          if (couponDoc.applicableVariant) {
+            discountType = 'variant';
+          }
+          // Cupón de premio Prode: solo lo puede usar el ganador (mismo WhatsApp)
+          if (couponDoc.ownerOnly) {
+            const ownerDoc = await Client.findById(couponDoc.owner).select('whatsapp');
+            const ownerPhone = (ownerDoc?.whatsapp || '').replace(/\D/g, '');
+            const userPhone  = (clientData.whatsapp || '').replace(/\D/g, '');
+            if (!ownerPhone || ownerPhone !== userPhone) {
+              couponDoc = null;
+              discountPercent = 0;
+              discountType = 'order';
+            }
+          }
+          // Cupón con tope de usos (ej: premio 2do puesto Prode = 2 usos)
+          if (couponDoc && couponDoc.maxUses) {
+            const usesCount = await Order.countDocuments({
+              coupon: couponDoc._id,
+              status: { $ne: 'cancelled' }
+            });
+            if (usesCount >= couponDoc.maxUses) {
+              couponDoc = null;
+              discountPercent = 0;
+              discountType = 'order';
+            }
           }
         }
       }
@@ -461,6 +620,15 @@ router.post('/order', async (req, res) => {
         return sum + (item.unitPrice * item.quantity) + addsCost;
       }, 0);
       discountAmount = Math.round(applicableSubtotal * discountPercent / 100);
+    } else if (discountType === 'variant' && couponDoc?.applicableVariant && discountPercent > 0) {
+      // Cupón de premio Prode: aplica a UNA sola unidad de la variante configurada (ej: "doble")
+      const variantLower = couponDoc.applicableVariant.toLowerCase();
+      const matching = orderItems.filter(i => (i.variant || '').toLowerCase() === variantLower);
+      if (matching.length > 0) {
+        // Tomar el de menor precio (protege margen)
+        const cheapest = matching.reduce((min, i) => i.unitPrice < min.unitPrice ? i : min, matching[0]);
+        discountAmount = Math.round(cheapest.unitPrice * discountPercent / 100);
+      }
     } else if (discountPercent > 0) {
       discountAmount = Math.round(subtotalBruto * discountPercent / 100);
     }
@@ -538,10 +706,16 @@ router.post('/order', async (req, res) => {
     await order.save();
 
     // Descontar stock
+    // Si no es acceptPartial, la reserva atómica ya lo descontó → solo marcar stockDeducted
+    // Si es acceptPartial, los items vienen confirmados → descontar normalmente
     try {
-      await deductStockForOrder(order.items);
+      if (acceptPartial) {
+        await deductStockForOrder(order.items);
+      }
       await Order.findByIdAndUpdate(order._id, { stockDeducted: true });
-      autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+      await autoUpdateProductAvailability();
+      await autoUpdateAdditionalAvailability();
+      await autoUpdatePromoAvailability();
     } catch (e) {
       console.error('Error descontando stock:', e.message);
     }
@@ -708,6 +882,101 @@ router.post('/review/:publicCode', async (req, res) => {
       } : null
     });
   } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT /public/order/:id/cancel — cliente cancela su propio pedido ──────────
+router.put('/order/:id/cancel', async (req, res) => {
+  try {
+    const { publicCode } = req.body;
+    if (!publicCode) return res.status(400).json({ message: 'Código de pedido requerido.' });
+
+    const { Order } = require('../models/Order');
+    const order = await Order.findById(req.params.id).populate('client');
+    if (!order) return res.status(404).json({ message: 'Pedido no encontrado.' });
+
+    // Verificar que el publicCode coincida (el cliente ya lo tiene)
+    if (order.publicCode !== publicCode) {
+      return res.status(403).json({ message: 'Código incorrecto.' });
+    }
+
+    // Solo se puede cancelar si está en 'pending'
+    if (order.status !== 'pending') {
+      return res.status(409).json({
+        message: 'Tu pedido ya está en preparación. Si necesitás cancelarlo, contactanos por WhatsApp.',
+        alreadyConfirmed: true
+      });
+    }
+
+    order.status = 'cancelled';
+
+    // Devolver stock si ya se había descontado
+    if (order.stockDeducted) {
+      try {
+        const { returnStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability } = require('../services/stock.service');
+        await returnStockForOrder(order.items);
+        await Order.findByIdAndUpdate(order._id, { stockDeducted: false });
+        await autoUpdateProductAvailability();
+        await autoUpdateAdditionalAvailability();
+        await autoUpdatePromoAvailability();
+      } catch (e) { console.error('Error devolviendo stock (cancel cliente):', e.message); }
+    }
+
+    // Revertir cupón si había uno
+    if (order.coupon) {
+      try {
+        const Coupon = require('../models/Coupon');
+        const coupon = await Coupon.findById(order.coupon);
+        if (coupon) {
+          const hadUse = coupon.uses.some(u => u.order?.toString() === order._id.toString());
+          if (hadUse) {
+            await Coupon.findByIdAndUpdate(coupon._id, {
+              $pull: { uses: { order: order._id } },
+              $inc: { totalUses: -1 }
+            });
+            if ((coupon.singleUse || coupon.type === 'loyalty') && !coupon.active) {
+              await Coupon.findByIdAndUpdate(coupon._id, { active: true });
+            }
+          }
+        }
+      } catch (e) { console.error('Error revirtiendo cupón (cancel cliente):', e.message); }
+    }
+
+    await order.save();
+
+    // Registrar en RejectedOrder con motivo 'cliente_cancelo'
+    try {
+      const RejectedOrder = require('../models/RejectedOrder');
+      await new RejectedOrder({
+        orderNumber: order.orderNumber,
+        publicCode:  order.publicCode,
+        client: { name: order.client?.name, whatsapp: order.client?.whatsapp, phone: order.client?.phone },
+        items: order.items.map(i => ({ productName: i.productName, variant: i.variant, quantity: i.quantity })),
+        total:  order.total,
+        reason: 'cliente_cancelo',
+        notes:  'Cancelado por el cliente desde el formulario público.',
+      }).save();
+    } catch (e) { console.error('Error guardando rechazo (cancel cliente):', e.message); }
+
+    // WhatsApp de confirmación de cancelación al cliente (sin cupón — no es error nuestro)
+    if (order.client?.whatsapp) {
+      const { sendOrderCancelled } = require('../services/whatsapp');
+      sendOrderCancelled(
+        order.client.whatsapp,
+        order.client.name || 'Cliente',
+        order.publicCode,
+        order.orderNumber
+      ).catch(err => console.error('Error WA cancel cliente:', err.message));
+    }
+
+    // Notificar a la cocina via socket
+    const io = req.app.get('io');
+    if (io) io.to(`order_${order.orderNumber}`).emit('order_status', { status: 'cancelled', order });
+
+    return res.json({ ok: true, cancelled: true });
+  } catch (err) {
+    console.error('Error cancelando pedido (cliente):', err.message);
+    res.status(500).json({ message: 'Error al cancelar el pedido.' });
+  }
 });
 
 module.exports = router;

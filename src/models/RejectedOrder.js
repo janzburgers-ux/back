@@ -14,7 +14,7 @@ const rejectedOrderSchema = new mongoose.Schema({
     quantity:    { type: Number }
   }],
   total:       { type: Number, default: 0 },
-  reason:      { type: String, enum: ['sin_stock', 'cocina_cerrada', 'otro'], default: 'sin_stock' },
+  reason:      { type: String, enum: ['sin_stock', 'cocina_cerrada', 'otro', 'cliente_cancelo'], default: 'sin_stock' },
   notes:       { type: String, default: '' },
   missingStock: [{ ingredient: { type: String }, needed: { type: Number }, available: { type: Number } }],
   rejectedAt:  { type: Date, default: Date.now }

@@ -11,9 +11,17 @@ const ProdeMatchSchema = new mongoose.Schema({
   stage:          { type: String, default: 'Fase de Grupos' },
   group:          { type: String, default: '' },
   status:         { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
-  homeScore:      { type: Number, default: null },
-  awayScore:      { type: Number, default: null },
-  winner:         { type: String, enum: ['home', 'away', 'draw', null], default: null },
+  homeScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
+  awayScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
+  winner:         { type: String, enum: ['home', 'away', 'draw', null], default: null }, // basado en 90'
+  // Campos adicionales para eliminación directa — solo informativo, no afectan puntuación
+  extraTimeHome:  { type: Number, default: null },  // goles en alargue (home)
+  extraTimeAway:  { type: Number, default: null },  // goles en alargue (away)
+  penaltiesHome:  { type: Number, default: null },  // penales (home)
+  penaltiesAway:  { type: Number, default: null },  // penales (away)
+  wentToET:       { type: Boolean, default: false }, // true si hubo alargue
+  wentToPens:     { type: Boolean, default: false }, // true si hubo penales
+  qualifiedTeam:  { type: String, default: null },   // quién clasificó (puede diferir del winner de 90')
   // true = ambos equipos definidos; false = alguno es TBD (no se permiten pronósticos)
   teamsConfirmed: { type: Boolean, default: true },
 }, { timestamps: true });

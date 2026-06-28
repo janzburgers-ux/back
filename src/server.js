@@ -98,6 +98,7 @@ app.use('/api/clients',         require('./routes/clients'));
 app.use('/api/dashboard',       require('./routes/dashboard'));
 app.use('/api/shopping',        require('./routes/shopping'));
 app.use('/api/additionals',     require('./routes/additionals'));
+app.use('/api/promos',          require('./routes/promos'));
 app.use('/api/coupons',         require('./routes/coupons'));
 app.use('/api/config',          require('./routes/config'));
 app.use('/api/upload',          require('./routes/upload'));
@@ -129,6 +130,8 @@ const { startChurnJob }                = require('./jobs/churn-alert');
 const { startBirthdayJob }             = require('./jobs/birthday-coupons');
 const { startProdeSync }               = require('./jobs/prode-sync');
 const { startProdeNotificationsJob }   = require('./jobs/prode-notifications');
+const { startKitchenAlertJob }         = require('./jobs/kitchen-alert');
+const { startProdePrizesJob }          = require('./jobs/prode-prizes');
 mongoose.connection.once('open', async () => {
   // ── Auto-fix índice corrupto en prodepoints (una sola vez) ──────────────────
   try {
@@ -144,6 +147,8 @@ mongoose.connection.once('open', async () => {
   }
 
   startChurnJob().catch(err => console.error('❌ Error iniciando churn job:', err.message));
+  startKitchenAlertJob();
+  startProdePrizesJob();
   startBirthdayJob();
   startProdeSync();
   startProdeNotificationsJob();

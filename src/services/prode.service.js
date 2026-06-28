@@ -150,38 +150,78 @@ async function syncFixture() {
         /^(w|l)\s?(of|del?)\s/i.test(name);
       const teamsConfirmed = !isTBD(homeTeam) && !isTBD(awayTeam);
 
+      // Declarado ANTES de los bloques if/else if que lo usan (evita
+      // ReferenceError por TDZ: antes estaba más abajo y se referenciaba
+      // dentro del bloque 'finished' antes de inicializarse).
+      const $setFields = {
+        homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group,
+        teamsConfirmed,
+      };
+
       let status    = 'scheduled';
       let homeScore = null;
       let awayScore = null;
       let winner    = null;
 
       if (FINISHED_STATUSES.includes(m.status)) {
-        status    = 'finished';
-        const ft = m.score?.fullTime;
+        status = 'finished';
         const rt = m.score?.regularTime;
-        homeScore = ft?.home ?? rt?.home ?? null;
-        awayScore = ft?.away ?? rt?.away ?? null;
-        winner    = mapWinner(m.score?.winner);
+        const ft = m.score?.fullTime;
+        const et = m.score?.extraTime;
+        const pk = m.score?.penalties;
+
+        // ── Resultado de los 90' — base para evaluar pronósticos ──────────────
+        // Se prefiere regularTime. fullTime se usa solo si regularTime no está disponible
+        // (partidos de fase de grupos donde no hay distinción ET/regulares).
+        homeScore = rt?.home ?? ft?.home ?? null;
+        awayScore = rt?.away ?? ft?.away ?? null;
+
+        // ── winner derivado de los 90' — NO del clasificado ──────────────────
+        // m.score.winner refleja quién clasificó (puede ser el perdedor en 90' que
+        // ganó en ET o penales). Para los pronósticos siempre usamos los 90'.
+        if (homeScore !== null && awayScore !== null) {
+          winner = homeScore > awayScore ? 'home'
+                 : awayScore > homeScore ? 'away'
+                 : 'draw';
+        }
+
+        // ── Datos de ET/penales — solo informativos, no afectan puntuación ───
+        $setFields.wentToET      = !!(et?.home !== null && et?.home !== undefined);
+        $setFields.wentToPens    = !!(pk?.home !== null && pk?.home !== undefined);
+        $setFields.extraTimeHome = et?.home ?? null;
+        $setFields.extraTimeAway = et?.away ?? null;
+        $setFields.penaltiesHome = pk?.home ?? null;
+        $setFields.penaltiesAway = pk?.away ?? null;
+        $setFields.qualifiedTeam = mapWinner(m.score?.winner) !== 'draw'
+          ? (mapWinner(m.score?.winner) === 'home' ? m.homeTeam : m.awayTeam)
+          : null;
       } else if (LIVE_STATUSES.includes(m.status)) {
         status = 'live';
         const ft = m.score?.fullTime;
-        homeScore = ft?.home ?? null;
-        awayScore = ft?.away ?? null;
+        const rt = m.score?.regularTime;
+        // En vivo: mostrar marcador actual (puede ser ET, pero se muestra como va)
+        homeScore = rt?.home ?? ft?.home ?? null;
+        awayScore = rt?.away ?? ft?.away ?? null;
       }
 
-      const $setFields = {
-        homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, status,
-        teamsConfirmed,
-      };
+      $setFields.status = status;
 
       if (status === 'finished' || status === 'live') {
         if (homeScore !== null) $setFields.homeScore = homeScore;
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
+        // Los campos ET/pen ya se asignaron arriba en el bloque finished
       } else {
-        $setFields.homeScore = null;
-        $setFields.awayScore = null;
-        $setFields.winner    = null;
+        $setFields.homeScore     = null;
+        $setFields.awayScore     = null;
+        $setFields.winner        = null;
+        $setFields.extraTimeHome = null;
+        $setFields.extraTimeAway = null;
+        $setFields.penaltiesHome = null;
+        $setFields.penaltiesAway = null;
+        $setFields.wentToET      = false;
+        $setFields.wentToPens    = false;
+        $setFields.qualifiedTeam = null;
       }
 
       return {

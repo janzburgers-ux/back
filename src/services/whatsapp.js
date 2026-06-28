@@ -124,7 +124,21 @@ async function sendOrderReady(phoneNumber, orderNumber, clientName, deliveryType
   const defaultTplDelivery  = `¡Hola {nombre}! 🛵\n\nTu pedido *{codigo}* está *en camino*. ✅\n\nEn instantes llega a tu puerta.\n{metodoPago}\n\n_Janz Burgers_ 🍔`;
   const defaultTplTakeaway  = `¡Hola {nombre}! 🥡\n\nTu pedido *{codigo}* está *listo para retirar*. ✅\n\nPodés pasar a buscarlo. ¡Te esperamos!\n{metodoPago}\n\n_Janz Burgers_ 🍔`;
 
-  const tpl = await getTemplate('orderReady', deliveryType === 'takeaway' ? defaultTplTakeaway : defaultTplDelivery);
+  // ── Migración suave (Fase 4) ─────────────────────────────────────────────
+  // Si existe una personalización guardada bajo la clave vieja 'orderReady',
+  // la usamos como fallback de 'orderReady_delivery' (preserva lo que el admin escribió).
+  // 'orderReady_takeaway' usa siempre su propio default hasta que se edite.
+  let tpl;
+  if (deliveryType === 'takeaway') {
+    tpl = await getTemplate('orderReady_takeaway', defaultTplTakeaway);
+  } else {
+    // Para delivery: intenta la clave nueva, si no existe cae en la vieja, y si no existe la vieja usa el default
+    const cfg = await Config.findOne({ key: 'whatsappTemplates' });
+    const savedNew  = cfg?.value?.['orderReady_delivery'];
+    const savedOld  = cfg?.value?.['orderReady'];
+    tpl = savedNew || savedOld || defaultTplDelivery;
+  }
+
   const message = fillTemplate(tpl, {
     nombre: clientName, codigo: displayCode, total: fmt(total),
     metodoPago: paymentReminder, alias: transferAlias || '', tipoEntrega: deliveryType
@@ -141,7 +155,21 @@ async function sendOrderCancelled(phoneNumber, clientName, publicCode, orderNumb
   return sendMessage(phoneNumber, message);
 }
 
-module.exports = { initWhatsApp, sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
+// ── Cancelado con cupón de disculpa (sin_stock) ───────────────────────────────
+async function sendOrderCancelledWithCoupon(phoneNumber, clientName, publicCode, couponCode) {
+  const defaultTpl =
+    `¡Hola {nombre}! 😔\n\n` +
+    `Lamentamos informarte que tu pedido *{codigo}* fue cancelado porque nos quedamos sin stock.\n\n` +
+    `Para disculparnos, te regalamos un *10% de descuento* en tu próximo pedido:\n\n` +
+    `🎟️ Código: *{cupon}*\n\n` +
+    `Válido por 15 días, un solo uso. ¡Te esperamos pronto!\n\n` +
+    `_Janz Burgers_ 🍔`;
+  const tpl = await getTemplate('orderCancelledStock', defaultTpl);
+  const message = fillTemplate(tpl, { nombre: clientName, codigo: publicCode, cupon: couponCode });
+  return sendMessage(phoneNumber, message);
+}
+
+module.exports = { initWhatsApp, sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderCancelledWithCoupon, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
 
 
 // ── Mensaje 5: Solicitud de reseña (post-entrega) ─────────────────────────────

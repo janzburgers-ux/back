@@ -172,10 +172,29 @@ async function syncFixture() {
         const pk = m.score?.penalties;
 
         // ── Resultado de los 90' — base para evaluar pronósticos ──────────────
-        // Se prefiere regularTime. fullTime se usa solo si regularTime no está disponible
-        // (partidos de fase de grupos donde no hay distinción ET/regulares).
-        homeScore = rt?.home ?? ft?.home ?? null;
-        awayScore = rt?.away ?? ft?.away ?? null;
+        // La API football-data.org v4 puede devolver el marcador de 90' en:
+        //   - regularTime: disponible en fases de eliminación (distingue ET)
+        //   - fullTime: disponible en todos los partidos (acumulado hasta el final del tiempo reglamentario)
+        // Si el partido NO fue a prórroga, fullTime == resultado de 90'.
+        // Si el partido FUE a prórroga, fullTime puede incluir el ET acumulado,
+        //   pero regularTime tiene los 90' exactos — lo usamos como fuente primaria.
+        // Orden de prioridad: regularTime > fullTime > null
+        const rtHome = (rt?.home !== null && rt?.home !== undefined) ? rt.home : null;
+        const rtAway = (rt?.away !== null && rt?.away !== undefined) ? rt.away : null;
+        const ftHome = (ft?.home !== null && ft?.home !== undefined) ? ft.home : null;
+        const ftAway = (ft?.away !== null && ft?.away !== undefined) ? ft.away : null;
+
+        // Si el partido tuvo prórroga, usar regularTime (los 90' exactos).
+        // Si NO tuvo prórroga, fullTime == 90', así que es equivalente.
+        // Si regularTime no está disponible (grupos), fullTime es el resultado correcto.
+        const wentToET = !!(et?.home !== null && et?.home !== undefined);
+        homeScore = rtHome ?? ftHome ?? null;
+        awayScore = rtAway ?? ftAway ?? null;
+
+        // Log para diagnosticar partidos con score null
+        if (homeScore === null || awayScore === null) {
+          console.warn(`⚠️ [ProdeSync] Partido ${m.id} (${m.homeTeam?.name} vs ${m.awayTeam?.name}) status=${m.status} pero score null. score:`, JSON.stringify(m.score));
+        }
 
         // ── winner derivado de los 90' — NO del clasificado ──────────────────
         // m.score.winner refleja quién clasificó (puede ser el perdedor en 90' que
@@ -187,7 +206,7 @@ async function syncFixture() {
         }
 
         // ── Datos de ET/penales — solo informativos, no afectan puntuación ───
-        $setFields.wentToET      = !!(et?.home !== null && et?.home !== undefined);
+        $setFields.wentToET      = wentToET;
         $setFields.wentToPens    = !!(pk?.home !== null && pk?.home !== undefined);
         $setFields.extraTimeHome = et?.home ?? null;
         $setFields.extraTimeAway = et?.away ?? null;

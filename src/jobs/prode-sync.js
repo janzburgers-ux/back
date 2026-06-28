@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const { syncFixture }   = require('../services/prode.service');
-const { ProdeMatch }    = require('../models/Prode');
+const { ProdeMatch, Pronostico } = require('../models/Prode');
 const { evaluateMatch } = require('../services/prode.service');
 
 // ── Evaluar partidos que el sync marcó como finished pero aún no evaluados ────

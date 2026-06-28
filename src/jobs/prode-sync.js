@@ -5,10 +5,14 @@ const { evaluateMatch } = require('../services/prode.service');
 
 // ── Evaluar partidos que el sync marcó como finished pero aún no evaluados ────
 async function evaluatePendingMatches() {
-  // Incluimos partidos finished con winner válido que todavía tienen
-  // pronósticos sin evaluar. Si en un sync anterior el winner era null,
-  // ahora que el sync lo resolvió, este bloque lo procesa.
+  // Primero buscamos qué partidos tienen pronósticos sin evaluar — así evitamos
+  // recorrer TODOS los partidos finished (que crece a ~104 con el torneo avanzado)
+  // en cada corrida del cron, cuando en la inmensa mayoría no hay nada pendiente.
+  const matchIds = await Pronostico.distinct('matchId', { evaluated: false });
+  if (matchIds.length === 0) return;
+
   const pendientes = await ProdeMatch.find({
+    _id: { $in: matchIds },
     status: 'finished',
     winner: { $in: ['home', 'away', 'draw'] },   // solo con dato real
     homeScore: { $ne: null },

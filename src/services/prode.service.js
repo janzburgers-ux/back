@@ -125,6 +125,7 @@ async function syncFixture() {
   try {
     const { data } = await axios.get(`${FOOTBALL_DATA_BASE}/competitions/WC/matches`, {
       headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY },
+      params: { limit: 500 }, // el Mundial 2026 tiene 104 partidos; la API trunca a 100 por defecto
       timeout: 15000,
     });
 

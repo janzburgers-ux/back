@@ -229,6 +229,7 @@ router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
   try {
     const resp = await axios.get(url, {
       headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY },
+      params: { limit: 500 },
       timeout: 12000,
     });
     const matches = resp.data?.matches || [];
@@ -237,6 +238,7 @@ router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
       httpStatus:     resp.status,
       url,
       cantidad:       matches.length,
+      resultSet:      resp.data?.resultSet || null,
       primer_partido: matches[0] || null,
     });
   } catch (err) {

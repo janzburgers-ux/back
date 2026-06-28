@@ -1,1294 +1,1808 @@
-const express = require('express');
-const router = express.Router();
-const { auth, adminOnly } = require('../middleware/auth');
-const { ProdeMatch, Pronostico, ProdePoints, ProdeConfig } = require('../models/Prode');
-const {
-  getProdeConfig,
-  isProdeActive,
-  syncFixture,
-  seedMockFixture,
-  evaluateMatch,
-  getRanking,
-  getTotalPoints,
-  resolveProdeStatus,
-  markProdeRegistered,
-  registerProdeGuest,
-  findClientByPhone,
-  getPremiosAdmin,
-  normalizePhone,
-  phoneKey,
-} = require('../services/prode.service');
-
-// ── POST registro invitado (nombre + WhatsApp, sin pedido previo) ─────────────
-router.post('/registro', async (req, res) => {
-  try {
-    const { nombre, whatsapp } = req.body;
-    if (!nombre?.trim() || !whatsapp) {
-      return res.status(400).json({ message: 'Nombre y WhatsApp son requeridos' });
-    }
-
-    const { client, couponCode } = await registerProdeGuest({ nombre, whatsapp });
-    const key = phoneKey(whatsapp);
-    const { requestOTP } = require('../utils/otp');
-    const result = requestOTP(key, String(client._id));
-
-    if (!result.ok) {
-      const secsLeft = Math.ceil((result.resendAt - Date.now()) / 1000);
-      return res.status(429).json({ message: `Aguardá ${secsLeft} segundos antes de pedir otro código.` });
-    }
-
-    const cfg = await getProdeConfig();
-    const guestPercent = cfg.guestCouponPercent || 20;
-
-    const waNum = client.whatsapp || client.phone || normalizePhone(whatsapp);
-    const { sendMessage } = require('../services/whatsapp');
-    let msg =
-      `🏆 *¡Bienvenido al Prode Janz!*\n\n` +
-      `Tu código de verificación es: *${result.code}*\n\n` +
-      `Válido por 5 minutos.\n\n`;
-    if (couponCode) {
-      msg += `🎟️ Tu cupón de invitado: *${couponCode}* (${guestPercent}% OFF en tu primera compra)\n\n`;
-    }
-    msg += `_Janz Burgers_ 🍔⚽`;
-    await sendMessage(waNum, msg);
-
-    res.json({
-      sent: true,
-      nombre: client.name.split(' ')[0],
-      cuponInvitado: couponCode || null,
-    });
-  } catch (err) {
-    res.status(err.message?.includes('activo') ? 403 : 500).json({ message: err.message });
-  }
-});
-
-// ── POST acceso al prode por número de WhatsApp (legacy, sin OTP) ─────────────
-router.post('/acceso', async (req, res) => {
-  try {
-    let { whatsapp } = req.body;
-    if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
-
-    const client = await findClientByPhone(whatsapp);
-    if (!client) {
-      return res.status(404).json({
-        message: 'No encontramos este número. Registrate como invitado si nunca compraste en Janz.',
-        code: 'CLIENT_NOT_FOUND',
-      });
-    }
-
-    await markProdeRegistered(client._id);
-    const estado = await resolveProdeStatus(client._id);
-
-    res.json({
-      clientId: client._id,
-      nombre: client.name.split(' ')[0],
-      estado,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST solicitar código OTP (paso 1 del login con verificación) ─────────────
-router.post('/acceso/codigo', async (req, res) => {
-  try {
-    let { whatsapp } = req.body;
-    if (!whatsapp) return res.status(400).json({ message: 'Ingresá tu número de WhatsApp' });
-
-    const key = phoneKey(whatsapp);
-    const client = await findClientByPhone(whatsapp);
-
-    if (!client) {
-      return res.status(404).json({
-        message: 'No encontramos este número. Registrate como invitado si nunca compraste en Janz.',
-        code: 'CLIENT_NOT_FOUND',
-      });
-    }
-
-    const { requestOTP } = require('../utils/otp');
-    const result = requestOTP(key, String(client._id));
-
-    if (!result.ok) {
-      const secsLeft = Math.ceil((result.resendAt - Date.now()) / 1000);
-      return res.status(429).json({ message: `Aguardá ${secsLeft} segundos antes de pedir otro código.` });
-    }
-
-    const { sendMessage } = require('../services/whatsapp');
-    const waNum = client.whatsapp || client.phone || '';
-    if (!waNum) return res.status(400).json({ message: 'No tenemos WhatsApp registrado para esta cuenta.' });
-
-    await sendMessage(waNum,
-      `🏆 *Prode Janz — Código de verificación*\n\n` +
-      `Tu código es: *${result.code}*\n\n` +
-      `Válido por 5 minutos. No lo compartas.\n\n` +
-      `_Janz Burgers_ 🍔⚽`
-    );
-
-    res.json({ sent: true, nombre: client.name.split(' ')[0] });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST verificar código OTP (paso 2) ────────────────────────────────────────
-router.post('/acceso/verificar', async (req, res) => {
-  try {
-    const { whatsapp, code } = req.body;
-    if (!whatsapp || !code) return res.status(400).json({ message: 'Faltan datos' });
-
-    const key = whatsapp.replace(/\D/g, '').slice(-8);
-    const { verifyOTP } = require('../utils/otp');
-    const result = verifyOTP(key, code);
-
-    if (!result.ok) {
-      if (result.reason === 'expired')   return res.status(400).json({ message: 'El código expiró. Pedí uno nuevo.' });
-      if (result.reason === 'too_many')  return res.status(400).json({ message: 'Demasiados intentos fallidos. Pedí un código nuevo.' });
-      if (result.reason === 'not_found') return res.status(400).json({ message: 'Código expirado. Pedí uno nuevo.' });
-      const left = result.attemptsLeft;
-      return res.status(400).json({ message: `Código incorrecto.${left > 0 ? ` Te quedan ${left} intento${left !== 1 ? 's' : ''}.` : ''}` });
-    }
-
-    const { Client } = require('../models/Order');
-    const client = await Client.findById(result.clientId);
-    if (!client) return res.status(404).json({ message: 'Cliente no encontrado' });
-
-    await markProdeRegistered(client._id);
-    const estado = await resolveProdeStatus(client._id);
-
-    res.json({
-      clientId: client._id,
-      nombre: client.name.split(' ')[0],
-      estado,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET estado del participante (categoría, progreso, premio) ─────────────────
-router.get('/estado/:clientId', async (req, res) => {
-  try {
-    const estado = await resolveProdeStatus(req.params.clientId);
-    if (!estado) return res.status(404).json({ message: 'Participante no encontrado' });
-    res.json(estado);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET config del prode (público — para mostrar/ocultar banner en /pedido) ───
-router.get('/config', async (req, res) => {
-  try {
-    const cfg = await getProdeConfig();
-    res.json(cfg);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── PUT actualizar config (solo admin) ───────────────────────────────────────
-router.put('/config', auth, adminOnly, async (req, res) => {
-  try {
-    const cfg = await ProdeConfig.findOneAndUpdate(
-      { key: 'prode' },
-      { $set: { value: req.body } },
-      { upsert: true, new: true }
-    );
-    res.json(cfg.value);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET fixture completo (público — lo necesita PublicProde.jsx sin token) ────
-router.get('/fixture', async (req, res) => {
-  try {
-    const { stage, group, status } = req.query;
-    const filter = {};
-    if (stage)  filter.stage  = stage;
-    if (group)  filter.group  = group;
-    if (status) filter.status = status;
-    const matches = await ProdeMatch.find(filter).sort({ matchDate: 1 });
-    res.json(matches);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST sync fixture desde API (solo admin) ─────────────────────────────────
-router.post('/fixture/sync', auth, adminOnly, async (req, res) => {
-  try {
-    const result = await syncFixture();
-    // syncFixture nunca tira, devuelve { synced, error? } — lo exponemos completo
-    if (result.error) {
-      return res.status(502).json({ message: `API error: ${result.error}`, synced: 0 });
-    }
-    res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET debug API — raw response de API-Football v3 (solo admin) ─────────────
-router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
-  const axios = require('axios');
-  const FOOTBALL_DATA_KEY = process.env.FOOTBALL_DATA_KEY;
-  const url = 'https://api.football-data.org/v4/competitions/WC/matches';
-
-  if (!FOOTBALL_DATA_KEY) {
-    return res.json({
-      ok: false,
-      problema: 'FOOTBALL_DATA_KEY no esta definida en las variables de entorno.',
-    });
-  }
-
-  try {
-    const resp = await axios.get(url, {
-      headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY },
-      params: { limit: 500 },
-      timeout: 12000,
-    });
-    const matches = resp.data?.matches || [];
-
-    // Filtros opcionales por query param
-    const { apiId, status: statusFilter, solo_problematicos } = req.query;
-
-    let resultado = matches;
-
-    if (apiId) {
-      resultado = matches.filter(m => String(m.id) === String(apiId));
-    } else if (statusFilter) {
-      resultado = matches.filter(m => m.status === statusFilter);
-    } else if (solo_problematicos === '1') {
-      // Partidos que NO son scheduled ni los statuses conocidos — los "raros"
-      const conocidos = ['SCHEDULED', 'TIMED', 'IN_PLAY', 'PAUSED', 'HALFTIME',
-                         'EXTRA_TIME', 'PENALTY_SHOOTOUT', 'FINISHED',
-                         'FINISHED_AET', 'FINISHED_AP', 'AWARDED',
-                         'POSTPONED', 'SUSPENDED', 'CANCELLED'];
-      resultado = matches.filter(m => !conocidos.includes(m.status));
-    }
-
-    // Siempre incluir los live de nuestra BD para cruzar con la API
-    const enVivoEnBD = await ProdeMatch.find({ status: 'live' }).select('apiId homeTeam awayTeam status homeScore awayScore').lean();
-
-    // Para cada partido en vivo en BD, buscar su dato crudo en la API
-    const cruceEnVivo = enVivoEnBD.map(bdMatch => {
-      const apiMatch = matches.find(m => String(m.id) === String(bdMatch.apiId));
-      return {
-        bd: {
-          _id: bdMatch._id,
-          apiId: bdMatch.apiId,
-          partido: `${bdMatch.homeTeam} vs ${bdMatch.awayTeam}`,
-          status_en_bd: bdMatch.status,
-          score_en_bd: `${bdMatch.homeScore ?? '?'}-${bdMatch.awayScore ?? '?'}`,
-        },
-        api: apiMatch ? {
-          status_en_api: apiMatch.status,
-          score: apiMatch.score,
-          utcDate: apiMatch.utcDate,
-        } : 'NO ENCONTRADO EN API (apiId no matchea)',
-      };
-    });
-
-    return res.json({
-      ok:              true,
-      httpStatus:      resp.status,
-      total_api:       matches.length,
-      resultSet:       resp.data?.resultSet || null,
-      en_vivo_en_bd:   cruceEnVivo,        // ← lo más importante para debuggear
-      filtro_aplicado: resultado.length < matches.length ? resultado : undefined,
-      primer_partido:  matches[0] || null,
-    });
-  } catch (err) {
-    const status = err.response?.status;
-    let problema = err.message;
-    if (status === 403) problema = 'API key invalida o sin permisos para WC.';
-    if (status === 429) problema = 'Rate limit (10 req/min). Esperá un momento.';
-    if (status === 404) problema = 'Competicion WC no encontrada en este plan.';
-    return res.json({
-      ok:          false,
-      problema,
-      httpStatus:  status,
-      apiResponse: err.response?.data,
-      url,
-    });
-  }
-});
-
-// ── POST seed fixture mockeado (solo admin, solo si no hay datos) ─────────────
-router.post('/fixture/seed-mock', auth, adminOnly, async (req, res) => {
-  try {
-    await seedMockFixture();
-    res.json({ message: 'Fixture mockeado insertado' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE partidos mockeados (apiId empieza con "mock-") ────────────────────
-router.delete('/fixture/mock', auth, adminOnly, async (req, res) => {
-  try {
-    const result = await ProdeMatch.deleteMany({ apiId: { $regex: /^mock-/ } });
-    res.json({ deleted: result.deletedCount });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── PUT actualizar resultado de un partido manualmente (solo admin) ───────────
-router.put('/fixture/:id/resultado', auth, adminOnly, async (req, res) => {
-  try {
-    const { homeScore, awayScore } = req.body;
-    const winner = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : 'draw';
-    const match = await ProdeMatch.findByIdAndUpdate(
-      req.params.id,
-      { homeScore, awayScore, winner, status: 'finished' },
-      { new: true }
-    );
-
-    // Si el partido ya había sido evaluado (con resultado anterior o incorrecto),
-    // reseteamos todo para que la re-evaluación sea limpia.
-    const yaEvaluados = await Pronostico.countDocuments({ matchId: match._id, evaluated: true });
-    if (yaEvaluados > 0) {
-      // Eliminar ProdePoints de pronósticos de este partido
-      await ProdePoints.deleteMany({ matchId: match._id, tipo: 'pronostico' });
-      // Resetear flag en los pronósticos
-      await Pronostico.updateMany(
-        { matchId: match._id },
-        { $set: { evaluated: false, pointsEarned: 0 } }
-      );
-    }
-
-    // Evaluar pronósticos con el resultado correcto
-    await evaluateMatch(match._id);
-    res.json(match);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET todas las predicciones de un partido (admin) ─────────────────────────
-router.get('/pronosticos-admin', auth, adminOnly, async (req, res) => {
-  try {
-    const { matchId } = req.query;
-    const { Client } = require('../models/Order');
-
-    const filter = {};
-    if (matchId) filter.matchId = matchId;
-
-    const pronosticos = await Pronostico.find(filter)
-      .populate('matchId')
-      .lean();
-
-    const clientIds = [...new Set(pronosticos.map(p => String(p.clientId)))];
-    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone').lean();
-    const clientMap = {};
-    clients.forEach(c => { clientMap[String(c._id)] = c; });
-
-    const result = pronosticos.map(p => ({
-      ...p,
-      client: clientMap[String(p.clientId)] || null,
-    }));
-
-    res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET pronósticos de un cliente ─────────────────────────────────────────────
-// Ruta pública para el cliente (usa clientId desde query o body)
-router.get('/pronosticos/:clientId', async (req, res) => {
-  try {
-    const pronosticos = await Pronostico.find({ clientId: req.params.clientId })
-      .populate('matchId');
-    res.json(pronosticos);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST guardar/actualizar pronóstico de un cliente ─────────────────────────
-router.post('/pronosticos', async (req, res) => {
-  try {
-    const { clientId, matchId, predictedWinner, predictedHome, predictedAway } = req.body;
-    if (!clientId || !matchId || !predictedWinner) {
-      return res.status(400).json({ message: 'Faltan campos requeridos' });
-    }
-
-    // Verificar que el partido no haya empezado (cutoff)
-    const match = await ProdeMatch.findById(matchId);
-    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
-
-    // ── Equipos no confirmados → no se puede pronosticar ─────────────────
-    if (match.teamsConfirmed === false) {
-      return res.status(400).json({
-        message: 'Los equipos de este partido aún no están confirmados. Podrás pronosticar una vez que se definan los clasificados.',
-        code: 'TEAMS_NOT_CONFIRMED',
-      });
-    }
-
-    if (match.status !== 'scheduled') {
-      return res.status(400).json({ message: 'El partido ya comenzó, no se pueden modificar pronósticos' });
-    }
-
-    const cfg = await getProdeConfig();
-    const cutoffMs = (cfg.cutoffMinutes || 30) * 60 * 1000;
-    if (new Date(match.matchDate) - new Date() < cutoffMs) {
-      return res.status(400).json({ message: `Pronósticos bloqueados ${cfg.cutoffMinutes || 30} minutos antes del partido` });
-    }
-
-    const pronostico = await Pronostico.findOneAndUpdate(
-      { clientId, matchId },
-      { predictedWinner, predictedHome: predictedHome ?? null, predictedAway: predictedAway ?? null, evaluated: false, pointsEarned: 0 },
-      { upsert: true, new: true }
-    );
-
-    await markProdeRegistered(clientId);
-
-    res.json(pronostico);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── PUT confirmar equipos manualmente (admin) — cuando el sync tarda en actualizar ──
-router.put('/fixture/:id/teams', auth, adminOnly, async (req, res) => {
-  try {
-    const { homeTeam, awayTeam, homeLogo, awayLogo } = req.body;
-    if (!homeTeam || !awayTeam) {
-      return res.status(400).json({ message: 'homeTeam y awayTeam son requeridos' });
-    }
-    const match = await ProdeMatch.findByIdAndUpdate(
-      req.params.id,
-      { homeTeam, awayTeam, teamsConfirmed: true,
-        ...(homeLogo !== undefined && { homeLogo }),
-        ...(awayLogo !== undefined && { awayLogo }),
-      },
-      { new: true }
-    );
-    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
-    res.json(match);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-// ── GET premios segmentados (admin) ───────────────────────────────────────────
-router.get('/premios', auth, adminOnly, async (req, res) => {
-  try {
-    const premios = await getPremiosAdmin();
-    res.json(premios);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST finalizar el Prode y premiar al top 3 automáticamente ───────────────
-// Genera y envía los cupones del top 3 (sistema de premios automáticos).
-// Es idempotente: si una posición ya fue premiada en esta temporada, se saltea.
-router.post('/finalizar-premios', auth, adminOnly, async (req, res) => {
-  try {
-    const { awardTop3Prizes } = require('../services/prode-prizes.service');
-    const result = await awardTop3Prizes();
-    res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET auditoría de premios del top 3 ya entregados/programados ─────────────
-router.get('/premios-top3', auth, adminOnly, async (req, res) => {
-  try {
-    const { listPrizes } = require('../services/prode-prizes.service');
-    const prizes = await listPrizes();
-    res.json(prizes);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET ranking general (admin) ───────────────────────────────────────────────
-router.get('/ranking', auth, async (req, res) => {
-  try {
-    const ranking = await getRanking();
-    res.json(ranking);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET ranking público — top 20, sin auth ────────────────────────────────────
-router.get('/ranking/publico', async (req, res) => {
-  try {
-    const ranking = await getRanking();
-    // El orden ya viene aplicado desde getRanking() con las 4 reglas de desempate.
-    // No re-sortear aquí para no pisar esas reglas.
-    const top20 = ranking.slice(0, 20).map((r, i) => ({
-      posicion:          i + 1,
-      _id:               r.clientId,
-      nombre:            r.apodo || r.nombre?.split(' ')[0] || r.nombre,
-      totalPuntos:       r.totalPuntos,
-      categoria:         r.categoriaLabel,
-      elegibleTop3:      r.elegibleTop3,
-      marcadoresExactos: r.marcadoresExactos || 0,
-    }));
-    res.json(top20);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-router.get('/ranking/posicion/:clientId', async (req, res) => {
-  try {
-    const ranking = await getRanking();
-    const idx = ranking.findIndex(r => String(r.clientId) === req.params.clientId);
-    res.json({
-      posicion:    idx >= 0 ? idx + 1 : null,
-      total:       ranking.length,
-      totalPuntos: idx >= 0 ? ranking[idx].totalPuntos : 0,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET historial de puntos de un cliente ─────────────────────────────────────
-router.get('/puntos/:clientId', async (req, res) => {
-  try {
-    const historial = await ProdePoints.find({ clientId: req.params.clientId })
-      .sort({ createdAt: -1 })
-      .limit(50);
-    const total = await getTotalPoints(req.params.clientId);
-    res.json({ historial, total });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST evaluar todos los partidos terminados pendientes (solo admin) ─────────
-router.post('/evaluar', auth, adminOnly, async (req, res) => {
-  try {
-    const matches = await ProdeMatch.find({ status: 'finished' });
-    let evaluated = 0;
-    for (const m of matches) {
-      await evaluateMatch(m._id);
-      evaluated++;
-    }
-    res.json({ evaluated });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST re-evaluar FORZADO — resetea todos los pronósticos de partidos terminados
-//    y recalcula puntos desde cero (útil para corregir errores históricos) ──────
-router.post('/evaluar-forzado', auth, adminOnly, async (req, res) => {
-  try {
-    const matches = await ProdeMatch.find({ status: 'finished' });
-    let reseteados = 0;
-    let evaluados  = 0;
-
-    for (const m of matches) {
-      // 1) Borrar ProdePoints de pronósticos de este partido
-      await ProdePoints.deleteMany({ matchId: m._id, tipo: 'pronostico' });
-      // 2) Resetear flag en los pronósticos
-      await Pronostico.updateMany(
-        { matchId: m._id },
-        { $set: { evaluated: false, pointsEarned: 0 } }
-      );
-      reseteados++;
-      // 3) Re-evaluar con el resultado actual
-      await evaluateMatch(m._id);
-      evaluados++;
-    }
-
-    res.json({ reseteados, evaluados, message: `${evaluados} partidos re-evaluados desde cero` });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST re-evaluar puntos de UN cliente específico desde cero ────────────────
-// Resetea solo los pronósticos de ese cliente y recalcula partido por partido.
-// Los pronósticos de los demás clientes no se tocan.
-router.post('/evaluar-cliente/:clientId', auth, adminOnly, async (req, res) => {
-  try {
-    const { clientId } = req.params;
-
-    // 1) Borrar ProdePoints de tipo pronostico de este cliente solamente
-    await ProdePoints.deleteMany({ clientId, tipo: 'pronostico' });
-
-    // 2) Resetear los pronósticos evaluados de este cliente
-    await Pronostico.updateMany(
-      { clientId },
-      { $set: { evaluated: false, pointsEarned: 0 } }
-    );
-
-    // 3) Re-evaluar partido por partido (solo los terminados).
-    //    evaluateMatch solo procesa pronósticos con evaluated:false,
-    //    por lo que los demás clientes (evaluated:true) no se ven afectados.
-    const matches = await ProdeMatch.find({ status: 'finished' });
-    let evaluados = 0;
-    for (const m of matches) {
-      await evaluateMatch(m._id);
-      evaluados++;
-    }
-
-    res.json({
-      clientId,
-      evaluados,
-      message: `Puntos de ${clientId} recalculados sobre ${evaluados} partidos terminados`,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET diagnóstico profundo del ranking (solo admin) ────────────────────────
-router.get('/ranking/diagnostico', auth, adminOnly, async (req, res) => {
-  try {
-    const { Client } = require('../models/Order');
-
-    // 1. Cuantos ProdePoints hay en total?
-    const totalPP = await ProdePoints.countDocuments();
-
-    // 2. Como son los clientId en ProdePoints? ObjectId o String?
-    const muestras = await ProdePoints.find({}).limit(5).select('clientId tipo puntos').lean();
-    const tiposClientId = muestras.map(p => ({
-      clientId: String(p.clientId),
-      tipo_js: typeof p.clientId,
-      es_objectid: p.clientId?.constructor?.name === 'ObjectId',
-      tipo_prode: p.tipo,
-      puntos: p.puntos,
-    }));
-
-    // 3. El aggregate inicial devuelve algo?
-    const aggResult = await ProdePoints.aggregate([
-      { $match: { tipo: { $in: ['pronostico', 'bonificacion'] }, clientId: { $exists: true, $ne: null } } },
-      { $group: { _id: '$clientId', total: { $sum: '$puntos' } } },
-    ]);
-
-    // 4. Para cada clientId del aggregate, existe en la coleccion clients?
-    const lookupTests = await Promise.all(aggResult.slice(0, 5).map(async r => {
-      const byId = await Client.findById(r._id).select('name').lean();
-      return {
-        clientId: String(r._id),
-        tipo_js: typeof r._id,
-        es_objectid: r._id?.constructor?.name === 'ObjectId',
-        totalPuntos: r.total,
-        encontrado: !!byId,
-        nombre: byId?.name || null,
-      };
-    }));
-
-    // 5. Cuantos Pronosticos y con que clientIds?
-    const totalPronos = await Pronostico.countDocuments();
-    const pronoClientIds = await Pronostico.distinct('clientId');
-
-    // 6. El aggregate completo con lookup devuelve algo?
-    const aggConLookup = await ProdePoints.aggregate([
-      { $match: { tipo: { $in: ['pronostico', 'bonificacion'] }, clientId: { $exists: true, $ne: null } } },
-      { $group: { _id: '$clientId', total: { $sum: '$puntos' } } },
-      { $lookup: { from: 'clients', localField: '_id', foreignField: '_id', as: 'client' } },
-      { $addFields: { clientFound: { $gt: [{ $size: '$client' }, 0] } } },
-    ]);
-    const conCliente = aggConLookup.filter(r => r.clientFound).length;
-    const sinCliente = aggConLookup.filter(r => !r.clientFound).length;
-
-    res.json({
-      resumen: {
-        totalProdePoints: totalPP,
-        totalPronosticos: totalPronos,
-        clientIdsConPronosticos: pronoClientIds.length,
-        aggSinLookup: aggResult.length,
-        aggConLookup_conCliente: conCliente,
-        aggConLookup_sinCliente: sinCliente,
-        diagnostico: aggResult.length === 0
-          ? 'SIN_DATOS: No hay ProdePoints en la BD. El ranking esta vacio porque nadie tiene puntos aun.'
-          : conCliente === 0
-            ? 'PROBLEMA_LOOKUP: El lookup no encuentra ningun cliente. clientId en ProdePoints no matchea con _id en clients.'
-            : conCliente + ' clientes encontrados, ' + sinCliente + ' sin match en clients',
-      },
-      muestras_ProdePoints: tiposClientId,
-      lookup_tests: lookupTests,
-    });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// ── GET estadísticas del prode para el admin ──────────────────────────────────
-router.get('/stats', auth, adminOnly, async (req, res) => {
-  try {
-    const [totalParticipantes, totalPartidos, totalPronosticos, totalPuntos] = await Promise.all([
-      ProdePoints.distinct('clientId').then(r => r.length),
-      ProdeMatch.countDocuments(),
-      Pronostico.countDocuments(),
-      ProdePoints.aggregate([{ $group: { _id: null, total: { $sum: '$puntos' } } }]).then(r => r[0]?.total || 0),
-    ]);
-    const lider = await getRanking().then(r => r[0] || null);
-    res.json({ totalParticipantes, totalPartidos, totalPronosticos, totalPuntos, lider });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET bonificaciones ────────────────────────────────────────────────────────
-router.get('/bonificaciones', auth, adminOnly, async (req, res) => {
-  try {
-    const cfg = await ProdeConfig.findOne({ key: 'prode' });
-    res.json(cfg?.value?.bonificaciones || []);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST agregar bonificación ─────────────────────────────────────────────────
-router.post('/bonificaciones', auth, adminOnly, async (req, res) => {
-  try {
-    const { tipo, descripcion, productoId, productoNombre, montoMinimo, puntos } = req.body;
-    if (!tipo || !puntos) return res.status(400).json({ message: 'Faltan campos requeridos' });
-
-    const nueva = { tipo, descripcion, productoId, productoNombre, montoMinimo: Number(montoMinimo) || 0, puntos: Number(puntos), activa: true };
-
-    let cfg = await ProdeConfig.findOne({ key: 'prode' });
-    if (!cfg) cfg = await ProdeConfig.create({ key: 'prode', value: {} });
-
-    const bonificaciones = cfg.value?.bonificaciones || [];
-    bonificaciones.push(nueva);
-
-    await ProdeConfig.findOneAndUpdate(
-      { key: 'prode' },
-      { $set: { 'value.bonificaciones': bonificaciones } },
-      { new: true }
-    );
-
-    res.json(nueva);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── PUT actualizar bonificación (por índice) ──────────────────────────────────
-router.put('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
-  try {
-    const idx = Number(req.params.index);
-    const cfg = await ProdeConfig.findOne({ key: 'prode' });
-    if (!cfg) return res.status(404).json({ message: 'Config no encontrada' });
-
-    const bonificaciones = cfg.value?.bonificaciones || [];
-    if (idx < 0 || idx >= bonificaciones.length) return res.status(404).json({ message: 'Bonificación no encontrada' });
-
-    bonificaciones[idx] = { ...bonificaciones[idx], ...req.body };
-
-    await ProdeConfig.findOneAndUpdate(
-      { key: 'prode' },
-      { $set: { 'value.bonificaciones': bonificaciones } },
-      { new: true }
-    );
-
-    res.json(bonificaciones[idx]);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE bonificación (por índice) ─────────────────────────────────────────
-router.delete('/bonificaciones/:index', auth, adminOnly, async (req, res) => {
-  try {
-    const idx = Number(req.params.index);
-    const cfg = await ProdeConfig.findOne({ key: 'prode' });
-    if (!cfg) return res.status(404).json({ message: 'Config no encontrada' });
-
-    const bonificaciones = cfg.value?.bonificaciones || [];
-    if (idx < 0 || idx >= bonificaciones.length) return res.status(404).json({ message: 'Bonificación no encontrada' });
-
-    bonificaciones.splice(idx, 1);
-
-    await ProdeConfig.findOneAndUpdate(
-      { key: 'prode' },
-      { $set: { 'value.bonificaciones': bonificaciones } },
-      { new: true }
-    );
-
-    res.json({ deleted: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-
-// ── GET lista completa de participantes con stats (admin) ─────────────────────
-router.get('/participantes', auth, adminOnly, async (req, res) => {
-  try {
-    const { Client } = require('../models/Order');
-
-    const clientIds = await Pronostico.distinct('clientId');
-    if (clientIds.length === 0) return res.json([]);
-
-    const clients = await Client.find({ _id: { $in: clientIds } }, 'name whatsapp phone prodeGuestCouponCode').lean();
-
-    const ptsByClient = await ProdePoints.aggregate([
-      { $match: { clientId: { $in: clientIds }, tipo: { $in: ['pronostico', 'bonificacion'] } } },
-      { $group: {
-        _id: '$clientId',
-        total:         { $sum: '$puntos' },
-        porPronostico: { $sum: { $cond: [{ $eq: ['$tipo', 'pronostico'] }, '$puntos', 0] } },
-        porBonus:      { $sum: { $cond: [{ $eq: ['$tipo', 'bonificacion'] }, '$puntos', 0] } },
-      }}
-    ]);
-    const ptsMap = {};
-    ptsByClient.forEach(p => { ptsMap[String(p._id)] = p; });
-
-    const statsByClient = await Pronostico.aggregate([
-      { $match: { clientId: { $in: clientIds } } },
-      { $group: {
-        _id: '$clientId',
-        total:    { $sum: 1 },
-        acertados:{ $sum: { $cond: [{ $and: [{ $eq: ['$evaluated', true] }, { $gt: ['$pointsEarned', 0] }] }, 1, 0] } },
-        exactos:  { $sum: { $cond: [
-          { $and: [
-            { $eq: ['$evaluated', true] },
-            { $gt: ['$pointsEarned', 0] },
-            { $ne: ['$predictedHome', null] },
-          ]}, 1, 0
-        ]}},
-      }}
-    ]);
-    const statsMap = {};
-    statsByClient.forEach(s => { statsMap[String(s._id)] = s; });
-
-    const result = await Promise.all(clients.map(async c => {
-      const cid = String(c._id);
-      const status = await resolveProdeStatus(c._id);
-      return {
-        clientId: c._id,
-        nombre:   c.name,
-        whatsapp: c.whatsapp || c.phone || '',
-        puntos:           ptsMap[cid]?.total         || 0,
-        puntosPronostico: ptsMap[cid]?.porPronostico || 0,
-        puntosBonus:      ptsMap[cid]?.porBonus      || 0,
-        puntosCompra:     ptsMap[cid]?.porBonus      || 0,
-        categoria:        status?.categoriaLabel || 'Invitado',
-        premioSegmento:   status?.premioSegmento || 'invitado',
-        elegibleTop3:     status?.elegibleTop3 || false,
-        cuponInvitado:    c.prodeGuestCouponCode || status?.cuponInvitado || null,
-        pronosticos: {
-          total:     statsMap[cid]?.total     || 0,
-          acertados: statsMap[cid]?.acertados || 0,
-          exactos:   statsMap[cid]?.exactos   || 0,
-        },
-        entregasEnPeriodo: status?.entregasEnPeriodo || 0,
-        pedidosEnPeriodo:  status?.entregasEnPeriodo || 0,
-      };
-    }));
-
-    result.sort((a, b) => b.puntos - a.puntos);
-    res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET PDF de pronósticos de un cliente ──────────────────────────────────────
-// Accesible con auth de cliente (token en cookie/header) o sin auth (link directo con clientId)
-// ?download=1 → fuerza descarga (attachment), sin parámetro → abre en navegador (inline/imprimir)
-router.get('/pdf/:clientId', async (req, res) => {
-  try {
-    const { generateProdePDF } = require('../services/prode-pdf.services');
-    const pdfBuffer    = await generateProdePDF(req.params.clientId);
-    const disposition  = req.query.download === '1'
-      ? `attachment; filename="prode-janz-${req.params.clientId}.pdf"`
-      : `inline; filename="prode-janz-${req.params.clientId}.pdf"`;
-    res.set({
-      'Content-Type':        'application/pdf',
-      'Content-Disposition': disposition,
-      'Content-Length':      pdfBuffer.length,
-    });
-    res.end(pdfBuffer);
-  } catch (err) {
-    console.error('[ProdePDF] Error:', err.message);
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// ── DELETE resetear predicciones de un cliente específico (admin/testing) ─────
-router.delete('/reset-cliente/:clientId', auth, adminOnly, async (req, res) => {
-  try {
-    const { clientId } = req.params;
-    const [p, pts] = await Promise.all([
-      Pronostico.deleteMany({ clientId }),
-      ProdePoints.deleteMany({ clientId }),
-    ]);
-    res.json({ pronosticosEliminados: p.deletedCount, puntosEliminados: pts.deletedCount });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE reset nuclear — borra TODOS los pronósticos y puntos (admin/testing) ─
-router.delete('/reset-all', auth, adminOnly, async (req, res) => {
-  try {
-    const [p, pts] = await Promise.all([
-      Pronostico.deleteMany({}),
-      ProdePoints.deleteMany({}),
-    ]);
-    // No tocamos ProdeMatch — los scores vienen de la API y se regeneran solos
-    res.json({ pronosticosEliminados: p.deletedCount, puntosEliminados: pts.deletedCount });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE eliminar participante del prode (admin) ───────────────────────────
-// Borra pronósticos, puntos y el cupón prode. Deja al cliente en la BD.
-router.delete('/participante/:clientId', auth, adminOnly, async (req, res) => {
-  try {
-    const { clientId } = req.params;
-    const { Client } = require('../models/Order');
-    const Coupon = require('../models/Coupon');
-
-    // Buscar cupón prode antes de modificar el cliente
-    const client = await Client.findById(clientId).select('prodeGuestCouponCode').lean();
-    if (client?.prodeGuestCouponCode) {
-      await Coupon.deleteOne({ code: client.prodeGuestCouponCode });
-    }
-
-    const [p, pts] = await Promise.all([
-      Pronostico.deleteMany({ clientId }),
-      ProdePoints.deleteMany({ clientId }),
-      Client.findByIdAndUpdate(clientId, {
-        $unset: { prodeRegisteredAt: '', prodeGuestCouponCode: '' },
-      }),
-    ]);
-
-    res.json({
-      pronosticosEliminados: p.deletedCount,
-      puntosEliminados: pts.deletedCount,
-      cuponEliminado: !!client?.prodeGuestCouponCode,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET preview destinatarios de notificación manual ─────────────────────────
-// Devuelve la lista de participantes que recibirían el mensaje según el filtro,
-// junto con un preview del mensaje de cada uno.
-// Query params:
-//   segmento  : 'todos' | 'invitado' | 'cliente' | 'competidor'  (default: todos)
-//   periodo   : 'ultimas24h' | 'ultimas48h' | 'semana' | 'todo'  (default: ultimas24h)
-//   soloConPuntos : '1' — solo los que tienen al menos 1 pto (default: 0)
-router.get('/notificaciones/preview', auth, adminOnly, async (req, res) => {
-  try {
-    const { segmento = 'todos', periodo = 'ultimas24h', soloConPuntos = '0' } = req.query;
-
-    // Calcular ventana temporal
-    const ahora = Date.now();
-    const ventanas = { ultimas24h: 24, ultimas48h: 48, semana: 168, todo: 0 };
-    const horas = ventanas[periodo] ?? 24;
-    const desde = horas > 0 ? new Date(ahora - horas * 3_600_000) : null;
-
-    // Traer pronósticos evaluados en el período
-    const filtroBase = { evaluated: true };
-    if (desde) filtroBase.updatedAt = { $gte: desde };
-
-    const pronosticos = await Pronostico.find(filtroBase).populate('matchId').lean();
-
-    // Agrupar por cliente
-    const byClient = {};
-    for (const p of pronosticos) {
-      const cid = String(p.clientId);
-      if (!byClient[cid]) byClient[cid] = [];
-      byClient[cid].push(p);
-    }
-
-    // Si periodo=todo, incluir también participantes sin pronósticos evaluados
-    // (para mensajes de tipo "recordatorio")
-    if (!desde) {
-      const allClientIds = await Pronostico.distinct('clientId');
-      for (const cid of allClientIds) {
-        if (!byClient[String(cid)]) byClient[String(cid)] = [];
-      }
-    }
-
-    const { Client } = require('../models/Order');
-    const { buildDailyProdeMessage: buildMsg } = require('../jobs/prode-notifications');
-    const { getRanking } = require('../services/prode.service');
-    const cfg = await getProdeConfig();
-
-    // PERF FIX: este endpoint tenía el mismo problema que tenía antes
-    // /prode/ranking — resolvía cada participante de forma SECUENCIAL
-    // (resolveProdeStatus + Client.findById, uno atrás del otro). Con varios
-    // participantes esto superaba el timeout de 10s del frontend, el preview
-    // nunca cargaba, y por eso el botón "Enviar" no aparecía nunca (solo se
-    // muestra cuando el preview cargó bien). Ahora se resuelven todos los
-    // participantes EN PARALELO y se trae a todos los clientes en una sola
-    // consulta en vez de una por participante.
-    const clientIdsList = Object.keys(byClient);
-    const clientsDocs = await Client.find({ _id: { $in: clientIdsList } })
-      .select('name whatsapp phone').lean();
-    const clientMap = {};
-    clientsDocs.forEach(c => { clientMap[String(c._id)] = c; });
-
-    // Cargar ranking una sola vez para el preview (igual que en el job de notificaciones)
-    let rankingMap = {};
+import { useState, useEffect, useCallback } from 'react';
+import { Trophy, RefreshCw, Settings, CheckCircle, Calendar, Users, Star, Zap, Plus, Trash2, Gift, Eye, FileText, Search } from 'lucide-react';
+import API from '../utils/api';
+import toast from 'react-hot-toast';
+
+const fmt = n => Number(n || 0).toLocaleString('es-AR');
+const fmtPeso = n => `$${Number(n || 0).toLocaleString('es-AR')}`;
+
+const TIPO_LABELS = {
+  gasto_minimo: { label: 'Gasto mínimo', desc: 'gastar ≥ $X = +N pts', emoji: '💰' },
+  por_cada_x:   { label: 'Por cada $X',  desc: 'cada $X gastado = +N pts', emoji: '🔁' },
+  producto:     { label: 'Producto',     desc: 'comprar X producto = +N pts', emoji: '🍔' },
+};
+
+const STAGE_LABELS = {
+  'Fase de Grupos': 'Fase de Grupos',
+  'Round of 16': 'Octavos',
+  'Quarter-final': 'Cuartos',
+  'Semi-final': 'Semifinal',
+  'Final': 'Final',
+};
+
+export default function Prode() {
+  const [tab, setTab] = useState('ranking');
+  const [ranking, setRanking] = useState([]);
+  const [fixture, setFixture] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [config, setConfig] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [debugResult, setDebugResult] = useState(null);
+  const [debugging, setDebugging] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [editConfig, setEditConfig] = useState(false);
+  const [cfgForm, setCfgForm] = useState({});
+  const [bonificaciones, setBonificaciones] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [showAddBon, setShowAddBon] = useState(false);
+  const [bonForm, setBonForm] = useState({ tipo: 'gasto_minimo', descripcion: '', montoMinimo: '', puntos: 1, productoId: '', productoNombre: '' });
+
+  // ── Predicciones (vista admin) ───────────────────────────────────────────────
+  const [predsMatchId,  setPredsMatchId ] = useState('');
+  const [predsData,     setPredsData    ] = useState([]);
+  const [predsLoading,  setPredsLoading ] = useState(false);
+
+  // ── Notificaciones manuales ──────────────────────────────────────────────────
+  const [notifSegmento,   setNotifSegmento  ] = useState('todos');
+  const [notifPeriodo,    setNotifPeriodo   ] = useState('ultimas24h');
+  const [notifSoloConPts, setNotifSoloConPts] = useState(false);
+  const [notifMsgCustom,  setNotifMsgCustom ] = useState('');
+  const [notifUsarCustom, setNotifUsarCustom] = useState(false);
+  const [notifPreview,    setNotifPreview   ] = useState(null);   // { total, conWa, sinWa, destinatarios }
+  const [notifLoading,    setNotifLoading   ] = useState(false);
+  const [notifSending,    setNotifSending   ] = useState(false);
+  const [notifResult,     setNotifResult    ] = useState(null);   // resultado del envío
+  const [notifSelected,   setNotifSelected  ] = useState([]);     // clientIds seleccionados para envío selectivo
+  const [notifExpandMsg,  setNotifExpandMsg ] = useState(null);   // clientId con preview de msg expandido
+
+  // ── Reset de datos de prueba ─────────────────────────────────────────────────
+  const [resetClientId,   setResetClientId  ] = useState('');
+  const [resetLoading,    setResetLoading   ] = useState(false);
+  const [recalcLoading,   setRecalcLoading  ] = useState(false);
+  const [confirmNuclear,  setConfirmNuclear ] = useState(false);
+  const [nuclearLoading,  setNuclearLoading ] = useState(false);
+
+  // ── Participantes ─────────────────────────────────────────────────────────────
+  const [participantes,   setParticipantes  ] = useState([]);
+  const [partsLoading,    setPartsLoading   ] = useState(false);
+  const [premios,         setPremios        ] = useState(null);
+  const [premiosLoading,  setPremiosLoading ] = useState(false);
+  const [prizesTop3,        setPrizesTop3       ] = useState([]);
+  const [prizesTop3Loading, setPrizesTop3Loading] = useState(false);
+  const [finalizingPrizes,  setFinalizingPrizes ] = useState(false);
+  const [confirmFinalize,   setConfirmFinalize  ] = useState(false);
+  const [expandedPart,    setExpandedPart   ] = useState(null);      // clientId expandido
+  const [partPreds,       setPartPreds      ] = useState({});         // { clientId: { loading, data } }
+  const [partFilter,      setPartFilter     ] = useState('all');      // 'all' | 'ok' | 'nok'
+
+  const load = useCallback(async () => {
+    setLoading(true);
     try {
-      const ranking = await getRanking();
-      ranking.forEach((r, i) => { rankingMap[String(r.clientId || r._id)] = i + 1; });
+      const [r, f, s, c, b, p] = await Promise.allSettled([
+        API.get('/prode/ranking'),
+        API.get('/prode/fixture'),
+        API.get('/prode/stats'),
+        API.get('/prode/config'),
+        API.get('/prode/bonificaciones'),
+        API.get('/products'),
+      ]);
+
+      if (r.status === 'fulfilled') setRanking(r.value.data);
+      else console.error('❌ /prode/ranking falló:', r.reason?.response?.data || r.reason?.message);
+
+      if (f.status === 'fulfilled') setFixture(f.value.data);
+      else console.error('❌ /prode/fixture falló:', f.reason?.response?.data || f.reason?.message);
+
+      if (s.status === 'fulfilled') setStats(s.value.data);
+      else console.error('❌ /prode/stats falló:', s.reason?.response?.data || s.reason?.message);
+
+      if (c.status === 'fulfilled') { setConfig(c.value.data); setCfgForm(c.value.data); }
+      else console.error('❌ /prode/config falló:', c.reason?.response?.data || c.reason?.message);
+
+      if (b.status === 'fulfilled') setBonificaciones(b.value.data);
+      else console.error('❌ /prode/bonificaciones falló:', b.reason?.response?.data || b.reason?.message);
+
+      if (p.status === 'fulfilled') setProducts(p.value.data.filter(x => x.active));
+      else console.error('❌ /products falló:', p.reason?.response?.data || p.reason?.message);
+
+      // Sólo mostrar error si lo crítico (fixture) no cargó
+      if (f.status === 'rejected') toast.error('Error cargando el fixture — revisá la consola para más info');
+
+    } catch (err) {
+      console.error('❌ Error inesperado en load:', err);
+      toast.error('Error cargando datos del prode');
+    }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { if (tab === 'premios') loadPrizesTop3(); }, [tab]);
+
+  const handleDebugApi = async () => {
+    setDebugging(true);
+    setDebugResult(null);
+    try {
+      const r = await API.get('/prode/fixture/debug-api');
+      setDebugResult(r.data);
     } catch (e) {
-      console.error('[preview] No se pudo cargar el ranking:', e.message);
-    }
+      setDebugResult({ ok: false, problema: e.response?.data?.message || e.message });
+    } finally { setDebugging(false); }
+  };
 
-    const resultados = await Promise.all(
-      Object.entries(byClient).map(async ([clientId, prons]) => {
-        const status = await resolveProdeStatus(clientId, cfg);
-        if (!status) return null;
+  const handleSync = async () => {
+    setSyncing(true);
+    try {
+      const r = await API.post('/prode/fixture/sync', {}, { timeout: 30000 });
+      toast.success(`${r.data.synced} partidos sincronizados (${r.data.insertados} nuevos, ${r.data.actualizados} actualizados)`);
+      load();
+    } catch { toast.error('Error sincronizando fixture'); }
+    finally { setSyncing(false); }
+  };
 
-        // Filtrar por segmento
-        if (segmento !== 'todos') {
-          const seg = status.premioSegmento; // 'invitado' | 'cliente' | 'competidor'
-          if (segmento === 'invitado'    && seg !== 'invitado')    return null;
-          if (segmento === 'cliente'     && seg !== 'cliente')     return null;
-          if (segmento === 'competidor'  && seg !== 'competidor')  return null;
-        }
+  const handleSeedMock = async () => {
+    try {
+      await API.post('/prode/fixture/seed-mock');
+      toast.success('Fixture de prueba cargado');
+      load();
+    } catch { toast.error('Error cargando fixture de prueba'); }
+  };
 
-        // Filtrar solo con puntos
-        if (soloConPuntos === '1' && status.totalPuntos === 0) return null;
+  const handleDeleteMock = async () => {
+    try {
+      const r = await API.delete('/prode/fixture/mock');
+      toast.success(`${r.data.deleted} partidos de prueba eliminados`);
+      load();
+    } catch { toast.error('Error eliminando partidos de prueba'); }
+  };
 
-        const client = clientMap[String(clientId)];
-        if (!client) return null;
-        const waNum = client.whatsapp || client.phone || '';
+  const handleSaveConfig = async () => {
+    try {
+      await API.put('/prode/config', cfgForm);
+      setConfig(cfgForm);
+      setEditConfig(false);
+      toast.success('Configuración guardada');
+    } catch { toast.error('Error guardando configuración'); }
+  };
 
-        // Construir preview del mensaje con ranking incluido
-        const rankingPos = rankingMap[String(clientId)] || null;
-        const msg = buildMsg(status, prons, cfg, rankingPos);
+  const handleConfirmTeams = async (matchId, homeTeam, awayTeam) => {
+    try {
+      await API.put(`/prode/fixture/${matchId}/teams`, { homeTeam, awayTeam });
+      setFixture(f => f.map(m => m._id === matchId ? { ...m, homeTeam, awayTeam, teamsConfirmed: true } : m));
+      toast.success(`✅ ${homeTeam} vs ${awayTeam} — pronósticos habilitados`);
+    } catch { toast.error('Error al confirmar equipos'); }
+  };
 
-        return {
-          clientId,
-          nombre:    client.name,
-          whatsapp:  waNum,
-          segmento:  status.premioSegmento,
-          categoria: status.categoriaLabel,
-          puntos:    status.totalPuntos,
-          partidos:  prons.length,
-          sinWa:     !waNum,
-          msgPreview: msg,
-        };
-      })
-    );
+  const handleSetResultado = async (matchId, homeScore, awayScore) => {
+    try {
+      await API.put(`/prode/fixture/${matchId}/resultado`, { homeScore: Number(homeScore), awayScore: Number(awayScore) });
+      setFixture(f => f.map(m => m._id === matchId ? { ...m, homeScore, awayScore, status: 'finished' } : m));
+      toast.success('Resultado cargado');
+    } catch { toast.error('Error cargando resultado'); }
+  };
 
-    const destinatarios = resultados.filter(Boolean);
+  const handleAddBonificacion = async () => {
+    if (!bonForm.puntos || bonForm.puntos < 1) return toast.error('Los puntos deben ser ≥ 1');
+    if ((bonForm.tipo === 'gasto_minimo' || bonForm.tipo === 'por_cada_x') && !bonForm.montoMinimo) return toast.error('Ingresá el monto');
+    if (bonForm.tipo === 'producto' && !bonForm.productoId) return toast.error('Seleccioná un producto');
+    try {
+      const res = await API.post('/prode/bonificaciones', bonForm);
+      setBonificaciones(prev => [...prev, res.data]);
+      setShowAddBon(false);
+      setBonForm({ tipo: 'gasto_minimo', descripcion: '', montoMinimo: '', puntos: 1, productoId: '', productoNombre: '' });
+      toast.success('Bonificación agregada');
+    } catch { toast.error('Error al agregar bonificación'); }
+  };
 
-    // Ordenar: primero los que tienen WA, luego por puntos desc
-    destinatarios.sort((a, b) => {
-      if (a.sinWa !== b.sinWa) return a.sinWa ? 1 : -1;
-      return b.puntos - a.puntos;
-    });
+  const handleToggleBon = async (idx, activa) => {
+    try {
+      await API.put(`/prode/bonificaciones/${idx}`, { activa });
+      setBonificaciones(prev => prev.map((b, i) => i === idx ? { ...b, activa } : b));
+    } catch { toast.error('Error al actualizar'); }
+  };
 
-    res.json({
-      total:       destinatarios.length,
-      conWa:       destinatarios.filter(d => !d.sinWa).length,
-      sinWa:       destinatarios.filter(d => d.sinWa).length,
-      destinatarios,
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
+  const handleDeleteBon = async (idx) => {
+    try {
+      await API.delete(`/prode/bonificaciones/${idx}`);
+      setBonificaciones(prev => prev.filter((_, i) => i !== idx));
+      toast.success('Bonificación eliminada');
+    } catch { toast.error('Error al eliminar'); }
+  };
 
-// ── POST enviar mensajes de notificación manual ───────────────────────────────
-// Body JSON:
-//   segmento      : 'todos' | 'invitado' | 'cliente' | 'competidor'
-//   periodo       : 'ultimas24h' | 'ultimas48h' | 'semana' | 'todo'
-//   soloConPuntos : boolean
-//   mensajeCustom : string | null  — si viene, reemplaza el template automático
-//   clientIds     : string[] | null — si viene, envía SOLO a esos ids (ignore filtros)
-router.post('/notificaciones/enviar', auth, adminOnly, async (req, res) => {
-  try {
-    const {
-      segmento      = 'todos',
-      periodo       = 'ultimas24h',
-      soloConPuntos = false,
-      mensajeCustom = null,
-      clientIds     = null,
-    } = req.body;
+  const loadPrediccionesByMatch = async (matchId) => {
+    if (!matchId) return;
+    setPredsLoading(true);
+    setPredsData([]);
+    try {
+      const r = await API.get(`/prode/pronosticos-admin?matchId=${matchId}`);
+      setPredsData(r.data);
+    } catch { toast.error('Error cargando predicciones'); }
+    finally { setPredsLoading(false); }
+  };
 
-    const { buildDailyProdeMessage } = require('../jobs/prode-notifications');
-    const { sendMessage } = require('../services/whatsapp');
-    const { Client } = require('../models/Order');
-    const cfg = await getProdeConfig();
+  const loadPremios = async () => {
+    setPremiosLoading(true);
+    try {
+      const r = await API.get('/prode/premios');
+      setPremios(r.data);
+    } catch { toast.error('Error cargando premios'); }
+    finally { setPremiosLoading(false); }
+  };
 
-    // ── Armar lista de destinatarios ─────────────────────────────────────────
-    let targetIds;
+  // ── Sistema de premios automáticos (top 3) ────────────────────────────────────
+  const loadPrizesTop3 = async () => {
+    setPrizesTop3Loading(true);
+    try {
+      const r = await API.get('/prode/premios-top3');
+      setPrizesTop3(r.data);
+    } catch { toast.error('Error cargando auditoría de premios'); }
+    finally { setPrizesTop3Loading(false); }
+  };
 
-    if (Array.isArray(clientIds) && clientIds.length > 0) {
-      // Envío selectivo (admin marcó participantes específicos)
-      targetIds = clientIds;
-    } else {
-      // Envío por segmento/período
-      const ahora = Date.now();
-      const ventanas = { ultimas24h: 24, ultimas48h: 48, semana: 168, todo: 0 };
-      const horas = ventanas[periodo] ?? 24;
-      const desde = horas > 0 ? new Date(ahora - horas * 3_600_000) : null;
-
-      const filtroBase = { evaluated: true };
-      if (desde) filtroBase.updatedAt = { $gte: desde };
-
-      const pronosticos = await Pronostico.find(filtroBase).lean();
-
-      // Si período=todo, incluir todos los participantes aunque no tengan prons evaluados
-      let allIds = [...new Set(pronosticos.map(p => String(p.clientId)))];
-      if (!desde) {
-        const todos = await Pronostico.distinct('clientId');
-        allIds = [...new Set([...allIds, ...todos.map(String)])];
+  const handleFinalizePrizes = async () => {
+    setConfirmFinalize(false);
+    setFinalizingPrizes(true);
+    try {
+      const r = await API.post('/prode/finalizar-premios');
+      const { awarded = [], skipped = [] } = r.data;
+      if (awarded.length > 0) {
+        toast.success(`🏆 Premiados: ${awarded.map(a => `#${a.position} ${a.clientName}`).join(', ')}`);
       }
-      targetIds = allIds;
-    }
-
-    const results = { sent: 0, skipped: 0, errors: 0, detalle: [] };
-
-    for (const clientId of targetIds) {
-      try {
-        const status = await resolveProdeStatus(clientId);
-        if (!status) { results.skipped++; continue; }
-
-        // Filtrar por segmento (solo si no es envío selectivo)
-        if (!Array.isArray(clientIds)) {
-          const seg = status.premioSegmento;
-          if (segmento !== 'todos') {
-            if (segmento === 'invitado'   && seg !== 'invitado')   { results.skipped++; continue; }
-            if (segmento === 'cliente'    && seg !== 'cliente')     { results.skipped++; continue; }
-            if (segmento === 'competidor' && seg !== 'competidor')  { results.skipped++; continue; }
-          }
-          if (soloConPuntos && status.totalPuntos === 0)            { results.skipped++; continue; }
-        }
-
-        const client = await Client.findById(clientId).select('name whatsapp phone').lean();
-        const waNum  = client?.whatsapp || client?.phone || '';
-
-        if (!waNum) {
-          results.skipped++;
-          results.detalle.push({ nombre: client?.name || clientId, estado: 'sin_wa' });
-          continue;
-        }
-
-        // Construir mensaje
-        let msg;
-        if (mensajeCustom?.trim()) {
-          // Reemplazar placeholder {{nombre}} si el admin lo usó
-          msg = mensajeCustom.replace(/\{\{nombre\}\}/g, status.nombre);
-        } else {
-          // Usar el período completo del prode para armar el resumen
-          const prons = await Pronostico.find({ clientId, evaluated: true })
-            .populate('matchId').lean();
-          msg = buildDailyProdeMessage(status, prons, cfg);
-        }
-
-        await sendMessage(waNum, msg);
-        results.sent++;
-        results.detalle.push({ nombre: client.name, estado: 'enviado', waNum });
-
-        // Pausa anti-spam
-        await new Promise(r => setTimeout(r, 1200));
-
-      } catch (e) {
-        console.error(`❌ [ProdeNotif Manual] Error con ${clientId}:`, e.message);
-        results.errors++;
-        results.detalle.push({ nombre: clientId, estado: 'error', error: e.message });
+      if (skipped.length > 0 && awarded.length === 0) {
+        toast.error('Ningún puesto nuevo para premiar (ya estaban premiados o sin competidores elegibles).');
       }
+      await loadPrizesTop3();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Error al finalizar y premiar');
+    } finally {
+      setFinalizingPrizes(false);
     }
+  };
 
-    console.log(`📲 [ProdeNotif Manual] Fin: ${results.sent} enviados, ${results.skipped} saltados, ${results.errors} errores`);
-    res.json(results);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
+  const loadParticipantes = async () => {
+    try {
+      const r = await API.get('/prode/participantes');
+      setParticipantes(r.data);
+    } catch { toast.error('Error cargando participantes'); }
+    finally { setPartsLoading(false); }
+  };
 
-// ── Cache liviano del ranking (evita recalcular en cada request) ──────────────
-let _rankingCache     = null;
-let _rankingCacheAt   = 0;
-let _rankingInFlight  = null; // promesa en curso, evita "cache stampede"
-const RANKING_CACHE_MS = 5 * 60 * 1000; // 5 minutos
+  const loadPartPreds = async (clientId) => {
+    if (expandedPart === clientId) { setExpandedPart(null); return; }
+    setExpandedPart(clientId);
+    if (partPreds[clientId]?.data) return; // ya cargado
+    setPartPreds(prev => ({ ...prev, [clientId]: { loading: true, data: null } }));
+    try {
+      const r = await API.get(`/prode/pronosticos/${clientId}`);
+      setPartPreds(prev => ({ ...prev, [clientId]: { loading: false, data: r.data } }));
+    } catch {
+      toast.error('Error cargando predicciones del participante');
+      setPartPreds(prev => ({ ...prev, [clientId]: { loading: false, data: [] } }));
+    }
+  };
 
-async function getCachedRanking() {
-  if (_rankingCache && Date.now() - _rankingCacheAt < RANKING_CACHE_MS) {
-    return _rankingCache;
-  }
-  // Si ya hay un cálculo en curso (p. ej. varios requests llegaron a la vez
-  // con el caché vencido), todos esperan el mismo resultado en vez de
-  // disparar getRanking() una vez por request.
-  if (_rankingInFlight) return _rankingInFlight;
+  const handleEliminarParticipante = async (clientId, nombre) => {
+    if (!window.confirm(`¿Eliminar a ${nombre} del prode?\n\nSe borrarán sus pronósticos, puntos y cupón prode. El cliente seguirá existiendo en el sistema (historial de pedidos intacto).`)) return;
+    try {
+      const r = await API.delete(`/prode/participante/${clientId}`);
+      toast.success(`${nombre} eliminado del prode (${r.data.pronosticosEliminados} pronósticos, ${r.data.puntosEliminados} pts${r.data.cuponEliminado ? ', cupón borrado' : ''})`);
+      setParticipantes(prev => prev.filter(p => String(p.clientId) !== String(clientId)));
+      setExpandedPart(null);
+      // Refrescar ranking
+      const rankRes = await API.get('/prode/ranking');
+      setRanking(rankRes.data);
+    } catch (e) {
+      toast.error(e.response?.data?.message || 'Error al eliminar participante');
+    }
+  };
 
-  _rankingInFlight = getRanking()
-    .then(result => {
-      _rankingCache   = result;
-      _rankingCacheAt = Date.now();
-      return result;
-    })
-    .finally(() => { _rankingInFlight = null; });
+  const handleResetCliente = async () => {
+    if (!resetClientId) return;
+    const cliente = ranking.find(r => String(r.clientId) === resetClientId);
+    if (!window.confirm(`¿Borrar TODAS las predicciones y puntos de ${cliente?.nombre || resetClientId}? Esta acción no se puede deshacer.`)) return;
+    setResetLoading(true);
+    try {
+      const r = await API.delete(`/prode/reset-cliente/${resetClientId}`);
+      toast.success(`✓ ${r.data.pronosticosEliminados} pronósticos y ${r.data.puntosEliminados} puntos eliminados`);
+      setResetClientId('');
+      // Refrescar ranking
+      const rankRes = await API.get('/prode/ranking');
+      setRanking(rankRes.data);
+    } catch { toast.error('Error al resetear'); }
+    finally { setResetLoading(false); }
+  };
 
-  return _rankingInFlight;
+  const handleRecalcCliente = async () => {
+    if (!resetClientId) return;
+    const cliente = ranking.find(r => String(r.clientId) === resetClientId);
+    if (!window.confirm(`¿Recalcular los puntos de pronósticos de ${cliente?.nombre || resetClientId} desde cero? Los demás clientes no se ven afectados.`)) return;
+    setRecalcLoading(true);
+    try {
+      const r = await API.post(`/prode/evaluar-cliente/${resetClientId}`);
+      toast.success(`✅ ${r.data.message}`);
+      const rankRes = await API.get('/prode/ranking');
+      setRanking(rankRes.data);
+    } catch (e) { toast.error(e.response?.data?.message || 'Error al recalcular puntos'); }
+    finally { setRecalcLoading(false); }
+  };
+
+  const handleNuclearReset = async () => {
+    setNuclearLoading(true);
+    try {
+      const r = await API.delete('/prode/reset-all');
+      toast.success(`💥 Reset completo — ${r.data.pronosticosEliminados} pronósticos y ${r.data.puntosEliminados} puntos eliminados`);
+      setConfirmNuclear(false);
+      const rankRes = await API.get('/prode/ranking');
+      setRanking(rankRes.data);
+    } catch { toast.error('Error en reset nuclear'); }
+    finally { setNuclearLoading(false); }
+  };
+
+  const [reEvalLoading, setReEvalLoading] = useState(false);
+  const handleReEvaluar = async () => {
+    if (!window.confirm('¿Re-evaluar TODOS los partidos terminados desde cero? Esto corrige puntos mal calculados.')) return;
+    setReEvalLoading(true);
+    try {
+      const r = await API.post('/prode/evaluar-forzado');
+      toast.success(`✅ ${r.data.message}`);
+      const rankRes = await API.get('/prode/ranking');
+      setRanking(rankRes.data);
+    } catch { toast.error('Error en re-evaluación'); }
+    finally { setReEvalLoading(false); }
+  };
+
+  // Agrupar fixture por stage/group
+  const fixtureAgrupado = fixture.reduce((acc, m) => {
+    const key = m.group || m.stage || 'Fixture';
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(m);
+    return acc;
+  }, {});
+
+  const statusBadge = (status) => {
+    if (status === 'finished') return <span style={{ background: '#166534', color: '#bbf7d0', fontSize: 11, padding: '2px 8px', borderRadius: 99, fontWeight: 500 }}>Finalizado</span>;
+    if (status === 'live')     return <span style={{ background: '#7f1d1d', color: '#fca5a5', fontSize: 11, padding: '2px 8px', borderRadius: 99, fontWeight: 500 }}>En vivo</span>;
+    return <span style={{ background: '#1e3a5f', color: '#93c5fd', fontSize: 11, padding: '2px 8px', borderRadius: 99, fontWeight: 500 }}>Programado</span>;
+  };
+
+  if (loading) return <div style={{ padding: 40, textAlign: 'center', color: 'var(--gray)' }}>Cargando prode...</div>;
+
+  return (
+    <>
+      <div className="page-header">
+        <h1 style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Trophy size={22} color="var(--gold)" /> Prode Mundial 2026
+        </h1>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="btn btn-secondary" onClick={handleDebugApi} disabled={debugging} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+            {debugging ? '...' : '🔍 Debug API'}
+          </button>
+          <button className="btn btn-secondary" onClick={() => setEditConfig(true)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Settings size={15} /> Configurar
+          </button>
+          <button className="btn btn-primary" onClick={handleSync} disabled={syncing} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <RefreshCw size={15} className={syncing ? 'spin' : ''} />
+            {syncing ? 'Sincronizando...' : 'Sync Fixture'}
+          </button>
+        </div>
+      </div>
+
+      <div className="page-body">
+
+        {/* Stats cards */}
+        {stats && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
+            {[
+              { label: 'Participantes', value: stats.totalParticipantes, icon: Users, color: '#E8B84B' },
+              { label: 'Partidos', value: stats.totalPartidos, icon: Calendar, color: '#60a5fa' },
+              { label: 'Pronósticos', value: stats.totalPronosticos, icon: Star, color: '#a78bfa' },
+              { label: 'Líder', value: stats.lider?.nombre?.split(' ')[0] || '—', icon: Trophy, color: '#34d399' },
+            ].map(({ label, value, icon: Icon, color }) => (
+              <div key={label} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 10, padding: '14px 16px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                  <span style={{ fontSize: 12, color: 'var(--gray)' }}>{label}</span>
+                  <Icon size={15} color={color} />
+                </div>
+                <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text)' }}>{value}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Panel debug API — API-Football v3 */}
+        {debugResult && (
+          <div style={{
+            background: debugResult.ok ? 'rgba(52,211,153,0.06)' : 'rgba(239,68,68,0.06)',
+            border: `1px solid ${debugResult.ok ? '#34d399' : '#ef4444'}`,
+            borderRadius: 10, padding: '14px 16px', marginBottom: 20, fontSize: 13,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <span style={{ fontWeight: 600, color: debugResult.ok ? '#34d399' : '#ef4444' }}>
+                {debugResult.ok ? '✅ API-Football responde' : '❌ Problema detectado'}
+              </span>
+              <button onClick={() => setDebugResult(null)} style={{ background: 'none', border: 'none', color: 'var(--gray)', cursor: 'pointer', fontSize: 16 }}>✕</button>
+            </div>
+            {debugResult.problema && (
+              <div style={{ marginBottom: 8 }}>
+                <span style={{ color: '#ef4444', fontWeight: 500 }}>Problema: </span>
+                <span style={{ color: 'var(--text)' }}>{debugResult.problema}</span>
+              </div>
+            )}
+            {debugResult.url && (
+              <div style={{ marginBottom: 8, color: 'var(--gray)', fontSize: 12 }}>
+                URL: <code style={{ color: 'var(--text)' }}>{debugResult.url}</code>
+              </div>
+            )}
+            {debugResult.ok && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <div>
+                  <span style={{ color: 'var(--gray)' }}>Partidos encontrados: </span>
+                  <span style={{ fontWeight: 600, color: '#34d399' }}>{debugResult.cantidad}</span>
+                </div>
+                {debugResult.primer_partido && (
+                  <details style={{ marginTop: 4 }}>
+                    <summary style={{ cursor: 'pointer', color: 'var(--gray)', fontSize: 12 }}>Ver primer partido (raw)</summary>
+                    <pre style={{ fontSize: 11, color: 'var(--text)', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, marginTop: 8, overflowX: 'auto', maxHeight: 300 }}>
+                      {JSON.stringify(debugResult.primer_partido, null, 2)}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+            {debugResult.apiResponse && (
+              <details style={{ marginTop: 6 }}>
+                <summary style={{ cursor: 'pointer', color: 'var(--gray)', fontSize: 12 }}>Ver respuesta de error</summary>
+                <pre style={{ fontSize: 11, color: '#ef4444', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, marginTop: 8, overflowX: 'auto' }}>
+                  {JSON.stringify(debugResult.apiResponse, null, 2)}
+                </pre>
+              </details>
+            )}
+          </div>
+        )}
+
+        {/* Estado del prode */}
+        {config && (
+          <div style={{
+            background: config.enabled ? 'rgba(52,211,153,0.08)' : 'rgba(239,68,68,0.08)',
+            border: `1px solid ${config.enabled ? '#34d399' : '#ef4444'}`,
+            borderRadius: 10, padding: '12px 16px', marginBottom: 20,
+            display: 'flex', alignItems: 'center', gap: 10, fontSize: 14,
+          }}>
+            <Zap size={16} color={config.enabled ? '#34d399' : '#ef4444'} />
+            <span style={{ color: config.enabled ? '#34d399' : '#ef4444', fontWeight: 500 }}>
+              Prode {config.enabled ? 'ACTIVO' : 'INACTIVO'}
+            </span>
+            {config.startDate && config.endDate && (
+              <span style={{ color: 'var(--gray)', fontSize: 13 }}>
+                · Período compras: {new Date(config.startDate).toLocaleDateString('es-AR')} → {new Date(config.endDate).toLocaleDateString('es-AR')}
+              </span>
+            )}
+            {config.enabled && (
+              <span style={{ color: 'var(--gray)', fontSize: 13 }}>
+                · {config.pointsWinner ?? 3} pt ganador · {(config.pointsWinner ?? 3) + (config.pointsExact ?? 3)} pt exacto · bonus categoría +3/+3
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Tabs */}
+        <div style={{ display: 'flex', gap: 0, marginBottom: 20, borderBottom: '1px solid var(--border)', overflowX: 'auto', WebkitOverflowScrolling: 'touch', scrollbarWidth: 'none' }}>
+          {[
+            { id: 'ranking',       label: '🏆 Ranking'    },
+            { id: 'fixture',       label: '📅 Fixture'    },
+            { id: 'predicciones',  label: '👁 Predicciones' },
+            { id: 'participantes', label: '👥 Participantes' },
+            { id: 'premios',       label: '🎁 Premios'       },
+            { id: 'bonificaciones',label: '🎁 Bonif. (legacy)' },
+            { id: 'terminos',      label: '📋 Términos & Premios' },
+            { id: 'mensajes',      label: '📲 Mensajes'           },
+          ].map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              padding: '8px 14px', fontSize: 13, fontWeight: tab === t.id ? 600 : 400,
+              color: tab === t.id ? 'var(--gold)' : 'var(--gray)',
+              borderBottom: tab === t.id ? '2px solid var(--gold)' : '2px solid transparent',
+              marginBottom: -1, whiteSpace: 'nowrap', flexShrink: 0,
+            }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* TAB: Ranking */}
+        {tab === 'ranking' && (
+          <div>
+            {ranking.length === 0 ? (
+              <div style={{ textAlign: 'center', color: 'var(--gray)', padding: 40 }}>
+                Todavía no hay puntos registrados
+              </div>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 14 }}>
+                <thead>
+                  <tr style={{ background: 'var(--card)', borderBottom: '1px solid var(--border)' }}>
+                    {['#', 'Cliente', 'Pts Pronóst.', 'Pts Bonus', 'Total', 'Exactos 🎯', 'Categoría', 'Entregas'].map(h => (
+                      <th key={h} style={{ padding: '10px 14px', textAlign: 'left', color: 'var(--gray)', fontWeight: 500, fontSize: 12 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {ranking.map((r, i) => (
+                    <tr key={r.clientId} style={{ borderBottom: '1px solid var(--border)' }}>
+                      <td style={{ padding: '12px 14px', fontWeight: 600, color: i === 0 ? '#E8B84B' : i === 1 ? '#9ca3af' : i === 2 ? '#d97706' : 'var(--gray)' }}>
+                        {i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}°`}
+                      </td>
+                      <td style={{ padding: '12px 14px', fontWeight: 500, color: 'var(--text)' }}>{r.nombre}</td>
+                      <td style={{ padding: '12px 14px' }}>
+                        <span style={{ background: '#2d1b69', color: '#a78bfa', fontSize: 12, padding: '3px 10px', borderRadius: 99 }}>
+                          {r.puntosPronosticos} pts
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px 14px' }}>
+                        <span style={{ background: '#14532d', color: '#86efac', fontSize: 12, padding: '3px 10px', borderRadius: 99 }}>
+                          {r.puntosBonus ?? r.puntosCompras ?? 0} pts
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px 14px' }}>
+                        <span style={{ background: '#713f12', color: '#fde68a', fontSize: 12, padding: '3px 10px', borderRadius: 99, fontWeight: 600 }}>
+                          {r.totalPuntos} pts
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
+                        <span style={{ background: '#1e1b4b', color: '#a78bfa', fontSize: 12, padding: '3px 10px', borderRadius: 99, fontWeight: 600 }}>
+                          {r.marcadoresExactos ?? 0}
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px 14px', fontSize: 13 }}>
+                        <span style={{ background: 'rgba(232,184,75,0.12)', color: '#E8B84B', fontSize: 12, padding: '3px 10px', borderRadius: 99 }}>
+                          {r.categoriaLabel || r.categoria || '—'}
+                        </span>
+                      </td>
+                      <td style={{ padding: '12px 14px', color: 'var(--gray)', fontSize: 13 }}>{r.entregasEnPeriodo ?? r.pedidosEnPeriodo ?? 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+
+        {/* TAB: Fixture */}
+        {tab === 'fixture' && (
+          <div>
+            {fixture.length === 0 ? (
+              <div style={{ textAlign: 'center', color: 'var(--gray)', padding: 40 }}>
+                <p style={{ marginBottom: 12 }}>No hay partidos cargados</p>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+                  <button className="btn btn-primary" onClick={handleSync}>Sync desde API</button>
+                  <button className="btn btn-secondary" onClick={handleSeedMock}>Cargar fixture de prueba</button>
+                </div>
+              </div>
+            ) : (
+              <>
+                {fixture.some(m => m.apiId?.startsWith('mock-')) && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={handleDeleteMock}
+                      style={{ fontSize: 12, color: '#ef4444', borderColor: '#ef444433' }}
+                    >
+                      🗑 Eliminar partidos de prueba ({fixture.filter(m => m.apiId?.startsWith('mock-')).length})
+                    </button>
+                  </div>
+                )}
+                {Object.entries(fixtureAgrupado).map(([grupo, matches]) => (
+                  <div key={grupo} style={{ marginBottom: 24 }}>
+                    <h3 style={{ fontSize: 13, color: 'var(--gray)', fontWeight: 600, marginBottom: 10, textTransform: 'uppercase', letterSpacing: 1 }}>{grupo}</h3>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      {matches.map(m => (
+                        <MatchRow key={m._id} match={m} onSetResultado={handleSetResultado} onConfirmTeams={handleConfirmTeams} statusBadge={statusBadge} />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* TAB: Participantes */}
+        {tab === 'participantes' && (() => {
+          const filtered = participantes.filter(p =>
+            partFilter === 'ok'  ? p.elegibleTop3 :
+            partFilter === 'nok' ? !p.elegibleTop3 : true
+          );
+          const totalParts = participantes.length;
+          const elegibles  = participantes.filter(p => p.elegibleTop3).length;
+
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+              {/* ── Segmentos de premio ────────────────────────────────────── */}
+              <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 18 }}>
+                <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>🏅 Segmentos de premio</div>
+                <div style={{ fontSize: 12, color: 'var(--gray)', lineHeight: 1.6 }}>
+                  <b>Invitados</b> → cupón {config?.guestCouponPercent || 20}% · <b>Clientes sin entregas en el período</b> → combo doble ·
+                  <b> ≥1 entrega en el período</b> → compite por top 3 del ranking.
+                </div>
+              </div>
+
+              {/* ── Stats globales + botón cargar ──────────────────────────── */}
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+                {participantes.length === 0 ? (
+                  <button className="btn btn-primary" disabled={partsLoading} onClick={loadParticipantes}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Users size={14} /> {partsLoading ? 'Cargando...' : 'Cargar participantes'}
+                  </button>
+                ) : (
+                  <>
+                    {[
+                      { label: 'Total participantes', value: totalParts,              color: '#E8B84B' },
+                      { label: 'Competidores top 3', value: elegibles,              color: '#34d399' },
+                      { label: 'Sin entregas en período', value: totalParts - elegibles, color: '#f87171' },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 10, padding: '10px 16px', textAlign: 'center', minWidth: 110 }}>
+                        <div style={{ fontSize: 22, fontWeight: 700, color }}>{value}</div>
+                        <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 2 }}>{label}</div>
+                      </div>
+                    ))}
+                    <button className="btn btn-secondary" onClick={loadParticipantes} disabled={partsLoading}
+                      style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5, fontSize: 12 }}>
+                      <RefreshCw size={12} className={partsLoading ? 'spin' : ''} /> Actualizar
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {participantes.length > 0 && (
+                <>
+                  {/* Filtro */}
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {[
+                      { id: 'all', label: 'Todos' },
+                      { id: 'ok',  label: '✅ Top 3 pool' },
+                      { id: 'nok', label: '❌ Sin entregas' },
+                    ].map(f => (
+                      <button key={f.id} onClick={() => setPartFilter(f.id)}
+                        style={{ background: partFilter === f.id ? 'var(--gold)' : 'var(--card)', color: partFilter === f.id ? '#000' : 'var(--gray)', border: '1px solid var(--border)', borderRadius: 99, padding: '5px 14px', fontSize: 12, cursor: 'pointer', fontWeight: partFilter === f.id ? 600 : 400 }}>
+                        {f.label}
+                      </button>
+                    ))}
+                    <span style={{ fontSize: 12, color: 'var(--gray)', alignSelf: 'center', marginLeft: 6 }}>
+                      {filtered.length} de {totalParts}
+                    </span>
+                  </div>
+
+                  {/* Tabla */}
+                  <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ background: 'rgba(255,255,255,0.03)' }}>
+                            {['#', 'Nombre', 'WhatsApp', 'Puntos', 'Categoría', 'Entregas', 'Premio', ''].map(h => (
+                              <th key={h} style={{ padding: '10px 12px', textAlign: 'left', color: 'var(--gray)', fontWeight: 500, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filtered.map((p, i) => {
+                            const elegible  = p.elegibleTop3;
+                            const isExpanded = expandedPart === String(p.clientId);
+                            const preds     = partPreds[String(p.clientId)];
+                            const premioLabel = p.premioSegmento === 'competidor' ? 'Top 3' : p.premioSegmento === 'cliente' ? 'Combo' : 'Cupón';
+                            return (
+                              <>
+                                <tr key={p.clientId}
+                                  style={{ borderBottom: isExpanded ? 'none' : '1px solid var(--border)', background: isExpanded ? 'rgba(232,184,75,0.04)' : i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)', cursor: 'pointer' }}
+                                  onClick={() => loadPartPreds(String(p.clientId))}
+                                >
+                                  <td style={{ padding: '11px 12px', color: 'var(--gray)', fontWeight: 600 }}>
+                                    {i + 1 <= 3 ? ['🥇','🥈','🥉'][i] : i + 1}
+                                  </td>
+                                  <td style={{ padding: '11px 12px', fontWeight: 500 }}>{p.nombre}</td>
+                                  <td style={{ padding: '11px 12px', color: 'var(--gray)', fontSize: 12 }}>
+                                    {p.whatsapp || '—'}
+                                  </td>
+                                  <td style={{ padding: '11px 12px' }}>
+                                    <span style={{ fontWeight: 700, color: 'var(--gold)' }}>{p.puntos}</span>
+                                    <span style={{ fontSize: 11, color: 'var(--gray)', marginLeft: 4 }}>
+                                      ({p.puntosPronostico}p + {p.puntosBonus ?? p.puntosCompra ?? 0}b)
+                                    </span>
+                                  </td>
+                                  <td style={{ padding: '11px 12px' }}>
+                                    <span style={{ background: 'rgba(232,184,75,0.12)', color: '#E8B84B', fontSize: 12, padding: '3px 10px', borderRadius: 99 }}>
+                                      {p.categoria || 'Invitado'}
+                                    </span>
+                                  </td>
+                                  <td style={{ padding: '11px 12px', fontWeight: 600, color: elegible ? '#34d399' : 'var(--text)' }}>
+                                    {p.entregasEnPeriodo ?? p.pedidosEnPeriodo ?? 0}
+                                  </td>
+                                  <td style={{ padding: '11px 12px' }}>
+                                    <span style={{
+                                      background: p.premioSegmento === 'competidor' ? 'rgba(52,211,153,0.12)' : 'rgba(255,255,255,0.06)',
+                                      color: p.premioSegmento === 'competidor' ? '#34d399' : 'var(--gray)',
+                                      fontSize: 12, padding: '3px 10px', borderRadius: 99, fontWeight: 600,
+                                    }}>
+                                      {premioLabel}
+                                    </span>
+                                    {p.cuponInvitado && (
+                                      <div style={{ fontSize: 10, color: 'var(--gray)', marginTop: 4 }}>{p.cuponInvitado}</div>
+                                    )}
+                                  </td>
+                                  <td style={{ padding: '11px 12px', textAlign: 'right' }}>
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
+                                      <button
+                                        onClick={e => { e.stopPropagation(); handleEliminarParticipante(String(p.clientId), p.nombre); }}
+                                        title="Eliminar del prode"
+                                        style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', opacity: 0.5, padding: 4, display: 'flex', alignItems: 'center' }}
+                                        onMouseEnter={e => e.currentTarget.style.opacity = 1}
+                                        onMouseLeave={e => e.currentTarget.style.opacity = 0.5}
+                                      >
+                                        <Trash2 size={14} />
+                                      </button>
+                                      <span style={{ color: isExpanded ? 'var(--gold)' : 'var(--gray)', fontSize: 16 }}>
+                                        {isExpanded ? '▲' : '▼'}
+                                      </span>
+                                    </div>
+                                  </td>
+                                </tr>
+
+                                {/* ── Predicciones expandidas ── */}
+                                {isExpanded && (
+                                  <tr key={`${p.clientId}-preds`} style={{ borderBottom: '1px solid var(--border)' }}>
+                                    <td colSpan={8} style={{ padding: '0 0 0 24px', background: 'rgba(232,184,75,0.03)' }}>
+                                      {preds?.loading ? (
+                                        <div style={{ padding: '16px 0', color: 'var(--gray)', fontSize: 13 }}>Cargando predicciones...</div>
+                                      ) : preds?.data?.length === 0 ? (
+                                        <div style={{ padding: '16px 0', color: 'var(--gray)', fontSize: 13 }}>Sin predicciones registradas.</div>
+                                      ) : preds?.data ? (
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, marginBottom: 4 }}>
+                                          <thead>
+                                            <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                                              {['Partido', 'Fecha', 'Predicción', 'Marcador exact.', 'Resultado real', 'Estado', 'Pts'].map(h => (
+                                                <th key={h} style={{ padding: '8px 10px', textAlign: 'left', color: 'var(--gray)', fontWeight: 500, textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.04em', whiteSpace: 'nowrap' }}>{h}</th>
+                                              ))}
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {preds.data.map(pr => {
+                                              const m = pr.matchId;
+                                              const winLabel = pr.predictedWinner === 'home' ? m?.homeTeam : pr.predictedWinner === 'away' ? m?.awayTeam : 'Empate';
+                                              const real = m?.status === 'finished' && m?.homeScore !== null
+                                                ? `${m.homeScore}–${m.awayScore}`
+                                                : m?.status === 'live' ? '🔴 En vivo' : 'Pendiente';
+                                              const acerto = pr.evaluated && pr.pointsEarned > 0;
+                                              const esExacto = pr.evaluated && pr.predictedHome !== null && pr.predictedHome === m?.homeScore && pr.predictedAway === m?.awayScore;
+                                              return (
+                                                <tr key={pr._id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                                                  <td style={{ padding: '8px 10px', fontWeight: 500, whiteSpace: 'nowrap' }}>
+                                                    {m?.homeTeam} vs {m?.awayTeam}
+                                                  </td>
+                                                  <td style={{ padding: '8px 10px', color: 'var(--gray)', whiteSpace: 'nowrap' }}>
+                                                    {m?.matchDate ? new Date(m.matchDate).toLocaleDateString('es-AR', { day: '2-digit', month: 'short' }) : '—'}
+                                                  </td>
+                                                  <td style={{ padding: '8px 10px' }}>
+                                                    <span style={{ color: pr.predictedWinner === 'home' ? '#93c5fd' : pr.predictedWinner === 'away' ? '#fca5a5' : '#d1d5db', fontWeight: 500 }}>
+                                                      {winLabel}
+                                                    </span>
+                                                  </td>
+                                                  <td style={{ padding: '8px 10px', color: 'var(--gray)' }}>
+                                                    {pr.predictedHome !== null ? `${pr.predictedHome}–${pr.predictedAway}` : '—'}
+                                                  </td>
+                                                  <td style={{ padding: '8px 10px', color: 'var(--gray)' }}>{real}</td>
+                                                  <td style={{ padding: '8px 10px' }}>
+                                                    {!pr.evaluated
+                                                      ? <span style={{ color: 'var(--gray)', fontSize: 11 }}>Pendiente</span>
+                                                      : esExacto
+                                                        ? <span style={{ color: '#a78bfa', fontWeight: 600 }}>⭐ Exacto</span>
+                                                        : acerto
+                                                          ? <span style={{ color: '#34d399', fontWeight: 600 }}>✓ Acertó</span>
+                                                          : <span style={{ color: '#ef4444' }}>✗ Falló</span>
+                                                    }
+                                                  </td>
+                                                  <td style={{ padding: '8px 10px', fontWeight: 700, color: pr.pointsEarned > 0 ? 'var(--gold)' : 'var(--gray)' }}>
+                                                    {pr.evaluated ? (pr.pointsEarned > 0 ? `+${pr.pointsEarned}` : '0') : '—'}
+                                                  </td>
+                                                </tr>
+                                              );
+                                            })}
+                                          </tbody>
+                                        </table>
+                                      ) : null}
+                                    </td>
+                                  </tr>
+                                )}
+                              </>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {filtered.length === 0 && (
+                      <div style={{ padding: '32px 20px', textAlign: 'center', color: 'var(--gray)' }}>
+                        No hay participantes en este filtro.
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* TAB: Bonificaciones */}
+        {tab === 'premios' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* ── Premiación automática del Top 3 (cupones reales) ──────────────── */}
+            <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 16 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 10 }}>
+                <div>
+                  <div style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <Trophy size={16} /> Premiación automática — Top 3
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--gray)', marginTop: 3, maxWidth: 480 }}>
+                    Genera y manda por WhatsApp los cupones reales del 1°, 2° y 3° puesto (1° recibe 4 semanas
+                    escalonadas automáticamente). Es seguro hacer click de nuevo: los puestos ya premiados se saltean.
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button className="btn btn-secondary" onClick={loadPrizesTop3} disabled={prizesTop3Loading}>
+                    <RefreshCw size={12} /> Actualizar
+                  </button>
+                  <button className="btn btn-primary" disabled={finalizingPrizes} onClick={() => setConfirmFinalize(true)}>
+                    {finalizingPrizes ? 'Premiando...' : '🏁 Finalizar y Premiar Top 3'}
+                  </button>
+                </div>
+              </div>
+
+              {confirmFinalize && (
+                <div style={{ marginTop: 12, padding: 12, background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.3)', borderRadius: 8 }}>
+                  <div style={{ fontSize: 13, marginBottom: 10 }}>
+                    ¿Confirmás finalizar el Prode y premiar al top 3 con el ranking actual? Se generan y envían
+                    cupones reales por WhatsApp ahora mismo.
+                  </div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="btn btn-primary" onClick={handleFinalizePrizes}>Sí, premiar ahora</button>
+                    <button className="btn btn-secondary" onClick={() => setConfirmFinalize(false)}>Cancelar</button>
+                  </div>
+                </div>
+              )}
+
+              <div style={{ marginTop: 14 }}>
+                {prizesTop3Loading ? (
+                  <div style={{ color: 'var(--gray)', fontSize: 13 }}>Cargando...</div>
+                ) : prizesTop3.length === 0 ? (
+                  <div style={{ color: 'var(--gray)', fontSize: 13 }}>Todavía no se premió a nadie en esta temporada.</div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {prizesTop3.map(p => (
+                      <div key={p._id} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 12 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 6 }}>
+                          <div style={{ fontWeight: 700 }}>#{p.position} · {p.clientName}</div>
+                          <div style={{ fontSize: 12, color: 'var(--gray)' }}>{p.prizeLabel}</div>
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                          {p.weeks.map(w => (
+                            <div key={w.label} style={{
+                              display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5,
+                              padding: '4px 8px', borderRadius: 6,
+                              background: w.sent ? 'rgba(74,222,128,0.1)' : 'rgba(255,255,255,0.05)',
+                              border: `1px solid ${w.sent ? 'rgba(74,222,128,0.3)' : 'var(--border)'}`,
+                              color: w.sent ? '#4ade80' : 'var(--gray)',
+                            }}>
+                              {w.sent ? <CheckCircle size={11} /> : <Calendar size={11} />}
+                              {w.label !== 'UNICO' ? w.label : ''} {w.couponCode || 'pendiente'}
+                              {!w.sent && ` · ${new Date(w.sendAt).toLocaleDateString('es-AR')}`}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {!premios ? (
+              <button className="btn btn-primary" disabled={premiosLoading} onClick={loadPremios}>
+                {premiosLoading ? 'Cargando...' : '🎁 Cargar segmentos de premio'}
+              </button>
+            ) : (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <button className="btn btn-secondary" onClick={loadPremios} disabled={premiosLoading}>
+                    <RefreshCw size={12} /> Actualizar
+                  </button>
+                </div>
+                {[
+                  { key: 'invitados', title: `🎟️ Invitados (cupón ${config?.guestCouponPercent || 20}%)`, desc: premios.cfg?.prizeInvitado },
+                  { key: 'clientes',  title: '🍔 Clientes sin entregas en el período', desc: premios.cfg?.prizeCliente },
+                  { key: 'top3',      title: '🏆 Top 3 competidores (≥1 entrega)', desc: 'Ranking filtrado' },
+                ].map(({ key, title, desc }) => (
+                  <div key={key} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 16 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>{title}</div>
+                    {desc && <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 12 }}>{desc}</div>}
+                    {(premios[key] || []).length === 0 ? (
+                      <div style={{ color: 'var(--gray)', fontSize: 13 }}>Ningún participante en este segmento.</div>
+                    ) : (
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                        <thead>
+                          <tr>
+                            {['Nombre', key === 'top3' ? 'Pos.' : 'Pts', key === 'invitados' ? 'Cupón' : 'Premio'].map(h => (
+                              <th key={h} style={{ textAlign: 'left', padding: '8px 10px', color: 'var(--gray)', fontSize: 11 }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(premios[key] || []).map((row, i) => (
+                            <tr key={row.clientId || i} style={{ borderTop: '1px solid var(--border)' }}>
+                              <td style={{ padding: '8px 10px' }}>{row.nombre}</td>
+                              <td style={{ padding: '8px 10px' }}>{key === 'top3' ? `#${row.posicion}` : row.totalPuntos}</td>
+                              <td style={{ padding: '8px 10px', color: 'var(--gray)' }}>{row.cuponInvitado || row.premio || '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        )}
+
+        {tab === 'bonificaciones' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 15, color: 'var(--text)' }}>Bonificaciones de puntos</div>
+                <div style={{ fontSize: 12, color: 'var(--gray)', marginTop: 3 }}>
+                  Se evalúan automáticamente al confirmar cada pedido durante el período activo del prode.
+                </div>
+              </div>
+              <button className="btn btn-primary" onClick={() => setShowAddBon(true)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <Plus size={14} /> Nueva
+              </button>
+            </div>
+
+            {bonificaciones.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--gray)', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12 }}>
+                <Gift size={32} style={{ opacity: 0.3, display: 'block', margin: '0 auto 12px' }} />
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Sin bonificaciones configuradas</div>
+                <div style={{ fontSize: 13 }}>Agregá condiciones para dar puntos extra a los clientes</div>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {bonificaciones.map((bon, idx) => (
+                  <div key={idx} style={{
+                    background: 'var(--card)', border: `1px solid ${bon.activa ? 'var(--border)' : 'rgba(255,255,255,0.04)'}`,
+                    borderRadius: 10, padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 14,
+                    opacity: bon.activa ? 1 : 0.5,
+                  }}>
+                    <div style={{ fontSize: 22 }}>{TIPO_LABELS[bon.tipo]?.emoji || '🎁'}</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 600, color: 'var(--text)', fontSize: 14 }}>
+                        {bon.descripcion || TIPO_LABELS[bon.tipo]?.label}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--gray)', marginTop: 2 }}>
+                        {bon.tipo === 'gasto_minimo' && `Gastar ≥ ${fmtPeso(bon.montoMinimo)} → +${bon.puntos} pts`}
+                        {bon.tipo === 'por_cada_x' && `Cada ${fmtPeso(bon.montoMinimo)} gastado → +${bon.puntos} pts`}
+                        {bon.tipo === 'producto' && `Comprar "${bon.productoNombre}" → +${bon.puntos} pts`}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{
+                        background: bon.activa ? 'rgba(52,211,153,0.12)' : 'rgba(239,68,68,0.1)',
+                        color: bon.activa ? '#34d399' : '#ef4444',
+                        fontSize: 11, padding: '3px 10px', borderRadius: 99, fontWeight: 600
+                      }}>
+                        {bon.activa ? 'Activa' : 'Inactiva'}
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={bon.activa}
+                        onChange={e => handleToggleBon(idx, e.target.checked)}
+                        title={bon.activa ? 'Desactivar' : 'Activar'}
+                        style={{ cursor: 'pointer' }}
+                      />
+                      <button onClick={() => handleDeleteBon(idx)}
+                        style={{ background: 'transparent', border: 'none', color: '#ef4444', cursor: 'pointer', opacity: 0.6, padding: 4 }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB: Predicciones */}
+        {tab === 'predicciones' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* Selector de partido */}
+            <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+              <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Eye size={16} color="var(--gold)" /> Ver predicciones por partido
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 16 }}>
+                Seleccioná un partido para ver qué pronosticó cada cliente. Los pronósticos del cliente son datos propios de la plataforma y su consulta es completamente válida.
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div style={{ flex: 1, minWidth: 220 }}>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 6 }}>Partido</label>
+                  <select
+                    value={predsMatchId}
+                    onChange={e => { setPredsMatchId(e.target.value); setPredsData([]); }}
+                    style={{ width: '100%' }}
+                  >
+                    <option value="">— Seleccioná un partido —</option>
+                    {fixture.map(m => (
+                      <option key={m._id} value={m._id}>
+                        {m.homeTeam} vs {m.awayTeam} · {new Date(m.matchDate).toLocaleDateString('es-AR', { day: '2-digit', month: 'short' })} · {m.status === 'finished' ? (m.homeScore !== null && m.awayScore !== null ? `${m.homeScore}-${m.awayScore}` : 'FIN (sin score)') : m.status === 'live' ? '🔴 EN VIVO' : 'Programado'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  className="btn btn-primary"
+                  disabled={!predsMatchId || predsLoading}
+                  onClick={() => loadPrediccionesByMatch(predsMatchId)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}
+                >
+                  <Search size={14} />
+                  {predsLoading ? 'Cargando...' : 'Ver predicciones'}
+                </button>
+              </div>
+            </div>
+
+            {/* Resultados */}
+            {predsLoading && (
+              <div style={{ textAlign: 'center', padding: 40, color: 'var(--gray)' }}>
+                <div className="spinner" style={{ margin: '0 auto 12px' }} />
+                Cargando predicciones...
+              </div>
+            )}
+
+            {!predsLoading && predsData.length > 0 && (() => {
+              const match = fixture.find(m => m._id === predsMatchId);
+              const total = predsData.length;
+              const homeVotes  = predsData.filter(p => p.predictedWinner === 'home').length;
+              const awayVotes  = predsData.filter(p => p.predictedWinner === 'away').length;
+              const drawVotes  = predsData.filter(p => p.predictedWinner === 'draw').length;
+              const exactos    = predsData.filter(p => p.pointsEarned >= (config?.pointsWinner || 1) + (config?.pointsExact || 5)).length;
+              const acertaron  = predsData.filter(p => p.evaluated && p.pointsEarned > 0).length;
+
+              return (
+                <>
+                  {/* Resumen estadístico */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 10 }}>
+                    {[
+                      { label: 'Total pronósticos', value: total, color: '#E8B84B' },
+                      { label: match?.homeTeam || 'Local',  value: `${homeVotes} (${total ? Math.round(homeVotes/total*100) : 0}%)`, color: '#60a5fa' },
+                      { label: 'Empate',             value: `${drawVotes} (${total ? Math.round(drawVotes/total*100) : 0}%)`, color: '#9ca3af' },
+                      { label: match?.awayTeam || 'Visitante', value: `${awayVotes} (${total ? Math.round(awayVotes/total*100) : 0}%)`, color: '#f87171' },
+                      ...(match?.status === 'finished' ? [
+                        { label: 'Acertaron ganador', value: acertaron, color: '#34d399' },
+                        { label: 'Exacto',            value: exactos,   color: '#a78bfa' },
+                      ] : []),
+                    ].map(({ label, value, color }) => (
+                      <div key={label} style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px' }}>
+                        <div style={{ fontSize: 11, color: 'var(--gray)', marginBottom: 4 }}>{label}</div>
+                        <div style={{ fontSize: 20, fontWeight: 700, color }}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Tabla */}
+                  <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+                    <div style={{ padding: '14px 18px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div style={{ fontWeight: 600, fontSize: 14 }}>
+                        {match?.homeTeam} vs {match?.awayTeam}
+                        {match?.status === 'finished' && (
+                          <span style={{ marginLeft: 10, color: 'var(--gold)', fontSize: 13 }}>
+                            Resultado: {match.homeScore !== null && match.awayScore !== null ? `${match.homeScore} – ${match.awayScore}` : 'Pendiente'}
+                          </span>
+                        )}
+                      </div>
+                      <span style={{ fontSize: 12, color: 'var(--gray)' }}>{total} pronósticos</span>
+                    </div>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                        <thead>
+                          <tr style={{ background: 'rgba(255,255,255,0.03)' }}>
+                            {['Cliente', 'WhatsApp', 'Pronóstico', 'Marcador exacto', 'Estado', 'Puntos'].map(h => (
+                              <th key={h} style={{ padding: '10px 14px', textAlign: 'left', color: 'var(--gray)', fontWeight: 500, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {predsData.map((p, i) => {
+                            const winnerLabel =
+                              p.predictedWinner === 'home' ? match?.homeTeam :
+                              p.predictedWinner === 'away' ? match?.awayTeam : 'Empate';
+                            const acerto = p.evaluated && p.pointsEarned > 0;
+                            const esExacto = p.evaluated && p.predictedHome !== null &&
+                              p.predictedHome === match?.homeScore && p.predictedAway === match?.awayScore;
+                            return (
+                              <tr key={p._id} style={{ borderBottom: '1px solid var(--border)', background: i % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)' }}>
+                                <td style={{ padding: '11px 14px', fontWeight: 500, color: 'var(--text)' }}>
+                                  {p.client?.name || <span style={{ color: 'var(--gray)' }}>Desconocido</span>}
+                                </td>
+                                <td style={{ padding: '11px 14px', color: 'var(--gray)', fontSize: 12 }}>
+                                  {p.client?.whatsapp || p.client?.phone || '—'}
+                                </td>
+                                <td style={{ padding: '11px 14px' }}>
+                                  <span style={{
+                                    background: p.predictedWinner === 'home' ? 'rgba(96,165,250,0.12)' : p.predictedWinner === 'away' ? 'rgba(248,113,113,0.12)' : 'rgba(156,163,175,0.12)',
+                                    color: p.predictedWinner === 'home' ? '#93c5fd' : p.predictedWinner === 'away' ? '#fca5a5' : '#d1d5db',
+                                    fontSize: 12, padding: '3px 10px', borderRadius: 99, fontWeight: 500,
+                                  }}>
+                                    {winnerLabel}
+                                  </span>
+                                </td>
+                                <td style={{ padding: '11px 14px', color: 'var(--gray)', fontSize: 13 }}>
+                                  {p.predictedHome !== null ? `${p.predictedHome} – ${p.predictedAway}` : <span style={{ opacity: 0.4 }}>—</span>}
+                                </td>
+                                <td style={{ padding: '11px 14px' }}>
+                                  {!p.evaluated ? (
+                                    <span style={{ fontSize: 12, color: 'var(--gray)' }}>Pendiente</span>
+                                  ) : esExacto ? (
+                                    <span style={{ fontSize: 12, background: 'rgba(167,139,250,0.12)', color: '#a78bfa', padding: '3px 10px', borderRadius: 99 }}>⭐ Exacto</span>
+                                  ) : acerto ? (
+                                    <span style={{ fontSize: 12, background: 'rgba(52,211,153,0.12)', color: '#34d399', padding: '3px 10px', borderRadius: 99 }}>✓ Acertó</span>
+                                  ) : (
+                                    <span style={{ fontSize: 12, background: 'rgba(239,68,68,0.1)', color: '#ef4444', padding: '3px 10px', borderRadius: 99 }}>✗ Falló</span>
+                                  )}
+                                </td>
+                                <td style={{ padding: '11px 14px', fontWeight: 700, color: p.pointsEarned > 0 ? 'var(--gold)' : 'var(--gray)' }}>
+                                  {p.evaluated ? `${p.pointsEarned > 0 ? '+' : ''}${p.pointsEarned}` : '—'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+
+            {!predsLoading && predsMatchId && predsData.length === 0 && !predsLoading && (
+              <div style={{ textAlign: 'center', padding: '40px 20px', color: 'var(--gray)', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12 }}>
+                <Eye size={32} style={{ opacity: 0.3, display: 'block', margin: '0 auto 12px' }} />
+                <div style={{ fontWeight: 600 }}>Sin pronósticos aún</div>
+                <div style={{ fontSize: 13, marginTop: 4 }}>Ningún cliente ha pronosticado este partido</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB: Términos & Premios */}
+        {tab === 'terminos' && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {/* Premios */}
+            <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                🏆 Premios
+              </h3>
+              <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 16 }}>
+                Estos textos aparecen en la sección "Premios" de las bases y condiciones que ven los clientes.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {[
+                  { key: 'prizeInvitado', label: '🎟️ Premio invitados', placeholder: 'Cupón 20% en tu primera compra' },
+                  { key: 'prizeCliente',  label: '🍔 Premio clientes (sin compras en el Mundial)', placeholder: 'Combo doble a elección' },
+                  { key: 'prize1', label: '🥇 1° Puesto (competidores)', placeholder: 'Premio mayor a definir' },
+                  { key: 'prize2', label: '🥈 2° Puesto', placeholder: 'Premio medio a definir' },
+                  { key: 'prize3', label: '🥉 3° Puesto', placeholder: 'Premio menor a definir' },
+                ].map(({ key, label, placeholder }) => (
+                  <div key={key}>
+                    <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 5 }}>{label}</label>
+                    <input
+                      type="text"
+                      value={cfgForm[key] || ''}
+                      onChange={e => setCfgForm(p => ({ ...p, [key]: e.target.value }))}
+                      placeholder={placeholder}
+                      style={{ width: '100%' }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Términos */}
+            <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <FileText size={15} color="var(--gold)" /> Reglas del ranking
+              </h3>
+              <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 12, lineHeight: 1.6 }}>
+                Ranking = pronósticos + bonus de categoría (máx. 6 pts). Las compras cuentan al <b>entregar</b> el pedido.
+                Bonus +3 al pasar a Cliente (invitado, 1.ª entrega) y +3 al llegar a VIP (2 entregas en el período).
+              </div>
+
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <FileText size={15} color="var(--gold)" /> Términos personalizados
+              </h3>
+              <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 12 }}>
+                Texto libre que aparece en las bases. Podés usar saltos de línea.
+              </div>
+              <textarea
+                value={cfgForm.termsExtra || ''}
+                onChange={e => setCfgForm(p => ({ ...p, termsExtra: e.target.value }))}
+                rows={8}
+                placeholder="Agregá aclaraciones, reglas extra, datos de contacto, etc..."
+                style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit', fontSize: 13, lineHeight: 1.6 }}
+              />
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button className="btn btn-primary" onClick={handleSaveConfig} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <CheckCircle size={15} /> Guardar términos y premios
+              </button>
+            </div>
+
+            {/* Herramientas de mantenimiento */}
+            <div style={{ background: 'var(--card)', border: '1px solid #7f1d1d', borderRadius: 12, padding: 20 }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4, color: '#fca5a5', display: 'flex', alignItems: 'center', gap: 8 }}>
+                ⚙️ Herramientas de mantenimiento
+              </h3>
+              <div style={{ fontSize: 12, color: 'var(--gray)', marginBottom: 16, lineHeight: 1.6 }}>
+                Acciones para corregir datos. Usá solo si detectás inconsistencias en los puntos.
+              </div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleReEvaluar}
+                  disabled={reEvalLoading}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  {reEvalLoading ? '⏳ Procesando...' : '🔄 Re-evaluar todos los partidos (corregir puntos)'}
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 10, lineHeight: 1.5 }}>
+                Re-evaluar: resetea y recalcula los puntos de todos los partidos ya terminados. <b>No borra pronósticos.</b>
+                Necesario si los puntos de algún cliente no coinciden con lo esperado.
+              </div>
+
+              <div style={{ borderTop: '1px solid var(--border)', marginTop: 16, paddingTop: 16 }}>
+                <h4 style={{ fontSize: 13, fontWeight: 700, marginBottom: 8, color: 'var(--text)' }}>
+                  Acciones sobre un cliente puntual
+                </h4>
+                <select
+                  value={resetClientId}
+                  onChange={e => setResetClientId(e.target.value)}
+                  style={{ width: '100%', marginBottom: 10 }}
+                >
+                  <option value="">Seleccioná un cliente del ranking...</option>
+                  {ranking.map(r => (
+                    <option key={r.clientId} value={r.clientId}>{r.nombre}</option>
+                  ))}
+                </select>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={handleRecalcCliente}
+                    disabled={!resetClientId || recalcLoading}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    {recalcLoading ? '⏳ Procesando...' : '🔄 Recalcular puntos de este cliente'}
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    onClick={handleResetCliente}
+                    disabled={!resetClientId || resetLoading}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    {resetLoading ? '⏳ Procesando...' : '🗑️ Borrar todas sus predicciones y puntos'}
+                  </button>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 10, lineHeight: 1.5 }}>
+                  <b>Recalcular:</b> resetea y vuelve a evaluar solo los pronósticos de este cliente sobre partidos ya terminados; no toca a los demás.<br />
+                  <b>Borrar:</b> elimina por completo sus pronósticos y puntos (irreversible).
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+
+        {/* TAB: Mensajes */}
+        {tab === 'mensajes' && (() => {
+          const SEGMENTOS = [
+            { id: 'todos',      label: 'Todos',       emoji: '👥' },
+            { id: 'invitado',   label: 'Invitados',   emoji: '🎟️' },
+            { id: 'cliente',    label: 'Clientes',    emoji: '🍔' },
+            { id: 'competidor', label: 'Competidores',emoji: '🏆' },
+          ];
+          const PERIODOS = [
+            { id: 'ultimas24h', label: 'Últimas 24 hs' },
+            { id: 'ultimas48h', label: 'Últimas 48 hs' },
+            { id: 'semana',     label: 'Última semana' },
+            { id: 'todo',       label: 'Todo el prode' },
+          ];
+
+          const handlePreview = async () => {
+            setNotifLoading(true);
+            setNotifResult(null);
+            setNotifSelected([]);
+            try {
+              const params = new URLSearchParams({
+                segmento:      notifSegmento,
+                periodo:       notifPeriodo,
+                soloConPuntos: notifSoloConPts ? '1' : '0',
+              });
+              const { data } = await API.get(`/prode/notificaciones/preview?${params}`, { timeout: 30000 });
+              setNotifPreview(data);
+            } catch (e) {
+              console.error('❌ /prode/notificaciones/preview falló:', e.response?.data || e.message);
+              toast.error('Error cargando preview');
+            }
+            finally { setNotifLoading(false); }
+          };
+
+          const handleEnviar = async () => {
+            if (!notifPreview) return;
+            const destinos = notifSelected.length > 0 ? notifSelected : null;
+            const cantidad = destinos ? destinos.length : notifPreview.conWa;
+            if (!window.confirm(`¿Enviar mensaje a ${cantidad} participante${cantidad !== 1 ? 's' : ''} por WhatsApp?`)) return;
+
+            setNotifSending(true);
+            setNotifResult(null);
+            try {
+              const { data } = await API.post('/prode/notificaciones/enviar', {
+                segmento:      notifSegmento,
+                periodo:       notifPeriodo,
+                soloConPuntos: notifSoloConPts,
+                mensajeCustom: notifUsarCustom && notifMsgCustom.trim() ? notifMsgCustom : null,
+                clientIds:     destinos,
+              }, { timeout: 60000 });
+              setNotifResult(data);
+              toast.success(`✅ ${data.sent} mensaje${data.sent !== 1 ? 's' : ''} enviado${data.sent !== 1 ? 's' : ''}`);
+            } catch (e) {
+              console.error('❌ /prode/notificaciones/enviar falló:', e.response?.data || e.message);
+              toast.error('Error enviando mensajes');
+            }
+            finally { setNotifSending(false); }
+          };
+
+          const toggleSelected = (cid) => {
+            setNotifSelected(prev =>
+              prev.includes(cid) ? prev.filter(x => x !== cid) : [...prev, cid]
+            );
+          };
+
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+
+              {/* Filtros */}
+              <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+                <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  📲 Envío manual de mensajes
+                </h3>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+                  {/* Segmento */}
+                  <div>
+                    <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 8 }}>Segmento</label>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {SEGMENTOS.map(s => (
+                        <button key={s.id} onClick={() => { setNotifSegmento(s.id); setNotifPreview(null); }}
+                          style={{ padding: '5px 12px', borderRadius: 99, fontSize: 12, border: '1px solid',
+                            borderColor: notifSegmento === s.id ? 'var(--gold)' : 'var(--border)',
+                            background:  notifSegmento === s.id ? 'rgba(232,184,75,0.1)' : 'transparent',
+                            color:       notifSegmento === s.id ? 'var(--gold)' : 'var(--gray)',
+                            cursor: 'pointer' }}>
+                          {s.emoji} {s.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Período */}
+                  <div>
+                    <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 8 }}>Período de resultados</label>
+                    <select value={notifPeriodo}
+                      onChange={e => { setNotifPeriodo(e.target.value); setNotifPreview(null); }}
+                      style={{ width: '100%' }}>
+                      {PERIODOS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Opciones adicionales */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={notifSoloConPts}
+                      onChange={e => { setNotifSoloConPts(e.target.checked); setNotifPreview(null); }} />
+                    Solo participantes con puntos
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={notifUsarCustom}
+                      onChange={e => setNotifUsarCustom(e.target.checked)} />
+                    Usar mensaje personalizado
+                  </label>
+                </div>
+
+                {/* Mensaje personalizado */}
+                {notifUsarCustom && (
+                  <div style={{ marginBottom: 16 }}>
+                    <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 6 }}>
+                      Mensaje personalizado — usá <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 4 }}>{'{{nombre}}'}</code> para insertar el nombre
+                    </label>
+                    <textarea
+                      value={notifMsgCustom}
+                      onChange={e => setNotifMsgCustom(e.target.value)}
+                      rows={5}
+                      placeholder={"🏆 *Prode Janz*\n\n¡Hola {{nombre}}! Recordá que podés ver tu ranking en el prode.\n\n_Janz Burgers_ 🍔⚽"}
+                      style={{ width: '100%', resize: 'vertical', fontFamily: 'monospace', fontSize: 12, lineHeight: 1.6 }}
+                    />
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <button className="btn btn-secondary" onClick={handlePreview} disabled={notifLoading}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {notifLoading ? '⏳ Cargando...' : '👁 Ver destinatarios'}
+                  </button>
+                  {notifPreview && (
+                    <button className="btn btn-primary" onClick={handleEnviar} disabled={notifSending}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {notifSending
+                        ? '⏳ Enviando...'
+                        : `📲 Enviar a ${notifSelected.length > 0 ? notifSelected.length + ' seleccionados' : notifPreview.conWa + ' con WA'}`}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Preview de destinatarios */}
+              {notifPreview && (
+                <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                    <h3 style={{ fontSize: 15, fontWeight: 700 }}>
+                      Destinatarios — {notifPreview.total} total
+                    </h3>
+                    <div style={{ display: 'flex', gap: 10, fontSize: 12 }}>
+                      <span style={{ color: '#4ade80' }}>✅ {notifPreview.conWa} con WA</span>
+                      {notifPreview.sinWa > 0 && <span style={{ color: 'var(--gray)' }}>⚠️ {notifPreview.sinWa} sin WA</span>}
+                      {notifSelected.length > 0 && (
+                        <button onClick={() => setNotifSelected([])}
+                          style={{ background: 'none', border: 'none', color: 'var(--gold)', cursor: 'pointer', fontSize: 12 }}>
+                          Limpiar selección ({notifSelected.length})
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {notifPreview.destinatarios.map(d => (
+                      <div key={d.clientId}
+                        onClick={() => !d.sinWa && toggleSelected(d.clientId)}
+                        style={{ background: 'var(--bg)', border: `1px solid ${notifSelected.includes(d.clientId) ? 'var(--gold)' : 'var(--border)'}`,
+                          borderRadius: 10, padding: '10px 14px', opacity: d.sinWa ? 0.45 : 1,
+                          width: '100%', boxSizing: 'border-box', cursor: d.sinWa ? 'default' : 'pointer' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: '100%' }}>
+                          <input type="checkbox" disabled={d.sinWa}
+                            checked={notifSelected.includes(d.clientId)}
+                            onChange={() => toggleSelected(d.clientId)}
+                            onClick={e => e.stopPropagation()}
+                            style={{ cursor: d.sinWa ? 'default' : 'pointer', flexShrink: 0 }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                              <span style={{ fontWeight: 600, fontSize: 13 }}>{d.nombre}</span>
+                              <span style={{ fontSize: 11, background: 'var(--border)', borderRadius: 99, padding: '1px 7px', color: 'var(--gray)' }}>
+                                {d.categoria}
+                              </span>
+                              <span style={{ fontSize: 12, color: 'var(--gold)' }}>{d.puntos} pts</span>
+                              {d.partidos > 0 && <span style={{ fontSize: 11, color: 'var(--gray)' }}>{d.partidos} partido{d.partidos !== 1 ? 's' : ''}</span>}
+                              {d.sinWa && <span style={{ fontSize: 11, color: '#f87171' }}>sin WA</span>}
+                            </div>
+                            {d.whatsapp && <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 2 }}>{d.whatsapp}</div>}
+                          </div>
+                          {!notifUsarCustom && (
+                            <button onClick={e => { e.stopPropagation(); setNotifExpandMsg(notifExpandMsg === d.clientId ? null : d.clientId); }}
+                              style={{ background: 'none', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 8px',
+                                fontSize: 11, color: 'var(--gray)', cursor: 'pointer', flexShrink: 0 }}>
+                              {notifExpandMsg === d.clientId ? '▲ ocultar' : '👁 ver msg'}
+                            </button>
+                          )}
+                        </div>
+                        {/* Preview del mensaje individual */}
+                        {notifExpandMsg === d.clientId && (
+                          <pre style={{ marginTop: 10, background: 'rgba(0,0,0,0.3)', borderRadius: 8, padding: 12,
+                            fontSize: 11, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                            color: '#ccc', border: '1px solid var(--border)', fontFamily: 'inherit' }}>
+                            {d.msgPreview}
+                          </pre>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Resultado del envío */}
+              {notifResult && (
+                <div style={{ background: 'var(--card)', border: '1px solid #166534', borderRadius: 12, padding: 20 }}>
+                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 12, color: '#4ade80' }}>
+                    ✅ Envío completado
+                  </h3>
+                  <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap', fontSize: 13, marginBottom: 14 }}>
+                    <span>📲 Enviados: <strong>{notifResult.sent}</strong></span>
+                    <span style={{ color: 'var(--gray)' }}>⏭ Saltados: <strong>{notifResult.skipped}</strong></span>
+                    {notifResult.errors > 0 && <span style={{ color: '#f87171' }}>❌ Errores: <strong>{notifResult.errors}</strong></span>}
+                  </div>
+                  {notifResult.detalle?.filter(d => d.estado === 'error').map((d, i) => (
+                    <div key={i} style={{ fontSize: 12, color: '#f87171' }}>⚠️ {d.nombre}: {d.error}</div>
+                  ))}
+                </div>
+              )}
+
+            </div>
+          );
+        })()}
+
+      </div>
+
+      {/* Modal: Nueva bonificación */}
+      {showAddBon && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 20 }}>
+          <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 14, padding: 28, width: 460, maxWidth: '95vw' }}>
+            <h2 style={{ marginBottom: 20, fontSize: 17, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Gift size={18} color="var(--gold)" /> Nueva bonificación
+            </h2>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Tipo de bonificación</label>
+                <select value={bonForm.tipo} onChange={e => setBonForm(p => ({ ...p, tipo: e.target.value, productoId: '', productoNombre: '' }))} style={{ width: '100%' }}>
+                  {Object.entries(TIPO_LABELS).map(([k, v]) => (
+                    <option key={k} value={k}>{v.emoji} {v.label} — {v.desc}</option>
+                  ))}
+                </select>
+              </div>
+
+              {(bonForm.tipo === 'gasto_minimo' || bonForm.tipo === 'por_cada_x') && (
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>
+                    {bonForm.tipo === 'gasto_minimo' ? 'Monto mínimo ($)' : 'Cada cuántos pesos ($)'}
+                  </label>
+                  <input type="number" min={1} value={bonForm.montoMinimo}
+                    onChange={e => setBonForm(p => ({ ...p, montoMinimo: e.target.value }))}
+                    placeholder={bonForm.tipo === 'gasto_minimo' ? 'ej: 5000' : 'ej: 1000'} />
+                </div>
+              )}
+
+              {bonForm.tipo === 'producto' && (
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Producto</label>
+                  <select value={bonForm.productoId}
+                    onChange={e => {
+                      const p = products.find(p => p._id === e.target.value);
+                      setBonForm(prev => ({ ...prev, productoId: e.target.value, productoNombre: p?.name || '' }));
+                    }}
+                    style={{ width: '100%' }}>
+                    <option value="">— Seleccioná un producto —</option>
+                    {products.map(p => <option key={p._id} value={p._id}>{p.name} {p.variant}</option>)}
+                  </select>
+                </div>
+              )}
+
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Puntos a otorgar</label>
+                <input type="number" min={1} value={bonForm.puntos}
+                  onChange={e => setBonForm(p => ({ ...p, puntos: Number(e.target.value) }))} />
+              </div>
+
+              <div>
+                <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Descripción (opcional)</label>
+                <input type="text" value={bonForm.descripcion}
+                  onChange={e => setBonForm(p => ({ ...p, descripcion: e.target.value }))}
+                  placeholder="ej: Bonus por gastar más de $5000" />
+              </div>
+
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 22 }}>
+              <button className="btn btn-secondary" onClick={() => setShowAddBon(false)}>Cancelar</button>
+              <button className="btn btn-primary" onClick={handleAddBonificacion}>Agregar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal configuración */}
+      {editConfig && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 14, padding: 28, width: 480, maxWidth: '95vw', maxHeight: '90vh', overflowY: 'auto' }}>
+            <h2 style={{ marginBottom: 20, fontSize: 18, fontWeight: 600 }}>Configuración del Prode</h2>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 14 }}>
+                <input type="checkbox" checked={cfgForm.enabled || false}
+                  onChange={e => setCfgForm(p => ({ ...p, enabled: e.target.checked }))} />
+                Prode habilitado
+              </label>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Fecha inicio (compras)</label>
+                  <input type="date" value={cfgForm.startDate ? cfgForm.startDate.split('T')[0] : ''}
+                    onChange={e => setCfgForm(p => ({ ...p, startDate: e.target.value }))} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Fecha fin (compras)</label>
+                  <input type="date" value={cfgForm.endDate ? cfgForm.endDate.split('T')[0] : ''}
+                    onChange={e => setCfgForm(p => ({ ...p, endDate: e.target.value }))} />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Pts por ganador</label>
+                  <input type="number" min={1} value={cfgForm.pointsWinner ?? 3}
+                    onChange={e => setCfgForm(p => ({ ...p, pointsWinner: Number(e.target.value) }))} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Pts extra exacto (se suma al ganador)</label>
+                  <input type="number" min={0} value={cfgForm.pointsExact ?? 3}
+                    onChange={e => setCfgForm(p => ({ ...p, pointsExact: Number(e.target.value) }))} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Pts bonus Cliente / VIP</label>
+                  <input type="number" min={0} value={cfgForm.pointsCategoryCliente ?? 3}
+                    onChange={e => setCfgForm(p => ({ ...p, pointsCategoryCliente: Number(e.target.value), pointsCategoryVip: Number(e.target.value) }))} />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>Bloqueo pronósticos (minutos antes del partido)</label>
+                  <input type="number" min={0} value={cfgForm.cutoffMinutes || 30}
+                    onChange={e => setCfgForm(p => ({ ...p, cutoffMinutes: Number(e.target.value) }))} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>⏰ Hora de envío de reportes diarios (0–23 hs, Argentina)</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <input type="number" min={0} max={23} value={cfgForm.notifHour ?? 9}
+                      onChange={e => setCfgForm(p => ({ ...p, notifHour: Number(e.target.value) }))}
+                      style={{ flex: 1 }} />
+                    <span style={{ color: 'var(--gray)', fontSize: 14, paddingRight: 2 }}>hs</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 4, lineHeight: 1.4 }}>Se aplica al reiniciar el servidor. Actualmente: {String(cfgForm.notifHour ?? 9).padStart(2,'0')}:00 hs.</div>
+                </div>
+                <div>
+                  <label style={{ fontSize: 12, color: 'var(--gray)', display: 'block', marginBottom: 4 }}>% descuento cupón invitados</label>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <input type="number" min={1} max={100} value={cfgForm.guestCouponPercent ?? 20}
+                      onChange={e => setCfgForm(p => ({ ...p, guestCouponPercent: Number(e.target.value) }))}
+                      style={{ flex: 1 }} />
+                    <span style={{ color: 'var(--gray)', fontSize: 16, fontWeight: 600, paddingRight: 2 }}>%</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--gray)', marginTop: 4, lineHeight: 1.4 }}>Solo aplica a nuevos cupones.</div>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 20 }}>
+              <button className="btn btn-secondary" onClick={() => setEditConfig(false)}>Cancelar</button>
+              <button className="btn btn-primary" onClick={handleSaveConfig}>Guardar</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
 }
 
-// ── GET predicciones públicas de TODOS los partidos revelados, en una sola
-//    consulta (sin auth) ────────────────────────────────────────────────────
-// Reemplaza N llamados individuales (uno por partido ya arrancado) por uno
-// solo. Evita que el frontend dispare decenas de requests simultáneos a
-// medida que avanza el Mundial y hay más partidos ya jugados.
-router.get('/predicciones-publicas', async (req, res) => {
-  try {
-    const matches = await ProdeMatch.find().select('matchDate').lean();
+// ── Componente fila de partido ────────────────────────────────────────────────
+function MatchRow({ match, onSetResultado, statusBadge, onConfirmTeams }) {
+  const [editScore,  setEditScore ] = useState(false);
+  const [editTeams,  setEditTeams ] = useState(false);
+  const [home,       setHome      ] = useState('');
+  const [away,       setAway      ] = useState('');
+  const [homeTeam,   setHomeTeam  ] = useState(match.homeTeam);
+  const [awayTeam,   setAwayTeam  ] = useState(match.awayTeam);
+  const [saving,     setSaving    ] = useState(false);
 
-    const REVEAL_MS = 5 * 60 * 1000;
-    const now = Date.now();
-    const result = {};
-    const revealedIds = [];
+  const d       = new Date(match.matchDate);
+  const dateStr = d.toLocaleDateString('es-AR', { day: '2-digit', month: 'short' });
+  const timeStr = d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+  const isTBD   = match.teamsConfirmed === false;
 
-    for (const match of matches) {
-      const revealAt = new Date(match.matchDate.getTime() + REVEAL_MS);
-      const revealed = now >= revealAt.getTime();
-      if (revealed) {
-        revealedIds.push(match._id);
-      } else {
-        result[match._id] = { revealed: false, revealAt };
-      }
-    }
+  const handleGuardar = () => {
+    const h = home !== '' ? Number(home) : 0;
+    const a = away !== '' ? Number(away) : 0;
+    onSetResultado(match._id, h, a);
+    setEditScore(false);
+  };
 
-    if (revealedIds.length > 0) {
-      // Ranking calculado UNA sola vez para todos los partidos revelados
-      // (en vez de una vez por partido como antes)
-      const ranking = await getCachedRanking();
-      const top10   = ranking.slice(0, 10);
-      const clientIds = top10.map(r => r.clientId);
+  const handleSubmitTeams = async () => {
+    if (!homeTeam.trim() || !awayTeam.trim()) return;
+    setSaving(true);
+    try {
+      await onConfirmTeams(match._id, homeTeam.trim(), awayTeam.trim());
+      setEditTeams(false);
+    } finally { setSaving(false); }
+  };
 
-      // Pronósticos del top10 para TODOS los partidos revelados, en una sola query
-      const pronosticos = await Pronostico.find({
-        matchId:  { $in: revealedIds },
-        clientId: { $in: clientIds },
-      }).lean();
+  return (
+    <div style={{ background: 'var(--card)', border: `1px solid ${isTBD ? 'rgba(234,179,8,0.25)' : 'var(--border)'}`, borderRadius: 10, padding: '12px 14px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <div style={{ fontSize: 11, color: 'var(--gray)', minWidth: 64, flexShrink: 0, lineHeight: 1.4 }}>{dateStr}<br/>{timeStr}</div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 8, minWidth: 180 }}>
+          <span style={{ fontWeight: 500, color: isTBD ? '#555' : 'var(--text)', textAlign: 'right', flex: 1, fontSize: 13, fontStyle: isTBD ? 'italic' : 'normal' }}>{match.homeTeam}</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: match.status === 'finished' ? 'var(--gold)' : 'var(--gray)', minWidth: 44, textAlign: 'center', flexShrink: 0 }}>
+            {match.status === 'finished'
+              ? (match.homeScore !== null && match.awayScore !== null
+                  ? `${match.homeScore}–${match.awayScore}`
+                  : '— FIN —')
+              : match.status === 'live' ? '🔴' : 'vs'}
+          </span>
+          <span style={{ fontWeight: 500, color: isTBD ? '#555' : 'var(--text)', flex: 1, fontSize: 13, fontStyle: isTBD ? 'italic' : 'normal' }}>{match.awayTeam}</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          {isTBD && (
+            <span style={{ fontSize: 10, fontWeight: 700, background: 'rgba(234,179,8,0.1)', color: '#ca8a04', border: '1px solid rgba(234,179,8,0.25)', borderRadius: 4, padding: '2px 6px', letterSpacing: '0.05em' }}>
+              ⏳ POR CONFIRMAR
+            </span>
+          )}
+          {statusBadge(match.status)}
+        </div>
+      </div>
 
-      const pronoByKey = {};
-      for (const p of pronosticos) {
-        pronoByKey[`${p.matchId}_${p.clientId}`] = p;
-      }
+      {/* ── Acciones (scheduled y live — live puede necesitar carga manual de resultado) */}
+      {(match.status === 'scheduled' || match.status === 'live') && (
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--border)', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {/* Cargar resultado */}
+          {!isTBD && (
+            editScore ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 12, color: 'var(--gray)' }}>Resultado:</span>
+                <input type="number" min={0} max={20} value={home} onChange={e => setHome(e.target.value)}
+                  style={{ width: 52, padding: '5px 6px', fontSize: 14, textAlign: 'center' }} placeholder="0" />
+                <span style={{ color: 'var(--gray)', fontWeight: 700 }}>–</span>
+                <input type="number" min={0} max={20} value={away} onChange={e => setAway(e.target.value)}
+                  style={{ width: 52, padding: '5px 6px', fontSize: 14, textAlign: 'center' }} placeholder="0" />
+                <button onClick={handleGuardar} style={{ background: '#166534', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <CheckCircle size={13} /> Guardar
+                </button>
+                <button onClick={() => setEditScore(false)} style={{ background: 'transparent', color: 'var(--gray)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}>
+                  Cancelar
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setEditScore(true)} style={{ background: 'transparent', color: 'var(--gray)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 12px', fontSize: 12, cursor: 'pointer' }}>
+                + Cargar resultado
+              </button>
+            )
+          )}
 
-      for (const matchId of revealedIds) {
-        const predicciones = top10.map((r, i) => {
-          const p = pronoByKey[`${matchId}_${r.clientId}`];
-          return {
-            position:    i + 1,
-            apodo:       r.apodo,
-            totalPuntos: r.totalPuntos,
-            prediccion:  p ? {
-              winner: p.predictedWinner,
-              home:   p.predictedHome,
-              away:   p.predictedAway,
-            } : null,
-          };
-        });
-        result[matchId] = { revealed: true, predicciones };
-      }
-    }
-
-    res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── GET predicciones públicas de un partido individual (sin auth) ────────────
-// Se mantiene por compatibilidad; el frontend ahora usa el endpoint batch
-// de arriba para no disparar un request por partido.
-// Se revelan 5 minutos después del inicio del partido para que nadie copie
-// las predicciones del top 10 antes de que arranque.
-router.get('/predicciones-publicas/:matchId', async (req, res) => {
-  try {
-    const match = await ProdeMatch.findById(req.params.matchId).lean();
-    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
-
-    const REVEAL_MS = 5 * 60 * 1000;
-    const revealAt  = new Date(match.matchDate.getTime() + REVEAL_MS);
-    const revealed  = Date.now() >= revealAt.getTime();
-
-    const matchPublic = {
-      homeTeam:  match.homeTeam,
-      awayTeam:  match.awayTeam,
-      homeLogo:  match.homeLogo,
-      awayLogo:  match.awayLogo,
-      matchDate: match.matchDate,
-      stage:     match.stage,
-      status:    match.status,
-      homeScore: match.homeScore,
-      awayScore: match.awayScore,
-      winner:    match.winner,
-    };
-
-    if (!revealed) {
-      return res.json({ revealed: false, revealAt, match: matchPublic });
-    }
-
-    // Top 10 del ranking (cacheado 5 min para no recalcular en cada request)
-    const ranking = await getCachedRanking();
-    const top10   = ranking.slice(0, 10);
-
-    // Sus predicciones para este partido en una sola query
-    const clientIds   = top10.map(r => r.clientId);
-    const pronosticos = await Pronostico.find({
-      matchId:  match._id,
-      clientId: { $in: clientIds },
-    }).lean();
-
-    const pronoByClient = {};
-    for (const p of pronosticos) {
-      pronoByClient[String(p.clientId)] = p;
-    }
-
-    const predicciones = top10.map((r, i) => {
-      const p = pronoByClient[String(r.clientId)];
-      return {
-        position:    i + 1,
-        apodo:       r.apodo,        // solo primer nombre, sin datos de contacto
-        totalPuntos: r.totalPuntos,
-        prediccion:  p ? {
-          winner: p.predictedWinner,
-          home:   p.predictedHome,   // null si no ingresó marcador
-          away:   p.predictedAway,
-        } : null,                    // null = no pronosticó este partido
-      };
-    });
-
-    res.json({ revealed: true, match: matchPublic, predicciones });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-module.exports = router;
+          {/* Confirmar equipos (solo si TBD) */}
+          {isTBD && (
+            editTeams ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flex: 1 }}>
+                <span style={{ fontSize: 12, color: 'var(--gray)', flexShrink: 0 }}>Equipos:</span>
+                <input value={homeTeam} onChange={e => setHomeTeam(e.target.value)}
+                  placeholder="Local" style={{ flex: 1, minWidth: 110, padding: '5px 8px', fontSize: 13 }} />
+                <span style={{ color: 'var(--gray)', fontWeight: 700, flexShrink: 0 }}>vs</span>
+                <input value={awayTeam} onChange={e => setAwayTeam(e.target.value)}
+                  placeholder="Visitante" style={{ flex: 1, minWidth: 110, padding: '5px 8px', fontSize: 13 }} />
+                <button onClick={handleSubmitTeams} disabled={saving} style={{ background: '#1e3a5f', color: '#74ACDF', border: '1px solid rgba(116,172,223,0.3)', borderRadius: 6, padding: '6px 12px', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                  <CheckCircle size={13} /> {saving ? 'Guardando...' : 'Confirmar'}
+                </button>
+                <button onClick={() => { setEditTeams(false); setHomeTeam(match.homeTeam); setAwayTeam(match.awayTeam); }} style={{ background: 'transparent', color: 'var(--gray)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 10px', fontSize: 12, cursor: 'pointer', flexShrink: 0 }}>
+                  Cancelar
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setEditTeams(true)} style={{ background: 'rgba(116,172,223,0.08)', color: '#74ACDF', border: '1px solid rgba(116,172,223,0.2)', borderRadius: 6, padding: '5px 12px', fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 5 }}>
+                ✏️ Definir equipos — habilitar pronósticos
+              </button>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

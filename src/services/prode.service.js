@@ -31,6 +31,8 @@ function mapGroup(group = '') {
 
 const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME', 'EXTRA_TIME', 'PENALTY_SHOOTOUT'];
 const FINISHED_STATUSES = ['FINISHED', 'FINISHED_AET', 'FINISHED_AP'];
+// Statuses que NO deben resetear datos ya guardados (el partido ya ocurrió)
+const AWARDED_STATUSES  = ['AWARDED', 'POSTPONED', 'SUSPENDED', 'CANCELLED'];
 
 function mapWinner(winner) {
   if (winner === 'HOME_TEAM') return 'home';
@@ -171,43 +173,39 @@ async function syncFixture() {
         const et = m.score?.extraTime;
         const pk = m.score?.penalties;
 
-        // ── Resultado de los 90' — base para evaluar pronósticos ──────────────
-        // La API football-data.org v4 puede devolver el marcador de 90' en:
-        //   - regularTime: disponible en fases de eliminación (distingue ET)
-        //   - fullTime: disponible en todos los partidos (acumulado hasta el final del tiempo reglamentario)
-        // Si el partido NO fue a prórroga, fullTime == resultado de 90'.
-        // Si el partido FUE a prórroga, fullTime puede incluir el ET acumulado,
-        //   pero regularTime tiene los 90' exactos — lo usamos como fuente primaria.
-        // Orden de prioridad: regularTime > fullTime > null
+        // ── Resultado de los 90' — fuente de verdad para pronósticos ──────────
+        // football-data.org v4:
+        //   - regularTime: disponible en fases eliminatorias, contiene SOLO los 90'
+        //   - fullTime: disponible siempre; en grupos == 90'; en eliminatorias puede
+        //     incluir ET acumulado si la API no separó regularTime
+        // Prioridad: regularTime > fullTime
+        // Importante: verificar explícitamente !== null porque el objeto puede existir
+        // con valores null (ej: { home: null, away: null })
         const rtHome = (rt?.home !== null && rt?.home !== undefined) ? rt.home : null;
         const rtAway = (rt?.away !== null && rt?.away !== undefined) ? rt.away : null;
         const ftHome = (ft?.home !== null && ft?.home !== undefined) ? ft.home : null;
         const ftAway = (ft?.away !== null && ft?.away !== undefined) ? ft.away : null;
 
-        // Si el partido tuvo prórroga, usar regularTime (los 90' exactos).
-        // Si NO tuvo prórroga, fullTime == 90', así que es equivalente.
-        // Si regularTime no está disponible (grupos), fullTime es el resultado correcto.
-        const wentToET = !!(et?.home !== null && et?.home !== undefined);
         homeScore = rtHome ?? ftHome ?? null;
         awayScore = rtAway ?? ftAway ?? null;
 
-        // Log para diagnosticar partidos con score null
+        // Log diagnóstico: si el partido está finished pero sin score, algo raro pasa
         if (homeScore === null || awayScore === null) {
-          console.warn(`⚠️ [ProdeSync] Partido ${m.id} (${m.homeTeam?.name} vs ${m.awayTeam?.name}) status=${m.status} pero score null. score:`, JSON.stringify(m.score));
+          console.warn(`⚠️ [ProdeSync] ${m.homeTeam?.name} vs ${m.awayTeam?.name} | apiStatus=${m.status} | score crudo:`, JSON.stringify(m.score));
         }
 
-        // ── winner derivado de los 90' — NO del clasificado ──────────────────
-        // m.score.winner refleja quién clasificó (puede ser el perdedor en 90' que
-        // ganó en ET o penales). Para los pronósticos siempre usamos los 90'.
+        // ── winner derivado SIEMPRE de los 90' (no de m.score.winner que refleja el clasificado) ──
         if (homeScore !== null && awayScore !== null) {
           winner = homeScore > awayScore ? 'home'
                  : awayScore > homeScore ? 'away'
                  : 'draw';
         }
 
-        // ── Datos de ET/penales — solo informativos, no afectan puntuación ───
+        // ── ET/penales: solo informativos ────────────────────────────────────
+        const wentToET   = !!(et?.home !== null && et?.home !== undefined);
+        const wentToPens = !!(pk?.home !== null && pk?.home !== undefined);
         $setFields.wentToET      = wentToET;
-        $setFields.wentToPens    = !!(pk?.home !== null && pk?.home !== undefined);
+        $setFields.wentToPens    = wentToPens;
         $setFields.extraTimeHome = et?.home ?? null;
         $setFields.extraTimeAway = et?.away ?? null;
         $setFields.penaltiesHome = pk?.home ?? null;
@@ -215,13 +213,29 @@ async function syncFixture() {
         $setFields.qualifiedTeam = mapWinner(m.score?.winner) !== 'draw'
           ? (mapWinner(m.score?.winner) === 'home' ? m.homeTeam : m.awayTeam)
           : null;
+
       } else if (LIVE_STATUSES.includes(m.status)) {
         status = 'live';
         const ft = m.score?.fullTime;
         const rt = m.score?.regularTime;
-        // En vivo: mostrar marcador actual (puede ser ET, pero se muestra como va)
-        homeScore = rt?.home ?? ft?.home ?? null;
-        awayScore = rt?.away ?? ft?.away ?? null;
+        homeScore = (rt?.home !== null && rt?.home !== undefined) ? rt.home
+                  : (ft?.home !== null && ft?.home !== undefined) ? ft.home : null;
+        awayScore = (rt?.away !== null && rt?.away !== undefined) ? rt.away
+                  : (ft?.away !== null && ft?.away !== undefined) ? ft.away : null;
+
+      } else if (AWARDED_STATUSES.includes(m.status)) {
+        // Partido aplazado/suspendido/adjudicado — NO tocar status ni scores
+        // si ya teníamos datos. Solo logueamos para visibilidad.
+        console.warn(`⚠️ [ProdeSync] Partido con status especial: ${m.status} | ${m.homeTeam?.name} vs ${m.awayTeam?.name}`);
+        // Saltear este partido del bulk — no incluimos $setFields problemáticos
+        // Retornamos un updateOne que solo actualiza stage/group/fechas, sin tocar status/scores
+        return {
+          updateOne: {
+            filter: { apiId },
+            update: { $set: { homeTeam, awayTeam, homeLogo, awayLogo, matchDate, stage, group, teamsConfirmed } },
+            upsert: true,
+          },
+        };
       }
 
       $setFields.status = status;
@@ -230,8 +244,8 @@ async function syncFixture() {
         if (homeScore !== null) $setFields.homeScore = homeScore;
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
-        // Los campos ET/pen ya se asignaron arriba en el bloque finished
       } else {
+        // scheduled: resetear scores (el partido no ha ocurrido)
         $setFields.homeScore     = null;
         $setFields.awayScore     = null;
         $setFields.winner        = null;

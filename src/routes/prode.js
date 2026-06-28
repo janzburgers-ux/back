@@ -222,7 +222,7 @@ router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
   if (!FOOTBALL_DATA_KEY) {
     return res.json({
       ok: false,
-      problema: 'FOOTBALL_DATA_KEY no esta definida en las variables de entorno. Registrate en football-data.org y agregala en Railway.',
+      problema: 'FOOTBALL_DATA_KEY no esta definida en las variables de entorno.',
     });
   }
 
@@ -233,13 +233,55 @@ router.get('/fixture/debug-api', auth, adminOnly, async (req, res) => {
       timeout: 12000,
     });
     const matches = resp.data?.matches || [];
+
+    // Filtros opcionales por query param
+    const { apiId, status: statusFilter, solo_problematicos } = req.query;
+
+    let resultado = matches;
+
+    if (apiId) {
+      resultado = matches.filter(m => String(m.id) === String(apiId));
+    } else if (statusFilter) {
+      resultado = matches.filter(m => m.status === statusFilter);
+    } else if (solo_problematicos === '1') {
+      // Partidos que NO son scheduled ni los statuses conocidos — los "raros"
+      const conocidos = ['SCHEDULED', 'TIMED', 'IN_PLAY', 'PAUSED', 'HALFTIME',
+                         'EXTRA_TIME', 'PENALTY_SHOOTOUT', 'FINISHED',
+                         'FINISHED_AET', 'FINISHED_AP', 'AWARDED',
+                         'POSTPONED', 'SUSPENDED', 'CANCELLED'];
+      resultado = matches.filter(m => !conocidos.includes(m.status));
+    }
+
+    // Siempre incluir los live de nuestra BD para cruzar con la API
+    const enVivoEnBD = await ProdeMatch.find({ status: 'live' }).select('apiId homeTeam awayTeam status homeScore awayScore').lean();
+
+    // Para cada partido en vivo en BD, buscar su dato crudo en la API
+    const cruceEnVivo = enVivoEnBD.map(bdMatch => {
+      const apiMatch = matches.find(m => String(m.id) === String(bdMatch.apiId));
+      return {
+        bd: {
+          _id: bdMatch._id,
+          apiId: bdMatch.apiId,
+          partido: `${bdMatch.homeTeam} vs ${bdMatch.awayTeam}`,
+          status_en_bd: bdMatch.status,
+          score_en_bd: `${bdMatch.homeScore ?? '?'}-${bdMatch.awayScore ?? '?'}`,
+        },
+        api: apiMatch ? {
+          status_en_api: apiMatch.status,
+          score: apiMatch.score,
+          utcDate: apiMatch.utcDate,
+        } : 'NO ENCONTRADO EN API (apiId no matchea)',
+      };
+    });
+
     return res.json({
-      ok:             true,
-      httpStatus:     resp.status,
-      url,
-      cantidad:       matches.length,
-      resultSet:      resp.data?.resultSet || null,
-      primer_partido: matches[0] || null,
+      ok:              true,
+      httpStatus:      resp.status,
+      total_api:       matches.length,
+      resultSet:       resp.data?.resultSet || null,
+      en_vivo_en_bd:   cruceEnVivo,        // ← lo más importante para debuggear
+      filtro_aplicado: resultado.length < matches.length ? resultado : undefined,
+      primer_partido:  matches[0] || null,
     });
   } catch (err) {
     const status = err.response?.status;

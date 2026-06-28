@@ -31,7 +31,7 @@ function mapGroup(group = '') {
 
 const LIVE_STATUSES     = ['IN_PLAY', 'PAUSED', 'HALFTIME', 'EXTRA_TIME', 'PENALTY_SHOOTOUT'];
 const FINISHED_STATUSES = ['FINISHED', 'FINISHED_AET', 'FINISHED_AP'];
-// Statuses que NO deben resetear datos ya guardados (el partido ya ocurrió)
+// Statuses especiales: no resetear scores ya guardados
 const AWARDED_STATUSES  = ['AWARDED', 'POSTPONED', 'SUSPENDED', 'CANCELLED'];
 
 function mapWinner(winner) {
@@ -173,14 +173,8 @@ async function syncFixture() {
         const et = m.score?.extraTime;
         const pk = m.score?.penalties;
 
-        // ── Resultado de los 90' — fuente de verdad para pronósticos ──────────
-        // football-data.org v4:
-        //   - regularTime: disponible en fases eliminatorias, contiene SOLO los 90'
-        //   - fullTime: disponible siempre; en grupos == 90'; en eliminatorias puede
-        //     incluir ET acumulado si la API no separó regularTime
-        // Prioridad: regularTime > fullTime
-        // Importante: verificar explícitamente !== null porque el objeto puede existir
-        // con valores null (ej: { home: null, away: null })
+        // Prioridad: regularTime (90' exactos en eliminatorias) > fullTime (siempre presente)
+        // Verificar explícitamente !== null porque la API puede mandar { home: null, away: null }
         const rtHome = (rt?.home !== null && rt?.home !== undefined) ? rt.home : null;
         const rtAway = (rt?.away !== null && rt?.away !== undefined) ? rt.away : null;
         const ftHome = (ft?.home !== null && ft?.home !== undefined) ? ft.home : null;
@@ -189,19 +183,17 @@ async function syncFixture() {
         homeScore = rtHome ?? ftHome ?? null;
         awayScore = rtAway ?? ftAway ?? null;
 
-        // Log diagnóstico: si el partido está finished pero sin score, algo raro pasa
         if (homeScore === null || awayScore === null) {
           console.warn(`⚠️ [ProdeSync] ${m.homeTeam?.name} vs ${m.awayTeam?.name} | apiStatus=${m.status} | score crudo:`, JSON.stringify(m.score));
         }
 
-        // ── winner derivado SIEMPRE de los 90' (no de m.score.winner que refleja el clasificado) ──
+        // winner siempre derivado de los 90' (m.score.winner refleja al clasificado, puede diferir)
         if (homeScore !== null && awayScore !== null) {
           winner = homeScore > awayScore ? 'home'
                  : awayScore > homeScore ? 'away'
                  : 'draw';
         }
 
-        // ── ET/penales: solo informativos ────────────────────────────────────
         const wentToET   = !!(et?.home !== null && et?.home !== undefined);
         const wentToPens = !!(pk?.home !== null && pk?.home !== undefined);
         $setFields.wentToET      = wentToET;
@@ -224,11 +216,8 @@ async function syncFixture() {
                   : (ft?.away !== null && ft?.away !== undefined) ? ft.away : null;
 
       } else if (AWARDED_STATUSES.includes(m.status)) {
-        // Partido aplazado/suspendido/adjudicado — NO tocar status ni scores
-        // si ya teníamos datos. Solo logueamos para visibilidad.
-        console.warn(`⚠️ [ProdeSync] Partido con status especial: ${m.status} | ${m.homeTeam?.name} vs ${m.awayTeam?.name}`);
-        // Saltear este partido del bulk — no incluimos $setFields problemáticos
-        // Retornamos un updateOne que solo actualiza stage/group/fechas, sin tocar status/scores
+        // Partido aplazado/suspendido: no tocar status ni scores ya guardados
+        console.warn(`⚠️ [ProdeSync] Status especial ignorado: ${m.status} | ${m.homeTeam?.name} vs ${m.awayTeam?.name}`);
         return {
           updateOne: {
             filter: { apiId },
@@ -245,7 +234,7 @@ async function syncFixture() {
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
       } else {
-        // scheduled: resetear scores (el partido no ha ocurrido)
+        // scheduled: el partido no ocurrió aún, limpiar scores
         $setFields.homeScore     = null;
         $setFields.awayScore     = null;
         $setFields.winner        = null;

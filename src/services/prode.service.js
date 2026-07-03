@@ -136,6 +136,15 @@ async function syncFixture() {
       return { synced: 0, error: 'La API devolvio 0 partidos. Verificar que el Mundial 2026 este disponible en tu plan.' };
     }
 
+    // Traemos el estado actual de cada partido para poder decidir, por partido,
+    // si un resultado "finished" es nuevo/distinto (→ queda pendiente de
+    // confirmación) o si ya estaba confirmado igual (→ no tocar nada).
+    const existingDocs = await ProdeMatch.find(
+      {},
+      'apiId status homeScore awayScore winner pendingReview pendingHomeScore pendingAwayScore'
+    ).lean();
+    const existingByApiId = new Map(existingDocs.map(d => [d.apiId, d]));
+
     const ops = matches.map(m => {
       const apiId     = String(m.id);
       const homeTeam  = m.homeTeam?.name || 'TBD';
@@ -227,14 +236,43 @@ async function syncFixture() {
         };
       }
 
-      $setFields.status = status;
+      const existing = existingByApiId.get(apiId);
 
-      if (status === 'finished' || status === 'live') {
+      if (status === 'finished') {
+        const yaConfirmadoIgual =
+          existing?.status === 'finished' &&
+          existing?.homeScore === homeScore &&
+          existing?.awayScore === awayScore;
+
+        if (yaConfirmadoIgual) {
+          // Ya está cargado y confirmado con este mismo resultado: no tocar nada
+          // (ni status, ni scores, ni flags de pendiente).
+        } else {
+          // Resultado nuevo o distinto al confirmado: queda EN REVISIÓN.
+          // No se pisan homeScore/awayScore/winner/status reales — el admin
+          // tiene que confirmarlo (o corregirlo) a mano desde el panel antes
+          // de que se evalúen los pronósticos y se repartan puntos.
+          // Nota: esto cubre tanto un partido recién terminado como una corrección
+          // tardía de la fuente sobre un partido que ya estaba confirmado.
+          $setFields.status           = 'pending_review';
+          $setFields.pendingReview    = true;
+          $setFields.pendingHomeScore = homeScore;
+          $setFields.pendingAwayScore = awayScore;
+          $setFields.pendingWinner    = winner;
+          const yaEstabaPendienteIgual =
+            existing?.pendingReview &&
+            existing?.pendingHomeScore === homeScore &&
+            existing?.pendingAwayScore === awayScore;
+          if (!yaEstabaPendienteIgual) $setFields.pendingSince = new Date();
+        }
+      } else if (status === 'live') {
+        $setFields.status = 'live';
         if (homeScore !== null) $setFields.homeScore = homeScore;
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
       } else {
         // scheduled: el partido no ocurrió aún, limpiar scores
+        $setFields.status        = 'scheduled';
         $setFields.homeScore     = null;
         $setFields.awayScore     = null;
         $setFields.winner        = null;
@@ -245,6 +283,11 @@ async function syncFixture() {
         $setFields.wentToET      = false;
         $setFields.wentToPens    = false;
         $setFields.qualifiedTeam = null;
+        $setFields.pendingReview    = false;
+        $setFields.pendingHomeScore = null;
+        $setFields.pendingAwayScore = null;
+        $setFields.pendingWinner    = null;
+        $setFields.pendingSince     = null;
       }
 
       return {

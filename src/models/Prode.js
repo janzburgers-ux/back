@@ -10,10 +10,19 @@ const ProdeMatchSchema = new mongoose.Schema({
   matchDate:      { type: Date, required: true },
   stage:          { type: String, default: 'Fase de Grupos' },
   group:          { type: String, default: '' },
-  status:         { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
+  status:         { type: String, enum: ['scheduled', 'live', 'finished', 'pending_review'], default: 'scheduled' },
   homeScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
   awayScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
   winner:         { type: String, enum: ['home', 'away', 'draw', null], default: null }, // basado en 90'
+  // ── Resultado detectado automáticamente por el sync, pendiente de confirmación
+  // manual del admin. Mientras pendingReview=true, el resultado NO se pisa en
+  // homeScore/awayScore/winner y por lo tanto NO se evalúan pronósticos ni se
+  // reparten puntos — hasta que el admin confirme (o corrija) desde el panel.
+  pendingReview:    { type: Boolean, default: false },
+  pendingHomeScore: { type: Number, default: null },
+  pendingAwayScore: { type: Number, default: null },
+  pendingWinner:    { type: String, enum: ['home', 'away', 'draw', null], default: null },
+  pendingSince:     { type: Date, default: null },
   // Campos adicionales para eliminación directa — solo informativo, no afectan puntuación
   extraTimeHome:  { type: Number, default: null },  // goles en alargue (home)
   extraTimeAway:  { type: Number, default: null },  // goles en alargue (away)

@@ -303,6 +303,49 @@ router.put('/fixture/:id/resultado', auth, adminOnly, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── POST confirmar resultado detectado automáticamente por el sync (solo admin)
+//    El sync deja los partidos "finished" en status='pending_review' con el
+//    resultado sugerido en pendingHomeScore/pendingAwayScore. Este endpoint
+//    aplica ese resultado (o uno corregido a mano por el admin en el body) y
+//    recién ahí evalúa los pronósticos de ESE partido. ─────────────────────────
+router.post('/fixture/:id/confirmar', auth, adminOnly, async (req, res) => {
+  try {
+    const match = await ProdeMatch.findById(req.params.id);
+    if (!match) return res.status(404).json({ message: 'Partido no encontrado' });
+    if (!match.pendingReview) {
+      return res.status(400).json({ message: 'Este partido no tiene un resultado pendiente de confirmación' });
+    }
+
+    // Si el admin manda homeScore/awayScore en el body, usa esos (corrección
+    // antes de confirmar). Si no, usa lo que detectó el sync automáticamente.
+    const homeScore = req.body.homeScore !== undefined ? Number(req.body.homeScore) : match.pendingHomeScore;
+    const awayScore = req.body.awayScore !== undefined ? Number(req.body.awayScore) : match.pendingAwayScore;
+    const winner = homeScore > awayScore ? 'home' : awayScore > homeScore ? 'away' : 'draw';
+
+    match.homeScore     = homeScore;
+    match.awayScore     = awayScore;
+    match.winner        = winner;
+    match.status        = 'finished';
+    match.pendingReview    = false;
+    match.pendingHomeScore = null;
+    match.pendingAwayScore = null;
+    match.pendingWinner    = null;
+    match.pendingSince     = null;
+    await match.save();
+
+    // Por si el partido ya había sido evaluado antes con otro resultado
+    // (corrección tardía), limpiamos para evaluar de cero solo este partido.
+    const yaEvaluados = await Pronostico.countDocuments({ matchId: match._id, evaluated: true });
+    if (yaEvaluados > 0) {
+      await ProdePoints.deleteMany({ matchId: match._id, tipo: 'pronostico' });
+      await Pronostico.updateMany({ matchId: match._id }, { $set: { evaluated: false, pointsEarned: 0 } });
+    }
+
+    await evaluateMatch(match._id);
+    res.json(match);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 // ── GET todas las predicciones de un partido (admin) ─────────────────────────
 router.get('/pronosticos-admin', auth, adminOnly, async (req, res) => {
   try {

@@ -6,7 +6,9 @@ const auth = async (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'No autorizado' });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'janz_secret');
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) throw new Error('JWT_SECRET no configurado');
+    const decoded = jwt.verify(token, jwtSecret);
     req.user = await User.findById(decoded.id).select('-password');
     if (!req.user) return res.status(401).json({ message: 'Usuario no encontrado' });
     next();

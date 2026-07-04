@@ -29,6 +29,10 @@ const clientSchema = new mongoose.Schema({
   prodeGuestCouponCode: { type: String, default: null, trim: true },
 }, { timestamps: true });
 
+// FIX rendimiento: whatsapp es la clave de búsqueda en cada pedido, PIN y notificación
+clientSchema.index({ whatsapp: 1 });
+clientSchema.index({ active: 1, whatsapp: 1 });
+
 const orderItemAdditionalSchema = new mongoose.Schema({
   additional: { type: mongoose.Schema.Types.ObjectId, ref: 'Additional', required: true },
   name: { type: String },
@@ -116,8 +120,11 @@ const orderSchema = new mongoose.Schema({
 // terminaba escaneando toda la colección. Sin índices esto no se nota
 // con pocos pedidos, pero se va a poner cada vez más lento a medida que
 // crece el historial.
-orderSchema.index({ status: 1, createdAt: -1 }); // filtrar por estado y ordenar por fecha
-orderSchema.index({ createdAt: -1 });             // rango de fechas sin filtrar por estado
+orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ createdAt: -1 });
+// FIX rendimiento: índices para countDeliveredInPeriod (ranking Prode) y analytics
+orderSchema.index({ client: 1, status: 1, deliveredAt: -1 });
+orderSchema.index({ deliveredAt: -1 });
 
 function generatePublicCode() {
   const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -128,14 +135,11 @@ function generatePublicCode() {
 
 orderSchema.pre('save', async function(next) {
   if (this.isNew) {
-    // Buscar el último pedido por orderNumber para evitar conflictos al borrar pedidos
-    // (countDocuments() falla si se borró algún pedido porque puede repetir un número ya usado)
-    const last = await mongoose.model('Order').findOne({}, { orderNumber: 1 }).sort({ createdAt: -1 });
-    let nextNum = 1;
-    if (last?.orderNumber) {
-      const match = last.orderNumber.match(/(\d+)$/);
-      if (match) nextNum = parseInt(match[1], 10) + 1;
-    }
+    // FIX race condition orderNumber: el patron leer-ultimo+sumar-1 no es atomico.
+    // Dos pedidos simultaneos pueden leer el mismo ultimo numero y generar el mismo
+    // siguiente, rompiendo con E11000 (unique). Counter con $inc es atomico en Mongo.
+    const { getNextSequence } = require('./Counter');
+    const nextNum = await getNextSequence('orderNumber');
     this.orderNumber = `JANZ-${String(nextNum).padStart(4, '0')}`;
     this.publicCode = generatePublicCode();
     this.receivedAt = new Date();

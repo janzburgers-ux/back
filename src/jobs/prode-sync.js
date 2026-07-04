@@ -1,7 +1,6 @@
 const cron = require('node-cron');
-const { syncFixture }   = require('../services/prode.service');
+const { syncFixture, evaluateMatch, reevaluateChangedMatches } = require('../services/prode.service');
 const { ProdeMatch, Pronostico } = require('../models/Prode');
-const { evaluateMatch } = require('../services/prode.service');
 
 // ── Evaluar partidos que el sync marcó como finished pero aún no evaluados ────
 async function evaluatePendingMatches() {
@@ -47,6 +46,12 @@ async function runProdeSync() {
 
   // Evaluar pronósticos de partidos recién terminados
   await evaluatePendingMatches();
+
+  // FIX bug "lectura de resultado": si algún partido fue evaluado con un
+  // resultado provisorio incorrecto (90' vs alargue/penales, ver syncFixture)
+  // y la API lo corrigió después, esto detecta esos casos por resultVersion
+  // y re-evalúa con el dato correcto, sin intervención manual.
+  await reevaluateChangedMatches();
 }
 
 function startProdeSync() {

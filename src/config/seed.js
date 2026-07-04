@@ -1,17 +1,37 @@
 require('dotenv').config();
 const mongoose = require('mongoose');
+const readline = require('readline');
 const User = require('../models/User');
 const Ingredient = require('../models/Ingredient');
 const Stock = require('../models/Stock');
 const { Product } = require('../models/Product');
 const Additional = require('../models/Additional');
 
+// ── GUARD: nunca correr en producción sin confirmación explícita ─────────────
+// Evita el borrado accidental de clientes, pedidos e ingredientes reales.
+// Para correr en producción de forma INTENCIONAL: NODE_ENV=production SEED_CONFIRM=yes node src/config/seed.js
+if (process.env.NODE_ENV === 'production' && process.env.SEED_CONFIRM !== 'yes') {
+  console.error('❌ PELIGRO: estás intentando correr seed.js en producción.');
+  console.error('   Esto BORRA todos los clientes, pedidos e ingredientes reales.');
+  console.error('   Si realmente querés hacerlo: SEED_CONFIRM=yes node src/config/seed.js');
+  process.exit(1);
+}
+
 const MONGODB_URI = process.env.MONGODB_URI;
+
+async function confirmar(pregunta) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(pregunta, ans => { rl.close(); resolve(ans.trim().toLowerCase()); }));
+}
 
 async function seed() {
   try {
     await mongoose.connect(MONGODB_URI);
     console.log('✅ MongoDB conectado');
+    console.log(`   Base de datos: ${mongoose.connection.name} @ ${mongoose.connection.host}`);
+
+    const resp = await confirmar('\n⚠️  Esto va a BORRAR todos los datos existentes. Escribí "si" para continuar: ');
+    if (resp !== 'si') { console.log('Cancelado.'); process.exit(0); }
 
     // ── Limpiar colecciones ──────────────────────────────────────────────────
     await mongoose.connection.collection('users').deleteMany({});
@@ -26,9 +46,11 @@ async function seed() {
     console.log('🗑️  Colecciones limpiadas');
 
     // ── Usuarios ─────────────────────────────────────────────────────────────
+    // ⚠️  Completar con los emails reales antes de correr.
+    // NO commitear contraseñas reales — cambiarlas desde el panel de admin después.
     const usersData = [
-      { name: 'Gianf', email: 'gianbuzzelatto@gmail.com', password: '26062020', role: 'admin', active: true, profitShare: 0 },
-      { name: 'Zai',   email: 'zaibuzzelatto@gmail.com',  password: '28102006', role: 'admin', active: true, profitShare: 0 },
+      { name: 'Admin 1', email: process.env.SEED_ADMIN1_EMAIL || 'admin1@janzburgers.com', password: process.env.SEED_ADMIN1_PASS || 'CambiarEsto2024!', role: 'admin', active: true, profitShare: 0 },
+      { name: 'Admin 2', email: process.env.SEED_ADMIN2_EMAIL || 'admin2@janzburgers.com', password: process.env.SEED_ADMIN2_PASS || 'CambiarEsto2024!', role: 'admin', active: true, profitShare: 0 },
     ];
     for (const u of usersData) {
       const user = new User(u);

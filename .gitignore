@@ -1,3 +1,17 @@
-node_modules/ 
-whatsapp-session/ 
-.env 
+node_modules/
+whatsapp-session/
+ 
+# Carpetas locales que whatsapp-web.js/Puppeteer crean igual aunque se use
+# RemoteAuth + MongoStore (la sesión "real" vive en Mongo, pero estas quedan
+# como caché/temporales del lado del proceso de Node y no deben commitearse).
+.wwebjs_auth/
+.wwebjs_cache/
+ 
+.env
+.env.*
+!.env.example
+ 
+npm-debug.log*
+*.log
+.DS_Store
+Thumbs.db

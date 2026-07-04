@@ -12,9 +12,11 @@ router.post('/login', async (req, res) => {
     if (!user || !(await user.comparePassword(password))) {
       return res.status(401).json({ message: 'Credenciales inválidas' });
     }
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) return res.status(500).json({ message: 'Error de configuración del servidor. Contactá al administrador.' });
     const token = jwt.sign(
       { id: user._id, role: user.role },
-      process.env.JWT_SECRET || 'janz_secret',
+      jwtSecret,
       { expiresIn: process.env.JWT_EXPIRE || '7d' }
     );
     res.json({

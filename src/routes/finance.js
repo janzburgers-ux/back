@@ -53,38 +53,47 @@ router.put('/buckets', auth, adminOnly, async (req, res) => {
 router.post('/night', auth, adminOnly, async (req, res) => {
   try {
     const { date, totalRevenue, ayudante, notes } = req.body;
+    if (!date) return res.status(400).json({ message: 'La fecha es requerida.' });
 
     let finance = await Finance.findOne();
     if (!finance) finance = new Finance({ buckets: DEFAULT_BUCKETS });
 
-    const ayudanteCost = Number(ayudante || 0);
-    const base = Math.max(0, Number(totalRevenue) - ayudanteCost);
+    // FIX integridad: antes se hacía push() sin verificar si ya había un registro
+    // para esa fecha. Un doble click o reenvío del formulario generaba dos entradas
+    // para la misma noche y los números del mes quedaban duplicados silenciosamente.
+    const targetDate = new Date(date);
+    const dayStart   = new Date(targetDate); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd     = new Date(targetDate); dayEnd.setHours(23, 59, 59, 999);
 
-    // Calcular distribución
-    const distribution = finance.buckets
-      .filter(b => b.active && b.key !== 'ayudante')
-      .map(b => ({
-        key:     b.key,
-        label:   b.label,
-        emoji:   b.emoji,
-        percent: b.percent,
-        amount:  Math.round(base * b.percent / 100),
-      }));
+    const alreadyExists = finance.nightRecords.some(r => {
+      const d = new Date(r.date);
+      return d >= dayStart && d <= dayEnd;
+    });
 
-    // Agregar ayudante si corresponde
-    if (ayudanteCost > 0) {
-      distribution.unshift({
-        key: 'ayudante', label: 'Ayudante', emoji: '👷',
-        percent: 0, amount: ayudanteCost
+    if (alreadyExists) {
+      return res.status(409).json({
+        message: `Ya existe un registro para el ${targetDate.toLocaleDateString('es-AR')}. Si querés corregirlo, eliminá el registro existente y volvé a cargarlo.`,
+        duplicate: true,
       });
     }
 
+    const ayudanteCost = Number(ayudante || 0);
+    const base         = Math.max(0, Number(totalRevenue) - ayudanteCost);
+
+    const distribution = finance.buckets
+      .filter(b => b.active && b.key !== 'ayudante')
+      .map(b => ({ key: b.key, label: b.label, emoji: b.emoji, percent: b.percent, amount: Math.round(base * b.percent / 100) }));
+
+    if (ayudanteCost > 0) {
+      distribution.unshift({ key: 'ayudante', label: 'Ayudante', emoji: '👷', percent: 0, amount: ayudanteCost });
+    }
+
     const record = {
-      date: new Date(date),
+      date:         targetDate,
       totalRevenue: Number(totalRevenue),
-      ayudante: ayudanteCost,
+      ayudante:     ayudanteCost,
       distribution,
-      notes: notes || '',
+      notes:        notes || '',
     };
 
     finance.nightRecords.push(record);

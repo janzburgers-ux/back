@@ -136,17 +136,20 @@ async function syncFixture() {
       return { synced: 0, error: 'La API devolvio 0 partidos. Verificar que el Mundial 2026 este disponible en tu plan.' };
     }
 
-    // Traemos el estado actual de cada partido para poder decidir, por partido,
-    // si un resultado "finished" es nuevo/distinto (→ queda pendiente de
-    // confirmación) o si ya estaba confirmado igual (→ no tocar nada).
-    const existingDocs = await ProdeMatch.find(
-      {},
-      'apiId status homeScore awayScore winner pendingReview pendingHomeScore pendingAwayScore'
+    // ── Snapshot de lo que ya tenemos guardado, ANTES de pisarlo ────────────────
+    // Lo necesitamos para detectar si un resultado "finished" que ya estaba
+    // guardado cambia en este sync (ver resultVersion más abajo).
+    const apiIds = matches.map(m => String(m.id));
+    const existingMatches = await ProdeMatch.find(
+      { apiId: { $in: apiIds } },
+      'apiId homeScore awayScore resultVersion'
     ).lean();
-    const existingByApiId = new Map(existingDocs.map(d => [d.apiId, d]));
+    const existingByApiId = {};
+    existingMatches.forEach(m => { existingByApiId[m.apiId] = m; });
 
     const ops = matches.map(m => {
       const apiId     = String(m.id);
+      const existing  = existingByApiId[apiId] || null;
       const homeTeam  = m.homeTeam?.name || 'TBD';
       const awayTeam  = m.awayTeam?.name || 'TBD';
       const homeLogo  = m.homeTeam?.crest || '';
@@ -174,26 +177,50 @@ async function syncFixture() {
       let homeScore = null;
       let awayScore = null;
       let winner    = null;
+      // Si queda en true, NO escribimos homeScore/awayScore/winner este ciclo:
+      // sabemos que el partido terminó pero todavía no tenemos un dato confiable
+      // de los 90'. El próximo sync (5 min después) lo vuelve a intentar.
+      let scoreNotReadyYet = false;
 
       if (FINISHED_STATUSES.includes(m.status)) {
         status = 'finished';
-        const rt = m.score?.regularTime;
-        const ft = m.score?.fullTime;
-        const et = m.score?.extraTime;
-        const pk = m.score?.penalties;
+        const rt       = m.score?.regularTime;
+        const ft       = m.score?.fullTime;
+        const et       = m.score?.extraTime;
+        const pk       = m.score?.penalties;
+        const duration = m.score?.duration || 'REGULAR';
+        const wentExtra = duration === 'EXTRA_TIME' || duration === 'PENALTY_SHOOTOUT';
 
-        // Prioridad: regularTime (90' exactos en eliminatorias) > fullTime (siempre presente)
         // Verificar explícitamente !== null porque la API puede mandar { home: null, away: null }
         const rtHome = (rt?.home !== null && rt?.home !== undefined) ? rt.home : null;
         const rtAway = (rt?.away !== null && rt?.away !== undefined) ? rt.away : null;
         const ftHome = (ft?.home !== null && ft?.home !== undefined) ? ft.home : null;
         const ftAway = (ft?.away !== null && ft?.away !== undefined) ? ft.away : null;
 
-        homeScore = rtHome ?? ftHome ?? null;
-        awayScore = rtAway ?? ftAway ?? null;
+        if (wentExtra) {
+          // FIX bug "lectura de resultado / alargue / penales":
+          // en partidos que fueron a alargue o penales, football-data.org
+          // reporta en `fullTime` el acumulado de TODO (90' + alargue + penales),
+          // no el resultado de los 90'. El prode se juega SOLO sobre los 90',
+          // así que en este caso `fullTime` NO es un fallback válido — sólo
+          // confiamos en `regularTime`. Si todavía no está publicado (puede
+          // tardar unos minutos en aparecer tras el pitazo final), no fijamos
+          // ningún resultado todavía en vez de guardar uno incorrecto.
+          if (rtHome !== null && rtAway !== null) {
+            homeScore = rtHome;
+            awayScore = rtAway;
+          } else {
+            scoreNotReadyYet = true;
+            console.warn(`⚠️ [ProdeSync] ${homeTeam} vs ${awayTeam} terminó (${duration}) pero regularTime (90') aún no está disponible. Se reintenta en el próximo sync. score crudo:`, JSON.stringify(m.score));
+          }
+        } else {
+          // Partido sin alargue: fullTime ES el resultado de los 90'.
+          homeScore = ftHome;
+          awayScore = ftAway;
+        }
 
-        if (homeScore === null || awayScore === null) {
-          console.warn(`⚠️ [ProdeSync] ${m.homeTeam?.name} vs ${m.awayTeam?.name} | apiStatus=${m.status} | score crudo:`, JSON.stringify(m.score));
+        if (!scoreNotReadyYet && (homeScore === null || awayScore === null)) {
+          console.warn(`⚠️ [ProdeSync] ${homeTeam} vs ${awayTeam} | apiStatus=${m.status} | score crudo:`, JSON.stringify(m.score));
         }
 
         // winner siempre derivado de los 90' (m.score.winner refleja al clasificado, puede diferir)
@@ -236,43 +263,39 @@ async function syncFixture() {
         };
       }
 
-      const existing = existingByApiId.get(apiId);
+      if (scoreNotReadyYet) {
+        // No marcamos como 'finished' todavía: si lo hiciéramos sin homeScore/
+        // awayScore, evaluateMatch() lo ignora (chequea winner === null) pero
+        // quedaría "finished" sin resultado, lo cual es confuso en el panel.
+        // Lo dejamos como 'live' — el próximo sync (5 min) lo termina de cerrar.
+        status = 'live';
+      }
 
-      if (status === 'finished') {
-        const yaConfirmadoIgual =
-          existing?.status === 'finished' &&
-          existing?.homeScore === homeScore &&
-          existing?.awayScore === awayScore;
+      $setFields.status = status;
 
-        if (yaConfirmadoIgual) {
-          // Ya está cargado y confirmado con este mismo resultado: no tocar nada
-          // (ni status, ni scores, ni flags de pendiente).
-        } else {
-          // Resultado nuevo o distinto al confirmado: queda EN REVISIÓN.
-          // No se pisan homeScore/awayScore/winner/status reales — el admin
-          // tiene que confirmarlo (o corregirlo) a mano desde el panel antes
-          // de que se evalúen los pronósticos y se repartan puntos.
-          // Nota: esto cubre tanto un partido recién terminado como una corrección
-          // tardía de la fuente sobre un partido que ya estaba confirmado.
-          $setFields.status           = 'pending_review';
-          $setFields.pendingReview    = true;
-          $setFields.pendingHomeScore = homeScore;
-          $setFields.pendingAwayScore = awayScore;
-          $setFields.pendingWinner    = winner;
-          const yaEstabaPendienteIgual =
-            existing?.pendingReview &&
-            existing?.pendingHomeScore === homeScore &&
-            existing?.pendingAwayScore === awayScore;
-          if (!yaEstabaPendienteIgual) $setFields.pendingSince = new Date();
-        }
-      } else if (status === 'live') {
-        $setFields.status = 'live';
+      if (status === 'finished' || status === 'live') {
         if (homeScore !== null) $setFields.homeScore = homeScore;
         if (awayScore !== null) $setFields.awayScore = awayScore;
         if (winner    !== null) $setFields.winner    = winner;
+
+        // ── Detectar resultado corregido post-hoc ─────────────────────────────
+        // Si el partido YA estaba guardado como finished con un resultado real
+        // y ahora llega un resultado distinto, es una corrección (típicamente
+        // el caso de arriba: el primer sync usó un dato provisorio). Subimos
+        // resultVersion para que el cron de evaluación detecte que los
+        // pronósticos ya evaluados de este partido quedaron desactualizados
+        // y los vuelva a evaluar con el resultado correcto.
+        if (
+          status === 'finished' && homeScore !== null && awayScore !== null &&
+          existing && existing.homeScore !== null && existing.homeScore !== undefined &&
+          existing.awayScore !== null && existing.awayScore !== undefined &&
+          (existing.homeScore !== homeScore || existing.awayScore !== awayScore)
+        ) {
+          $setFields.resultVersion = (existing.resultVersion || 0) + 1;
+          console.warn(`⚠️ [ProdeSync] Resultado corregido en ${homeTeam} vs ${awayTeam}: ${existing.homeScore}-${existing.awayScore} → ${homeScore}-${awayScore}. resultVersion → ${$setFields.resultVersion}`);
+        }
       } else {
         // scheduled: el partido no ocurrió aún, limpiar scores
-        $setFields.status        = 'scheduled';
         $setFields.homeScore     = null;
         $setFields.awayScore     = null;
         $setFields.winner        = null;
@@ -283,11 +306,6 @@ async function syncFixture() {
         $setFields.wentToET      = false;
         $setFields.wentToPens    = false;
         $setFields.qualifiedTeam = null;
-        $setFields.pendingReview    = false;
-        $setFields.pendingHomeScore = null;
-        $setFields.pendingAwayScore = null;
-        $setFields.pendingWinner    = null;
-        $setFields.pendingSince     = null;
       }
 
       return {
@@ -629,6 +647,10 @@ async function evaluateMatch(matchId) {
 
     p.pointsEarned = pts;
     p.evaluated = true;
+    // Dejamos registrado contra qué versión del resultado se evaluó este
+    // pronóstico (ver resultVersion en el modelo). Si el resultado se corrige
+    // más adelante, reevaluateChangedMatches() lo detecta por este campo.
+    p.evaluatedResultVersion = match.resultVersion || 0;
     await p.save();
 
     if (pts > 0) {
@@ -661,6 +683,56 @@ async function evaluateMatch(matchId) {
   }
 
   console.log(`✅ Evaluados ${pronosticos.length} pronósticos para ${match.homeTeam} vs ${match.awayTeam}`);
+}
+
+// ── Resetear evaluación de un partido (para volver a evaluarlo limpio) ──────────
+// Se usa tanto cuando un admin corrige el resultado a mano (PUT /fixture/:id/resultado)
+// como automáticamente cuando el sync detecta que un resultado ya evaluado cambió
+// (ver resultVersion / reevaluateChangedMatches).
+async function resetMatchEvaluation(matchId) {
+  await ProdePoints.deleteMany({ matchId, tipo: 'pronostico' });
+  await Pronostico.updateMany(
+    { matchId },
+    { $set: { evaluated: false, pointsEarned: 0, evaluatedResultVersion: -1 } }
+  );
+}
+
+// ── Re-evaluar partidos cuyo resultado cambió DESPUÉS de haber sido evaluado ────
+// FIX bug "lectura de resultado del prode": antes, si syncFixture guardaba un
+// resultado provisorio incorrecto (típicamente en partidos con alargue/penales,
+// ver syncFixture) y evaluateMatch ya había repartido puntos con ese dato, una
+// corrección posterior del resultado NUNCA se reflejaba en los puntos: quedaban
+// evaluados para siempre con el dato viejo. Esta función busca exactamente esos
+// casos (evaluatedResultVersion desactualizado) y los vuelve a evaluar.
+async function reevaluateChangedMatches() {
+  const desync = await Pronostico.aggregate([
+    { $match: { evaluated: true } },
+    {
+      $lookup: {
+        from: 'prodematches',
+        localField: 'matchId',
+        foreignField: '_id',
+        as: 'match',
+      },
+    },
+    { $unwind: '$match' },
+    {
+      $match: {
+        $expr: { $ne: ['$evaluatedResultVersion', { $ifNull: ['$match.resultVersion', 0] }] },
+      },
+    },
+    { $group: { _id: '$matchId' } },
+  ]);
+
+  for (const { _id: matchId } of desync) {
+    await resetMatchEvaluation(matchId);
+    await evaluateMatch(matchId);
+  }
+
+  if (desync.length > 0) {
+    console.log(`🔁 [ProdeSync] Re-evaluados ${desync.length} partido(s) con resultado corregido.`);
+  }
+  return { reevaluated: desync.length };
 }
 
 async function getTotalPoints(clientId) {
@@ -767,8 +839,8 @@ async function getRanking() {
       if (
         p.predictedHome !== null && p.predictedAway !== null &&
         p.matchId &&
-        p.predictedHome === p.matchId.homeScore &&
-        p.predictedAway === p.matchId.awayScore
+        Number(p.predictedHome) === Number(p.matchId.homeScore) &&
+        Number(p.predictedAway) === Number(p.matchId.awayScore)
       ) {
         const cid = String(p.clientId);
         exactosPorCliente[cid] = (exactosPorCliente[cid] || 0) + 1;
@@ -782,18 +854,96 @@ async function getRanking() {
     r.marcadoresExactos = exactosPorCliente[String(r.clientId)] || 0;
   }
 
-  // ── Resolver categorías en paralelo ─────────────────────────────────
-  await Promise.all(ranking.map(async (r) => {
-    if (!r.clientId) return;
-    const status = await resolveProdeStatus(r.clientId, cfg);
-    r.categoria         = status?.categoria      || 'invitado';
-    r.categoriaLabel    = status?.categoriaLabel || 'Invitado';
-    r.premioSegmento    = status?.premioSegmento || 'invitado';
-    r.elegibleTop3      = status?.elegibleTop3   || false;
-    r.entregasEnPeriodo = status?.entregasEnPeriodo || 0;
-    r.entregasPreProde  = status?.entregasPreProde  || 0;
-    r.pedidosEnPeriodo  = r.entregasEnPeriodo;
-  }));
+  // ── Resolver categorías en BATCH (no O(n)) ───────────────────────────────
+  // FIX rendimiento: antes hacía resolveProdeStatus(clientId) por cada
+  // participante — 5 queries × N participantes (Client.findById, 2×
+  // countDocuments, ProdePoints.find, getTotalPoints). Con 50 participantes
+  // = 250 queries. Ahora son 3 queries totales que traen todos los datos.
+  const allClientIds = ranking.map(r => r.clientId).filter(Boolean);
+
+  // 1) Entregas en período y pre-Prode: un solo aggregate agrupa por clientId
+  const { start: pStart, end: pEnd } = cfg.startDate
+    ? { start: new Date(cfg.startDate), end: cfg.endDate ? new Date(cfg.endDate) : new Date() }
+    : { start: new Date(0), end: new Date() };
+
+  const prodeStart = cfg.startDate ? new Date(cfg.startDate) : null;
+
+  const deliveryBatch = await Order.aggregate([
+    {
+      $match: {
+        client: { $in: allClientIds },
+        status: 'delivered',
+      },
+    },
+    {
+      $group: {
+        _id: '$client',
+        entregasTotal: { $sum: 1 },
+        entregasEnPeriodo: {
+          $sum: {
+            $cond: [
+              {
+                $and: [
+                  { $gte: ['$deliveredAt', pStart] },
+                  { $lte: ['$deliveredAt', pEnd] },
+                ],
+              },
+              1, 0,
+            ],
+          },
+        },
+        entregasPreProde: {
+          $sum: {
+            $cond: [
+              prodeStart
+                ? { $lt: ['$deliveredAt', prodeStart] }
+                : { $eq: [1, 0] }, // si no hay startDate, nada es pre-prode
+              1, 0,
+            ],
+          },
+        },
+      },
+    },
+  ]);
+
+  const deliveryMap = {};
+  deliveryBatch.forEach(d => {
+    deliveryMap[String(d._id)] = {
+      entregasEnPeriodo: d.entregasEnPeriodo || 0,
+      entregasPreProde:  d.entregasPreProde  || 0,
+    };
+  });
+
+  // 2) Bonificaciones de categoría: un solo find para todos los participantes
+  const bonusBatch = await ProdePoints.find({
+    clientId: { $in: allClientIds },
+    tipo: 'bonificacion',
+    subtipo: { $in: [BONUS.UPGRADE_CLIENTE, BONUS.UPGRADE_VIP] },
+  }).select('clientId subtipo puntos').lean();
+
+  const bonusMap = {};
+  bonusBatch.forEach(b => {
+    const cid = String(b.clientId);
+    if (!bonusMap[cid]) bonusMap[cid] = {};
+    bonusMap[cid][b.subtipo] = b.puntos;
+  });
+
+  // 3) Aplicar al ranking usando los datos en memoria
+  for (const r of ranking) {
+    const cid = String(r.clientId);
+    const del = deliveryMap[cid] || { entregasEnPeriodo: 0, entregasPreProde: 0 };
+
+    const categoria      = resolveCategoria(del.entregasPreProde, del.entregasEnPeriodo);
+    const premioSegmento = resolvePremioSegmento(del.entregasPreProde, del.entregasEnPeriodo);
+
+    r.categoria          = categoria;
+    r.categoriaLabel     = categoria === 'vip' ? 'VIP' : categoria === 'cliente' ? 'Cliente' : 'Invitado';
+    r.premioSegmento     = premioSegmento;
+    r.elegibleTop3       = del.entregasEnPeriodo >= 1;
+    r.entregasEnPeriodo  = del.entregasEnPeriodo;
+    r.entregasPreProde   = del.entregasPreProde;
+    r.pedidosEnPeriodo   = del.entregasEnPeriodo;
+  }
 
   // ── Sort final con las 4 reglas de desempate ──────────────────────────
   // Regla 1: mayor puntaje total
@@ -884,6 +1034,8 @@ module.exports = {
   findClientByPhone,
   resolveProdeStatus,
   evaluateMatch,
+  resetMatchEvaluation,
+  reevaluateChangedMatches,
   getTotalPoints,
   getRanking,
   getTop3Competidores,

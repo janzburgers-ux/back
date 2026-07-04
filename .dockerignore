@@ -1,0 +1,34 @@
+# ── Archivos que NO deben entrar en la imagen Docker ─────────────────────────
+
+# FIX crítico: la sesión de WhatsApp guardada localmente NO debe ir en la imagen.
+# Si entrara, cualquiera con acceso a la imagen podría extraer la sesión de WA.
+# Con RemoteAuth + MongoStore (Bloque 2) esto ya no es necesario localmente,
+# pero lo dejamos aquí como capa de defensa extra.
+whatsapp-session/
+
+# Variables de entorno — nunca en la imagen
+.env
+.env.*
+!.env.example
+
+# Dependencias locales — se instalan durante el build con npm ci
+node_modules/
+
+# Archivos de desarrollo
+.git/
+.gitignore
+README.md
+*.md
+
+# Logs
+*.log
+npm-debug.log*
+
+# Coverage y tests
+coverage/
+*.test.js
+*.spec.js
+
+# Archivos del OS
+.DS_Store
+Thumbs.db

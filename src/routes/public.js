@@ -11,32 +11,26 @@ const PinVerification = require('../models/PinVerification');
 const { calcPackagingCost, reserveStockForOrder, deductStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability } = require('../services/stock.service');
 const Promo    = require('../models/Promo');
 const { estimateWaitTime } = require('../services/kitchen-capacity');
+// FIX timezone: centralizado en arDate.js — las copias locales tenían el
+// timestamp UTC desfasado al usarlas en rangos de query a MongoDB.
+const { nowAR, todayRangeAR, arDateStr } = require('../utils/arDate');
 
-// ── Helpers de timezone Argentina ─────────────────────────────────────────────
-function nowAR() {
-  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
-}
-
-function todayRangeAR() {
-  const ar = nowAR();
-  const dateStr = `${ar.getFullYear()}-${String(ar.getMonth() + 1).padStart(2, '0')}-${String(ar.getDate()).padStart(2, '0')}`;
-  return {
-    start: new Date(dateStr + 'T00:00:00-03:00'),
-    end:   new Date(dateStr + 'T23:59:59.999-03:00')
-  };
-}
-
-// Horario desde Config (con soporte de excepciones por fecha)
-function todayStrAR() {
-  const ar = nowAR();
-  return `${ar.getFullYear()}-${String(ar.getMonth() + 1).padStart(2, '0')}-${String(ar.getDate()).padStart(2, '0')}`;
-}
+// ── Cache de menú en memoria (30s TTL) ───────────────────────────────────────
+// FIX rendimiento: sin cache, cada apertura de la app hacía 6+ queries a Mongo.
+// En picos de 20 clientes simultáneos = 120 queries en el mismo instante.
+const menuCache = {
+  data: null, expiresAt: 0, TTL: 30 * 1000,
+  get()     { return Date.now() < this.expiresAt ? this.data : null; },
+  set(data) { this.data = data; this.expiresAt = Date.now() + this.TTL; },
+  clear()   { this.data = null; this.expiresAt = 0; },
+};
+module.exports.menuCache = menuCache;
 
 async function getTodayOverride() {
   try {
     const cfg = await Config.findOne({ key: 'operationOverrides' });
     const overrides = cfg?.value || [];
-    return overrides.find(o => o.date === todayStrAR()) || null;
+    return overrides.find(o => o.date === arDateStr(nowAR())) || null;
   } catch { return null; }
 }
 
@@ -171,6 +165,10 @@ router.patch('/client-update', async (req, res) => {
 
 // GET menú público
 router.get('/menu', async (req, res) => {
+  // Servir desde cache si está fresco (30s TTL)
+  const cached = menuCache.get();
+  if (cached) return res.json(cached);
+
   try {
     // Modelos que se usaban con require() perezoso dentro del handler;
     // se mantienen igual, solo se adelantan para poder usarlos en el
@@ -314,7 +312,9 @@ router.get('/menu', async (req, res) => {
     // Excepción del día (para mensajes personalizados en el banner)
     const todayOverride = await getTodayOverride();
 
-    res.json({ open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger, todayOverride, anyLowStock, promos });
+    const menuResponse = { open, menu, additionals, zones, limits: { ...limits, todayCount, limitReached }, businessWhatsapp, dailyDeal: activeDailyDeal, monthlyBurger: activeMonthlyBurger, todayOverride, anyLowStock, promos };
+    if (open && !limitReached) menuCache.set(menuResponse);
+    res.json(menuResponse);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -336,6 +336,7 @@ router.post('/order', async (req, res) => {
         .select('orderNumber publicCode status total');
       if (existing) {
         return res.json({
+          _id:                existing._id,
           orderNumber:        existing.orderNumber,
           publicCode:         existing.publicCode,
           status:             existing.status,
@@ -498,26 +499,25 @@ router.post('/order', async (req, res) => {
         }
 
         if (couponDoc) {
-          // Cupón de uso único: verificar que no haya ningún pedido activo con él
+          // FIX race condition: findOneAndUpdate atómico reemplaza el read-then-check
+          // no atómico. Dos pedidos concurrentes con el mismo cupón ya no pueden
+          // pasar ambos — solo uno puede marcar active=false exitosamente.
           if (couponDoc.singleUse) {
-            const anyActiveOrder = await Order.findOne({
-              coupon: couponDoc._id,
-              status: { $ne: 'cancelled' }
-            });
-            if (anyActiveOrder) {
-              couponDoc = null; // ya fue usado
-            }
+            const locked = await Coupon.findOneAndUpdate(
+              { _id: couponDoc._id, active: true },
+              { $set: { active: false, _lockReservedAt: new Date() } },
+              { new: false }
+            );
+            if (!locked) couponDoc = null;
           }
         }
 
         if (couponDoc) {
           discountPercent = couponDoc.discountForUser;
-          // Cupón de producto específico
           if (couponDoc.applicableProduct) {
             discountType = 'product';
             applicableProductId = couponDoc.applicableProduct.toString();
           }
-          // Cupón restringido por variante (premios Prode → solo "doble")
           if (couponDoc.applicableVariant) {
             discountType = 'variant';
           }
@@ -527,6 +527,19 @@ router.post('/order', async (req, res) => {
             const ownerPhone = (ownerDoc?.whatsapp || '').replace(/\D/g, '');
             const userPhone  = (clientData.whatsapp || '').replace(/\D/g, '');
             if (!ownerPhone || ownerPhone !== userPhone) {
+              couponDoc = null;
+              discountPercent = 0;
+              discountType = 'order';
+            }
+          }
+          // FIX blockedOwnerUse: el dueño de un cupón de referido no puede
+          // usarlo en su propio pedido. Este check faltaba acá (solo estaba en
+          // /coupons/validate), dejando un bypass funcional en el checkout real.
+          if (couponDoc && couponDoc.blockedOwnerUse && couponDoc.owner) {
+            const ownerDoc = await Client.findById(couponDoc.owner).select('whatsapp');
+            const ownerPhone = (ownerDoc?.whatsapp || '').replace(/\D/g, '');
+            const userPhone  = (clientData.whatsapp || '').replace(/\D/g, '');
+            if (ownerPhone && ownerPhone === userPhone) {
               couponDoc = null;
               discountPercent = 0;
               discountType = 'order';
@@ -758,6 +771,7 @@ router.post('/order', async (req, res) => {
 
     res.status(201).json({
       success: true,
+      _id: order._id,
       orderNumber: order.orderNumber,
       publicCode: order.publicCode,
       total: order.total,
@@ -960,6 +974,11 @@ router.put('/order/:id/cancel', async (req, res) => {
     }
 
     await order.save();
+
+    // FIX: decrementar totalOrders al cancelar (un pedido cancelado no es una compra real)
+    if (order.client?._id) {
+      await Client.findByIdAndUpdate(order.client._id, { $inc: { totalOrders: -1 } });
+    }
 
     // Registrar en RejectedOrder con motivo 'cliente_cancelo'
     try {

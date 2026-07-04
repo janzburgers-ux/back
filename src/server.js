@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const compression = require('compression');
 const helmet = require('helmet');
@@ -6,14 +7,36 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const http = require('http');
 const { Server } = require('socket.io');
-require('dotenv').config();
 const QRCode = require('qrcode');
 const { initWhatsApp, getCurrentQR, getWhatsAppStatus } = require('./services/whatsapp');
+
+// ── Validación de variables de entorno requeridas ────────────────────────────
+const REQUIRED_ENV = ['MONGODB_URI', 'JWT_SECRET', 'FRONTEND_URL'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length > 0) {
+  console.error(`❌ Variables de entorno requeridas no configuradas: ${missingEnv.join(', ')}`);
+  console.error('   Configurarlas en Railway → Variables antes de volver a deployar.');
+  process.exit(1);
+}
+
+// ── Captura de errores no manejados ─────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ [unhandledRejection] Promise rechazada sin manejar:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ [uncaughtException] Excepción no capturada:', err);
+  process.exit(1);
+});
 
 // Estado de iniciación (persiste en memoria mientras el proceso vive)
 let whatsappInitiated = false;
 
 const app = express();
+
+// FIX: Railway corre detrás de proxy — sin esto el rate limiter toma la IP
+// del proxy como IP de todos los clientes (limitando de forma global).
+app.set('trust proxy', 1);
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -75,17 +98,20 @@ const orderLimiter = rateLimit({
 });
 
 // Middleware
-app.use(cors({
-  origin: process.env.FRONTEND_URL.split(','),
-  credentials: true
-}));
+// FIX: FRONTEND_URL.split() crasheaba si la variable no estaba seteada.
+// Ahora validada arriba en REQUIRED_ENV; aquí solo normalizamos.
+const allowedOrigins = process.env.FRONTEND_URL.split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database
+// Database — fail fast: si Mongo no conecta al boot Railway lo detecta y reporta el error
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log('✅ MongoDB conectado'))
-  .catch(err => console.error('❌ Error MongoDB:', err));
+  .catch(err => {
+    console.error('❌ No se pudo conectar a MongoDB:', err.message);
+    process.exit(1);
+  });
 
 // ── Registrar modelos de Push (necesario para que Mongoose los reconozca) ─────
 require('./models/PushModels');
@@ -203,7 +229,14 @@ app.get('/api/whatsapp/qr-view', auth, adminOnly, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: '🍔 Janz Burgers API running' });
+  const mongoOk = mongoose.connection.readyState === 1;
+  const { connected: waOk } = getWhatsAppStatus();
+  res.status(mongoOk ? 200 : 503).json({
+    status: mongoOk ? 'ok' : 'degraded',
+    mongo: mongoOk ? 'connected' : 'disconnected',
+    whatsapp: waOk ? 'connected' : 'disconnected',
+    uptime: Math.floor(process.uptime()),
+  });
 });
 
 app.use((err, req, res, next) => {

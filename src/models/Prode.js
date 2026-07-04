@@ -10,19 +10,10 @@ const ProdeMatchSchema = new mongoose.Schema({
   matchDate:      { type: Date, required: true },
   stage:          { type: String, default: 'Fase de Grupos' },
   group:          { type: String, default: '' },
-  status:         { type: String, enum: ['scheduled', 'live', 'finished', 'pending_review'], default: 'scheduled' },
+  status:         { type: String, enum: ['scheduled', 'live', 'finished'], default: 'scheduled' },
   homeScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
   awayScore:      { type: Number, default: null },  // resultado de los 90' (base para pronósticos)
   winner:         { type: String, enum: ['home', 'away', 'draw', null], default: null }, // basado en 90'
-  // ── Resultado detectado automáticamente por el sync, pendiente de confirmación
-  // manual del admin. Mientras pendingReview=true, el resultado NO se pisa en
-  // homeScore/awayScore/winner y por lo tanto NO se evalúan pronósticos ni se
-  // reparten puntos — hasta que el admin confirme (o corrija) desde el panel.
-  pendingReview:    { type: Boolean, default: false },
-  pendingHomeScore: { type: Number, default: null },
-  pendingAwayScore: { type: Number, default: null },
-  pendingWinner:    { type: String, enum: ['home', 'away', 'draw', null], default: null },
-  pendingSince:     { type: Date, default: null },
   // Campos adicionales para eliminación directa — solo informativo, no afectan puntuación
   extraTimeHome:  { type: Number, default: null },  // goles en alargue (home)
   extraTimeAway:  { type: Number, default: null },  // goles en alargue (away)
@@ -33,6 +24,13 @@ const ProdeMatchSchema = new mongoose.Schema({
   qualifiedTeam:  { type: String, default: null },   // quién clasificó (puede diferir del winner de 90')
   // true = ambos equipos definidos; false = alguno es TBD (no se permiten pronósticos)
   teamsConfirmed: { type: Boolean, default: true },
+  // FIX bug "lectura de resultado": se incrementa cada vez que homeScore/awayScore
+  // cambian DESPUÉS de haber tenido un valor real (ej: el sync llegó antes de que
+  // football-data.org publicara el campo regularTime y usó fullTime —que en
+  // partidos con alargue/penales incluye esos goles— como resultado provisorio;
+  // unos minutos después la API corrige el dato y acá lo reflejamos). Sirve para
+  // detectar pronósticos ya evaluados con un resultado que quedó desactualizado.
+  resultVersion:  { type: Number, default: 0 },
 }, { timestamps: true });
 
 // ── Pronostico — pronóstico de un cliente para un partido ─────────────────────
@@ -44,6 +42,10 @@ const PronosticoSchema = new mongoose.Schema({
   predictedAway:   { type: Number, default: null },
   evaluated:       { type: Boolean, default: false },
   pointsEarned:    { type: Number, default: 0 },
+  // Versión de ProdeMatch.resultVersion contra la que se evaluó este pronóstico.
+  // Si difiere de la versión actual del partido, el resultado se corrigió
+  // después de evaluar y hay que re-evaluar (ver reevaluateChangedMatches).
+  evaluatedResultVersion: { type: Number, default: -1 },
 }, { timestamps: true });
 
 PronosticoSchema.index({ clientId: 1, matchId: 1 }, { unique: true });

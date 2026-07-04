@@ -2,7 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { Order, Client } = require('../models/Order');
 const { auth, adminOnly } = require('../middleware/auth');
-const { nowAR, arHour, monthRangeAR, yearRangeAR } = require('../utils/arDate');
+const { nowAR, arHour, arDayOfWeek, monthRangeAR, yearRangeAR } = require('../utils/arDate');
+// FIX: estos require() estaban dentro de los handlers (se ejecutaban en cada
+// request). Node cachea los módulos pero la resolución de path + cache lookup
+// en cada request es innecesaria — mejor declararlos una vez al cargar el archivo.
+const { Recipe, Product } = require('../models/Product');
+const Ingredient = require('../models/Ingredient');
 
 function scoreRFM(value, thresholds) {
   if (value <= thresholds[0]) return 5;
@@ -37,7 +42,7 @@ function getRFMSegment(r, f, m) {
 // ── 1. RFM Segmentation ────────────────────────────────────────────────────
 router.get('/rfm', auth, adminOnly, async (req, res) => {
   try {
-    const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+
     const now = nowAR();
     const clients = await Client.find({ active: true, totalOrders: { $gt: 0 } });
     if (clients.length === 0) return res.json({ segments: [], clients: [], summary: {} });
@@ -81,7 +86,7 @@ router.get('/rfm', auth, adminOnly, async (req, res) => {
 // ── 2. Churn Detection ─────────────────────────────────────────────────────
 router.get('/churn', auth, adminOnly, async (req, res) => {
   try {
-    const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+
     const now = nowAR();
     const lastOrders = await Order.aggregate([
       { $match: { status: { $ne: 'cancelled' } } },
@@ -134,7 +139,7 @@ router.get('/forecast', auth, adminOnly, async (req, res) => {
   try {
     const arNow56 = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
     const since = new Date(arNow56); since.setDate(since.getDate() - 56);
-    const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } });
+    const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } }).lean();
     const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
     const byDow = {};
     days.forEach((d, i) => { byDow[i] = { name: d, orders: [], revenue: [], items: {} }; });
@@ -166,7 +171,16 @@ router.get('/forecast', auth, adminOnly, async (req, res) => {
 // ── 4. Cross-sell ──────────────────────────────────────────────────────────
 router.get('/crosssell', auth, adminOnly, async (req, res) => {
   try {
-    const orders = await Order.find({ status: { $ne: 'cancelled' } }).select('items');
+    // FIX rendimiento: antes Order.find() sin rango de fechas ni .lean() traía
+    // TODOS los pedidos históricos hidratados como objetos Mongoose completos.
+    // Con 2000 pedidos eso son ~40MB en memoria solo para este endpoint.
+    // Ahora: últimos 6 meses (suficiente para el análisis) + .lean() + .select().
+    const since = new Date(); since.setMonth(since.getMonth() - 6);
+    const orders = await Order.find({
+      status: { $ne: 'cancelled' },
+      createdAt: { $gte: since },
+    }).select('items').lean();
+
     const pairCounts = {}; const itemCounts = {};
     orders.forEach(order => {
       const products = order.items.map(i => `${i.productName || '?'} ${i.variant || ''}`.trim());
@@ -195,7 +209,7 @@ router.get('/hourly', auth, adminOnly, async (req, res) => {
   try {
     const arNow30 = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
     const since = new Date(arNow30); since.setDate(since.getDate() - 30);
-    const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } });
+    const orders = await Order.find({ createdAt: { $gte: since }, status: { $ne: 'cancelled' } }).lean();
     const hourly = {};
     for (let h = 0; h < 24; h++) hourly[h] = { hour: h, orders: 0, revenue: 0 };
     orders.forEach(o => { const h = arHour(new Date(o.createdAt)); hourly[h].orders++; hourly[h].revenue += o.total; });
@@ -208,7 +222,7 @@ router.get('/hourly', auth, adminOnly, async (req, res) => {
 // ── 6. Smart Alerts ────────────────────────────────────────────────────────
 router.get('/alerts', auth, adminOnly, async (req, res) => {
   try {
-    const alerts = []; const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+    const alerts = [];
     const now = nowAR();
     const churnCount = await Order.aggregate([
       { $match: { status: { $ne: 'cancelled' } } },
@@ -238,15 +252,15 @@ router.get('/alerts', auth, adminOnly, async (req, res) => {
 router.get('/ingredient-usage', auth, adminOnly, async (req, res) => {
   try {
     const { month, year } = req.query;
-    const { Recipe, Product } = require('../models/Product');
-    const Ingredient = require('../models/Ingredient');
+
+
 
     let start, end;
     if (month && year) {
       start = new Date(Number(year), Number(month) - 1, 1, 0, 0, 0);
       end   = new Date(Number(year), Number(month), 0, 23, 59, 59, 999);
     } else {
-      const { nowAR, arHour, arDayOfWeek } = require("../utils/arDate");
+  
     const now = nowAR();
       start = new Date(now.getFullYear(), now.getMonth(), 1);
       end   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);

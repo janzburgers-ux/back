@@ -9,11 +9,20 @@ const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
 const { addPointsForOrder, getReferralConfig, registerReferralUse, validateReferralUse, isFraudAttempt } = require('../services/loyalty');
 const { processProdeCategoryOnDelivery } = require('../services/prode.service');
+// FIX timezone: usar la utilidad centralizada
+const { nowAR } = require('../utils/arDate');
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function nowAR() {
-  return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires' }));
-}
+// ── Máquina de estados: transiciones válidas ─────────────────────────────────
+// FIX integridad: rechaza transiciones inválidas (ej: cancelled→delivered)
+// que antes ejecutaban efectos secundarios sobre pedidos inexistentes.
+const ALLOWED_TRANSITIONS = {
+  pending:   ['confirmed', 'cancelled'],
+  confirmed: ['preparing', 'cancelled'],
+  preparing: ['ready',     'cancelled'],
+  ready:     ['delivered', 'cancelled'],
+  delivered: [],
+  cancelled: [],
+};
 
 // Nombre amistoso: usa apodo si existe, sino primera palabra del nombre completo
 function friendlyName(client) {
@@ -334,6 +343,16 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' });
 
     const prevStatus = order.status;
+
+    // FIX integridad: validar que la transición esté permitida
+    const allowed = ALLOWED_TRANSITIONS[prevStatus] || [];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        message: `Transición inválida: ${prevStatus} → ${status}. Permitidas desde '${prevStatus}': ${allowed.length ? allowed.join(', ') : 'ninguna (estado terminal)'}.`,
+        currentStatus: prevStatus,
+      });
+    }
+
     order.status = status;
 
     let stockResults = [];
@@ -464,6 +483,11 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       }
 
       await order.save();
+
+      // FIX: totalOrders se incrementa al crear pero nunca se decrementaba al cancelar
+      if (order.client?._id) {
+        await Client.findByIdAndUpdate(order.client._id, { $inc: { totalOrders: -1 } });
+      }
 
       const { reason, notes: rNotes, missingStock } = req.body;
 

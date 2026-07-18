@@ -77,6 +77,13 @@ const orderSchema = new mongoose.Schema({
   notes: { type: String },
   coupon: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon', default: null },
   couponCode: { type: String, default: null },
+  // ── Trazabilidad de cupones rechazados ───────────────────────────────────
+  // Si el cliente intentó un cupón pero terminó no aplicándose (por
+  // ownerOnly, maxUses, ya usado, etc.), queda registrado acá en vez de
+  // perderse en silencio. couponCode queda null (no se aplicó ningún
+  // descuento), pero couponAttempted guarda qué código escribió el cliente.
+  couponAttempted: { type: String, default: null },
+  couponRejectionReason: { type: String, default: null },
   discountAmount: { type: Number, default: 0 },
   discountPercent: { type: Number, default: 0 },
   // 'order' = descuento sobre todo el pedido | 'product' = descuento sobre producto específico

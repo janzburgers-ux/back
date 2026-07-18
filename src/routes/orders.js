@@ -4,7 +4,7 @@ const { Order } = require('../models/Order');
 const { Client } = require('../models/Order');
 const Config = require('../models/Config');
 const { auth, kitchenOrAdmin, adminOnly } = require('../middleware/auth');
-const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateProductAvailability } = require('../services/stock.service');
+const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateProductAvailability, broadcastAvailability } = require('../services/stock.service');
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
 const { addPointsForOrder, getReferralConfig, registerReferralUse, validateReferralUse, isFraudAttempt } = require('../services/loyalty');
@@ -175,15 +175,28 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
     const Coupon = require('../models/Coupon');
     const { client: clientData, items, paymentMethod, notes, deliveryType, couponCode, zone } = req.body;
 
-    // Cupón
+    // Cupón — mismo motor que usa el checkout público (services/coupon.service.js),
+    // para que un pedido cargado a mano no aplique un cupón que en realidad
+    // no le corresponde a ese cliente (ownerOnly, maxUses, ya usado, etc.)
     let couponDoc = null;
     let discountPercent = 0;
     let discountType = 'order';
     let discountAmount = 0;
     let applicableProductId = null;
+    let couponRejectionReason = null;
 
     if (couponCode) {
+      const { checkCouponEligibility } = require('../services/coupon.service');
       couponDoc = await Coupon.findOne({ code: couponCode.toUpperCase(), active: true });
+      if (!couponDoc) {
+        couponRejectionReason = 'inactive';
+      } else {
+        const eligibility = await checkCouponEligibility(couponDoc, clientData.whatsapp);
+        if (!eligibility.ok) {
+          couponRejectionReason = eligibility.reason;
+          couponDoc = null;
+        }
+      }
       if (couponDoc) {
         discountPercent = couponDoc.discountForUser;
         if (couponDoc.applicableProduct) {
@@ -280,6 +293,8 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
       notes,
       coupon: couponDoc ? couponDoc._id : null,
       couponCode: couponDoc ? couponDoc.code : null,
+      couponAttempted: (couponCode && !couponDoc) ? couponCode.toUpperCase() : null,
+      couponRejectionReason: (couponCode && !couponDoc) ? couponRejectionReason : null,
       discountPercent,
       discountAmount,
       discountType,
@@ -303,6 +318,7 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
       await deductStockForOrder(order.items);
       await Order.findByIdAndUpdate(order._id, { stockDeducted: true });
       autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+      broadcastAvailability(req.app.get('io')).catch(() => {});
     } catch (e) { console.error('Error descontando stock:', e.message); }
 
     await Client.findByIdAndUpdate(client._id, { $inc: { totalOrders: 1 } });
@@ -370,6 +386,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
         stockResults = await deductStockForOrder(order.items);
         order.stockDeducted = true;
         autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+        broadcastAvailability(req.app.get('io')).catch(() => {});
       }
 
       if (order.client?.whatsapp) {
@@ -424,6 +441,17 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           if (coupon.type === 'loyalty' || coupon.singleUse) {
             await Coupon.findByIdAndUpdate(coupon._id, { active: false });
           }
+
+          // Cupón con tope de usos (maxUses, ej: premio 2do puesto Prode) →
+          // desactivar apenas se confirma el pedido que llega al tope, para
+          // que no quede "activo" en la lista dando a entender que se puede
+          // seguir usando cuando en realidad ya no es elegible.
+          if (coupon.maxUses) {
+            const usesCount = await Coupon.findById(coupon._id).then(c => c.totalUses);
+            if (usesCount >= coupon.maxUses) {
+              await Coupon.findByIdAndUpdate(coupon._id, { active: false });
+            }
+          }
         }
       }
 
@@ -457,6 +485,7 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
           await returnStockForOrder(order.items);
           await Order.findByIdAndUpdate(order._id, { stockDeducted: false });
           autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+          broadcastAvailability(req.app.get('io')).catch(() => {});
         } catch (e) { console.error('Error devolviendo stock:', e.message); }
       }
 
@@ -475,6 +504,11 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
               });
               // Si era de 1 uso y fue desactivado, re-activar
               if ((coupon.singleUse || coupon.type === 'loyalty') && !coupon.active) {
+                await Coupon.findByIdAndUpdate(coupon._id, { active: true });
+              }
+              // Si tenía tope de usos y quedó desactivado al llegar al tope,
+              // esta cancelación lo deja de nuevo por debajo del tope → reactivar.
+              if (coupon.maxUses && !coupon.active && (coupon.totalUses - 1) < coupon.maxUses) {
                 await Coupon.findByIdAndUpdate(coupon._id, { active: true });
               }
             }
@@ -686,6 +720,7 @@ router.delete('/:id', auth, adminOnly, async (req, res) => {
         await returnStockForOrder(order.items);
         stockReturned = true;
         autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+        broadcastAvailability(req.app.get('io')).catch(() => {});
       } catch (e) {
         console.error('Error devolviendo stock al eliminar pedido:', e.message);
         // No abortamos: el pedido se elimina igual, pero logueamos el problema

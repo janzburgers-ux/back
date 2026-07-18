@@ -3,13 +3,23 @@ const router = express.Router();
 const Stock = require('../models/Stock');
 const Ingredient = require('../models/Ingredient');
 const { auth, adminOnly } = require('../middleware/auth');
-const { autoUpdateProductAvailability } = require('../services/stock.service');
+const { autoUpdateProductAvailability, getLiveAvailability, broadcastAvailability } = require('../services/stock.service');
 
 // Get all stock
 router.get('/', auth, async (req, res) => {
   try {
     const stocks = await Stock.find().populate('ingredient').sort('status');
     res.json(stocks);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET disponibilidad en vivo por producto/adicional (unidades exactas, no solo sí/no)
+router.get('/availability', auth, async (req, res) => {
+  try {
+    const data = await getLiveAvailability();
+    res.json(data);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -28,6 +38,7 @@ router.put('/:id', auth, adminOnly, async (req, res) => {
     
     await stock.save();
     autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+    broadcastAvailability(req.app.get('io')).catch(() => {});
 
     const populated = await Stock.findById(stock._id).populate('ingredient');
     res.json(populated);
@@ -52,6 +63,7 @@ router.post('/bulk-update', auth, adminOnly, async (req, res) => {
     }
 
     autoUpdateProductAvailability().catch(e => console.error('Auto-availability error:', e.message));
+    broadcastAvailability(req.app.get('io')).catch(() => {});
     res.json(results);
   } catch (err) {
     res.status(400).json({ message: err.message });

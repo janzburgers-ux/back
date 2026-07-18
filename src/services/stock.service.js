@@ -466,6 +466,88 @@ async function returnStockForOrder(orderItems) {
   }
 }
 
+// ── Disponibilidad en tiempo real, en UNIDADES (no solo sí/no) ──────────────
+// autoUpdateProductAvailability de arriba solo sabe "se puede hacer 1 más o no".
+// Esto calcula CUÁNTAS unidades más se pueden vender ahora mismo con el stock
+// actual, tomando —para cada producto— el ingrediente más restrictivo de su
+// receta (el "cuello de botella"). Como el cálculo es siempre en vivo contra
+// el stock de cada ingrediente, cuando dos productos comparten un ingrediente
+// (ej. el mismo pan), vender uno baja automáticamente el número disponible
+// del otro también — sin necesidad de precalcular combinaciones de carrito.
+const LOW_STOCK_THRESHOLD = 3; // por debajo de esto (y > 0): semáforo "quedan pocas"
+
+async function getLiveAvailability() {
+  const Additional = require('../models/Additional');
+
+  const [products, allStock] = await Promise.all([
+    Product.find({ active: true }).lean(),
+    Stock.find().lean(),
+  ]);
+
+  const stockMap = {}; // ingredientId -> currentStock
+  allStock.forEach(s => { stockMap[s.ingredient.toString()] = s.currentStock; });
+
+  const recipeIds = [...new Set(products.filter(p => p.recipe).map(p => p.recipe.toString()))];
+  const recipes = recipeIds.length ? await Recipe.find({ _id: { $in: recipeIds } }).lean() : [];
+  const recipeMap = {};
+  recipes.forEach(r => { recipeMap[r._id.toString()] = r; });
+
+  const products_ = products.map(p => {
+    const base = { productId: p._id.toString(), name: p.name, variant: p.variant };
+    if (!p.recipe || !recipeMap[p.recipe.toString()]) {
+      // Sin receta cargada: no se puede calcular unidades, se deja como estaba (available booleano)
+      return { ...base, unitsAvailable: null, lowStock: false, available: p.available !== false };
+    }
+    const recipe = recipeMap[p.recipe.toString()];
+    let minUnits = Infinity;
+    let bottleneckIngredient = null;
+    for (const ri of (recipe.ingredients || [])) {
+      const ingId = ri.ingredient?.toString();
+      if (!ingId) continue;
+      const stock = stockMap[ingId] || 0;
+      const possible = ri.quantity > 0 ? Math.floor(stock / ri.quantity) : Infinity;
+      if (possible < minUnits) { minUnits = possible; bottleneckIngredient = ingId; }
+    }
+    if (minUnits === Infinity) minUnits = 0;
+    return {
+      ...base,
+      unitsAvailable: minUnits,
+      lowStock: minUnits > 0 && minUnits <= LOW_STOCK_THRESHOLD,
+      available: minUnits > 0,
+      bottleneckIngredient,
+    };
+  });
+
+  const additionalsDocs = await Additional.find({ active: true, ingredient: { $ne: null } }).lean();
+  const additionals_ = additionalsDocs.map(a => {
+    const stock = stockMap[a.ingredient.toString()] || 0;
+    const unitsAvailable = a.consumesQuantity > 0 ? Math.floor(stock / a.consumesQuantity) : null;
+    return {
+      additionalId: a._id.toString(),
+      name: a.name,
+      unitsAvailable,
+      lowStock: unitsAvailable !== null && unitsAvailable > 0 && unitsAvailable <= LOW_STOCK_THRESHOLD,
+      available: unitsAvailable === null || unitsAvailable > 0,
+    };
+  });
+
+  return { products: products_, additionals: additionals_, generatedAt: new Date() };
+}
+
+// ── Emitir la disponibilidad en vivo por Socket.IO ───────────────────────────
+// Se llama después de cualquier cambio de stock (pedido creado/confirmado/
+// cancelado, carga manual de mercadería) para que el menú público y el panel
+// de stock se actualicen solos, sin que nadie tenga que recargar la página.
+async function broadcastAvailability(io) {
+  if (!io) return;
+  try {
+    const payload = await getLiveAvailability();
+    io.emit('stock_availability', payload);
+  } catch (err) {
+    console.error('Error emitiendo stock_availability:', err.message);
+  }
+}
+
 module.exports = {
   reserveStockForOrder,
   deductStockForOrder,
@@ -478,4 +560,7 @@ module.exports = {
   autoUpdateAdditionalAvailability,
   autoUpdatePromoAvailability,
   returnStockForOrder,
+  getLiveAvailability,
+  broadcastAvailability,
+  LOW_STOCK_THRESHOLD,
 };

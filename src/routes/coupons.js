@@ -96,45 +96,15 @@ router.post('/validate', async (req, res) => {
 
     if (!coupon) return res.status(404).json({ message: 'Cupón inválido o inactivo' });
 
-    // Verificar expiración
-    if (coupon.expiresAt && new Date() > new Date(coupon.expiresAt)) {
-      return res.status(400).json({ message: 'Este cupón está vencido' });
-    }
-
-    // ── Anti-fraude: bloquear que el dueño use su propio cupón de referido ──
-    if (coupon.type === 'referral' && coupon.blockedOwnerUse !== false) {
-      const { isFraudAttempt } = require('../services/loyalty');
-      const fraud = await isFraudAttempt(coupon, whatsapp);
-      if (fraud) return res.status(400).json({ message: 'No podés usar tu propio cupón de referido' });
-    }
-
-    // ── Cupón de referido: solo 1 uso por cliente (independiente de unlimited) ──
-    // La lógica de referidos es traer clientes NUEVOS; el mismo cliente no puede
-    // volver a beneficiarse del descuento de un cupón ajeno más de una vez.
-    if (coupon.type === 'referral') {
-      const client = await Client.findOne({ whatsapp, active: true });
-      if (client) {
-        const alreadyUsed = coupon.uses.some(
-          u => u.client?.toString() === client._id.toString()
-        );
-        if (alreadyUsed) {
-          return res.status(400).json({ message: 'Ya utilizaste este cupón anteriormente' });
-        }
-      }
-    }
-
-    if (!coupon.unlimited) {
-      const client = await Client.findOne({ whatsapp, active: true });
-      if (client) {
-        const existingOrder = await Order.findOne({
-          coupon: coupon._id, client: client._id, status: { $ne: 'cancelled' }
-        });
-        if (existingOrder) return res.status(400).json({ message: 'Ya usaste este cupón anteriormente' });
-      }
-      if (coupon.singleUse) {
-        const anyActiveOrder = await Order.findOne({ coupon: coupon._id, status: { $ne: 'cancelled' } });
-        if (anyActiveOrder) return res.status(400).json({ message: 'Este cupón ya fue utilizado' });
-      }
+    // ── Mismo motor que usa la creación real del pedido ──────────────────────
+    // FIX: antes este endpoint tenía su propia copia parcial de las reglas
+    // (no chequeaba ownerOnly, no chequeaba blockedOwnerUse fuera de 'referral',
+    // no chequeaba maxUses) → el cliente veía "cupón válido" acá y después,
+    // al crear el pedido de verdad, el cupón se caía en silencio.
+    const { checkCouponEligibility } = require('../services/coupon.service');
+    const eligibility = await checkCouponEligibility(coupon, whatsapp);
+    if (!eligibility.ok) {
+      return res.status(400).json({ message: eligibility.message, reason: eligibility.reason });
     }
 
     const response = {

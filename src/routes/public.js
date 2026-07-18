@@ -8,7 +8,7 @@ const { sendOrderReceived, sendMessage } = require('../services/whatsapp');
 const Review = require('../models/Review');
 const Coupon = require('../models/Coupon');
 const PinVerification = require('../models/PinVerification');
-const { calcPackagingCost, reserveStockForOrder, deductStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability } = require('../services/stock.service');
+const { calcPackagingCost, reserveStockForOrder, deductStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability, broadcastAvailability } = require('../services/stock.service');
 const Promo    = require('../models/Promo');
 const { estimateWaitTime } = require('../services/kitchen-capacity');
 // FIX timezone: centralizado en arDate.js — las copias locales tenían el
@@ -170,25 +170,21 @@ router.get('/menu', async (req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    // Modelos que se usaban con require() perezoso dentro del handler;
-    // se mantienen igual, solo se adelantan para poder usarlos en el
-    // Promise.all de abajo.
-    const Stock = require('../models/Stock');
-    const { Recipe } = require('../models/Product');
 
     // ── Consultas independientes en paralelo ──────────────────────────────
     // Antes: isOpen(), products, additionals, 3x Config.findOne() y
     // Stock.find() se esperaban una por una (7 round-trips secuenciales a
     // Mongo). Ninguna depende del resultado de otra, así que se piden todas
     // juntas. Los 3 Config.findOne además se combinan en un solo find($in).
-    const [open, products, additionals, configDocs, allStocks] = await Promise.all([
+    // (La consulta de Stock se sacó de acá porque ahora vive adentro de
+    // getLiveAvailability(), que se llama más abajo — evita duplicarla.)
+    const [open, products, additionals, configDocs] = await Promise.all([
       isOpen(),
       Product.find({ active: true, visible: { $ne: false } }).sort('name variant').lean(),
       Additional.find({ active: true }).sort('name')
         .select('name description price emoji category appliesTo available ingredient consumesQuantity consumesUnit')
         .lean(),
       Config.find({ key: { $in: ['zones', 'orderLimits', 'business'] } }).lean(),
-      Stock.find().select('ingredient status').lean(),
     ]);
 
     const configByKey = {};
@@ -207,35 +203,24 @@ router.get('/menu', async (req, res) => {
 
     const businessWhatsapp = configByKey.business?.whatsappNumber || '';
 
-    // ── Calcular stockWarning por producto ──────────────────────────────────
-    // Para cada producto, verificar si algún ingrediente de su receta está en 'low' o 'out'
-    const stockStatusMap = {}; // ingredientId -> status
-    allStocks.forEach(s => { stockStatusMap[s.ingredient.toString()] = s.status; });
-
-    // ── Recetas: una sola consulta para todas, en vez de 1 por producto ────
-    // Antes este `for` hacía `await Recipe.findById(...)` adentro, es decir
-    // una consulta secuencial a Mongo por cada producto con receta. Ahora se
-    // traen todas las recetas necesarias de una sola vez con $in y se arma
-    // un mapa en memoria; el resultado final (stockWarning por producto) es
-    // exactamente el mismo.
-    const recipeIds = [...new Set(products.filter(p => p.recipe).map(p => p.recipe.toString()))];
-    const recipes = recipeIds.length
-      ? await Recipe.find({ _id: { $in: recipeIds } }).select('ingredients').populate('ingredients.ingredient', '_id').lean()
-      : [];
-    const recipeWarningMap = {}; // recipeId -> boolean (algún ingrediente low/out)
-    recipes.forEach(recipe => {
-      const hasWarning = recipe.ingredients.some(ri => {
-        const ingId = ri.ingredient?._id?.toString();
-        return ingId && (stockStatusMap[ingId] === 'low' || stockStatusMap[ingId] === 'out');
-      });
-      recipeWarningMap[recipe._id.toString()] = hasWarning;
-    });
+    // ── Disponibilidad por producto: mismo motor que usa el panel admin y el ──
+    // push en vivo por Socket.IO (services/stock.service.js::getLiveAvailability).
+    // Antes acá se calculaba "stockWarning" de forma propia, aparte, mirando
+    // solo si algún ingrediente estaba en 'low'/'out' sin importar cuántas
+    // unidades quedaban realmente. Ahora es un único cálculo compartido, así
+    // el número que ve el cliente al cargar la página es siempre el mismo que
+    // el que después llega por el socket cuando se actualiza en vivo.
+    const { getLiveAvailability } = require('../services/stock.service');
+    const liveAvailability = await getLiveAvailability();
+    const availabilityMap = {}; // productId -> { unitsAvailable, lowStock, available }
+    liveAvailability.products.forEach(p => { availabilityMap[p.productId] = p; });
 
     // Agrupar productos por nombre (con stockWarning calculado)
     const menu = {};
     for (const p of products) {
       if (!menu[p.name]) menu[p.name] = [];
-      const stockWarning = p.recipe ? !!recipeWarningMap[p.recipe.toString()] : false;
+      const live = availabilityMap[p._id.toString()];
+      const stockWarning = !!live?.lowStock;
       menu[p.name].push({
         _id: p._id, name: p.name, variant: p.variant,
         salePrice: p.salePrice, available: p.available,
@@ -247,7 +232,7 @@ router.get('/menu', async (req, res) => {
       });
     }
 
-    const anyLowStock = Object.values(stockStatusMap).some(s => s === 'low' || s === 'out');
+    const anyLowStock = liveAvailability.products.some(p => p.lowStock || p.available === false);
 
     // ── Promos activas y disponibles ──────────────────────────────────────────
     const promosDocs = await Promo.find({ active: true }).populate('components.product', 'name variant salePrice image available active');
@@ -453,110 +438,49 @@ router.post('/order', async (req, res) => {
     let discountType = 'order';
     let discountAmount = 0;
     let applicableProductId = null;
+    // Trazabilidad: si el cliente mandó un couponCode pero terminó sin aplicarse,
+    // acá queda por qué — para que no se pierda en silencio (ver Order.couponAttempted).
+    let couponRejectionReason = null;
 
     if (couponCode) {
+      const { checkCouponEligibility } = require('../services/coupon.service');
       couponDoc = await Coupon.findOne({ code: couponCode.toUpperCase(), active: true });
 
-      if (couponDoc) {
-        // Verificar expiración
-        if (couponDoc.expiresAt && new Date() > new Date(couponDoc.expiresAt)) {
-          couponDoc = null; // cupón vencido
+      if (!couponDoc) {
+        couponRejectionReason = 'inactive';
+      } else {
+        const eligibility = await checkCouponEligibility(couponDoc, clientData.whatsapp);
+        if (!eligibility.ok) {
+          couponRejectionReason = eligibility.reason;
+          couponDoc = null;
         }
       }
 
       if (couponDoc) {
-        // ── Cupón de referido: solo 1 uso por cliente ──────────────────────
-        // Chequeo independiente del flag unlimited — un cliente no puede usar
-        // el cupón de otro más de una vez, sin importar configuración.
-        if (couponDoc.type === 'referral') {
-          const clientForCheck = await Client.findOne({ whatsapp: clientData.whatsapp, active: true });
-          if (clientForCheck) {
-            const alreadyUsed = couponDoc.uses.some(
-              u => u.client?.toString() === clientForCheck._id.toString()
-            );
-            if (alreadyUsed) {
-              couponDoc = null; // bloquear silenciosamente (ya fue validado en /validate)
-            }
+        // FIX race condition: findOneAndUpdate atómico reemplaza el read-then-check
+        // no atómico. Dos pedidos concurrentes con el mismo cupón ya no pueden
+        // pasar ambos — solo uno puede marcar active=false exitosamente.
+        if (couponDoc.singleUse) {
+          const locked = await Coupon.findOneAndUpdate(
+            { _id: couponDoc._id, active: true },
+            { $set: { active: false, _lockReservedAt: new Date() } },
+            { new: false }
+          );
+          if (!locked) {
+            couponDoc = null;
+            couponRejectionReason = 'singleUseTaken';
           }
         }
       }
 
       if (couponDoc) {
-        // Verificar si ya fue usado por este cliente en algún pedido NO cancelado
-        if (!couponDoc.unlimited) {
-          const existingOrder = await Order.findOne({
-            coupon: couponDoc._id,
-            'client': await (async () => {
-              const c = await Client.findOne({ whatsapp: clientData.whatsapp, active: true });
-              return c?._id || null;
-            })(),
-            status: { $ne: 'cancelled' }
-          });
-
-          if (existingOrder) {
-            couponDoc = null; // ya lo usó en un pedido válido
-          }
+        discountPercent = couponDoc.discountForUser;
+        if (couponDoc.applicableProduct) {
+          discountType = 'product';
+          applicableProductId = couponDoc.applicableProduct.toString();
         }
-
-        if (couponDoc) {
-          // FIX race condition: findOneAndUpdate atómico reemplaza el read-then-check
-          // no atómico. Dos pedidos concurrentes con el mismo cupón ya no pueden
-          // pasar ambos — solo uno puede marcar active=false exitosamente.
-          if (couponDoc.singleUse) {
-            const locked = await Coupon.findOneAndUpdate(
-              { _id: couponDoc._id, active: true },
-              { $set: { active: false, _lockReservedAt: new Date() } },
-              { new: false }
-            );
-            if (!locked) couponDoc = null;
-          }
-        }
-
-        if (couponDoc) {
-          discountPercent = couponDoc.discountForUser;
-          if (couponDoc.applicableProduct) {
-            discountType = 'product';
-            applicableProductId = couponDoc.applicableProduct.toString();
-          }
-          if (couponDoc.applicableVariant) {
-            discountType = 'variant';
-          }
-          // Cupón de premio Prode: solo lo puede usar el ganador (mismo WhatsApp)
-          if (couponDoc.ownerOnly) {
-            const ownerDoc = await Client.findById(couponDoc.owner).select('whatsapp');
-            const ownerPhone = (ownerDoc?.whatsapp || '').replace(/\D/g, '');
-            const userPhone  = (clientData.whatsapp || '').replace(/\D/g, '');
-            if (!ownerPhone || ownerPhone !== userPhone) {
-              couponDoc = null;
-              discountPercent = 0;
-              discountType = 'order';
-            }
-          }
-          // FIX blockedOwnerUse: el dueño de un cupón de referido no puede
-          // usarlo en su propio pedido. Este check faltaba acá (solo estaba en
-          // /coupons/validate), dejando un bypass funcional en el checkout real.
-          if (couponDoc && couponDoc.blockedOwnerUse && couponDoc.owner) {
-            const ownerDoc = await Client.findById(couponDoc.owner).select('whatsapp');
-            const ownerPhone = (ownerDoc?.whatsapp || '').replace(/\D/g, '');
-            const userPhone  = (clientData.whatsapp || '').replace(/\D/g, '');
-            if (ownerPhone && ownerPhone === userPhone) {
-              couponDoc = null;
-              discountPercent = 0;
-              discountType = 'order';
-            }
-          }
-          // Cupón con tope de usos (ej: premio 2do puesto Prode = 2 usos)
-          if (couponDoc && couponDoc.maxUses) {
-            const usesCount = await Order.countDocuments({
-              coupon: couponDoc._id,
-              status: { $ne: 'cancelled' }
-            });
-            if (usesCount >= couponDoc.maxUses) {
-              couponDoc = null;
-              discountPercent = 0;
-              discountType = 'order';
-            }
-          }
+        if (couponDoc.applicableVariant) {
+          discountType = 'variant';
         }
       }
     }
@@ -713,6 +637,9 @@ router.post('/order', async (req, res) => {
       notes,
       coupon: couponDoc ? couponDoc._id : null,
       couponCode: couponDoc ? couponDoc.code : (hourlyDiscountApplied ? `HORARIO ${hDisc.fromHour}-${hDisc.toHour}` : null),
+      // Si mandó un código y no se aplicó, queda registrado acá (ver services/coupon.service.js)
+      couponAttempted: (couponCode && !couponDoc) ? couponCode.toUpperCase() : null,
+      couponRejectionReason: (couponCode && !couponDoc) ? couponRejectionReason : null,
       discountPercent,
       discountAmount,
       discountType,
@@ -747,6 +674,7 @@ router.post('/order', async (req, res) => {
       await autoUpdateProductAvailability();
       await autoUpdateAdditionalAvailability();
       await autoUpdatePromoAvailability();
+      broadcastAvailability(req.app.get('io')).catch(() => {});
     } catch (e) {
       console.error('Error descontando stock:', e.message);
     }
@@ -779,6 +707,12 @@ router.post('/order', async (req, res) => {
       discountPercent: order.discountPercent || 0,
       discountType: order.discountType || 'order',
       couponCode: order.couponCode || null,
+      // Aviso explícito si el cliente intentó un cupón y no se pudo aplicar,
+      // en vez de que se entere recién cuando llega el WhatsApp de confirmación.
+      couponRejected: !!order.couponAttempted,
+      couponRejectionMessage: order.couponAttempted
+        ? 'Tu cupón no pudo aplicarse a este pedido, por eso el total no tiene descuento.'
+        : null,
       deliveryCost: order.deliveryCost || 0,
       items: order.items,
       estimatedMinutes: order.estimatedMinutes || null,
@@ -944,12 +878,13 @@ router.put('/order/:id/cancel', async (req, res) => {
     // Devolver stock si ya se había descontado
     if (order.stockDeducted) {
       try {
-        const { returnStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability } = require('../services/stock.service');
+        const { returnStockForOrder, autoUpdateProductAvailability, autoUpdateAdditionalAvailability, autoUpdatePromoAvailability, broadcastAvailability } = require('../services/stock.service');
         await returnStockForOrder(order.items);
         await Order.findByIdAndUpdate(order._id, { stockDeducted: false });
         await autoUpdateProductAvailability();
         await autoUpdateAdditionalAvailability();
         await autoUpdatePromoAvailability();
+        broadcastAvailability(req.app.get('io')).catch(() => {});
       } catch (e) { console.error('Error devolviendo stock (cancel cliente):', e.message); }
     }
 

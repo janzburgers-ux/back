@@ -28,9 +28,6 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-// Estado de iniciación (persiste en memoria mientras el proceso vive)
-let whatsappInitiated = false;
-
 const app = express();
 
 // FIX: Railway corre detrás de proxy — sin esto el rate limiter toma la IP
@@ -141,7 +138,6 @@ app.use('/api/analytics',       require('./routes/analytics'));
 app.use('/api/churn-job',       require('./routes/churn-job'));
 app.use('/api/rejected-orders', require('./routes/rejected-orders'));
 app.use('/api/expenses',        require('./routes/expenses'));
-app.use('/api/prode',           require('./routes/prode'));
 
 app.use('/api/cash-movements',  require('./routes/cash-movements'));
 
@@ -162,30 +158,11 @@ app.use('/api/reviews',            require('./routes/reviews'));
 // ── Jobs automáticos ──────────────────────────────────────────────────────────
 const { startChurnJob }                = require('./jobs/churn-alert');
 const { startBirthdayJob }             = require('./jobs/birthday-coupons');
-const { startProdeSync }               = require('./jobs/prode-sync');
-const { startProdeNotificationsJob }   = require('./jobs/prode-notifications');
 const { startKitchenAlertJob }         = require('./jobs/kitchen-alert');
-const { startProdePrizesJob }          = require('./jobs/prode-prizes');
 mongoose.connection.once('open', async () => {
-  // ── Auto-fix índice corrupto en prodepoints (una sola vez) ──────────────────
-  try {
-    const ppColl = mongoose.connection.db.collection('prodepoints');
-    const idxs   = await ppColl.indexes();
-    const bad    = idxs.find(i => i.name === 'clientId_1_subtipo_1' && !i.partialFilterExpression);
-    if (bad) {
-      await ppColl.dropIndex('clientId_1_subtipo_1');
-      console.log('✅ [startup] Índice prodepoints corregido (se recreará con partial filter)');
-    }
-  } catch (e) {
-    console.warn('⚠️ [startup] No se pudo verificar índice prodepoints:', e.message);
-  }
-
   startChurnJob().catch(err => console.error('❌ Error iniciando churn job:', err.message));
   startKitchenAlertJob();
-  startProdePrizesJob();
   startBirthdayJob();
-  startProdeSync();
-  startProdeNotificationsJob();
 });
 
 // ── WhatsApp: status, initiate bajo demanda, y QR ────────────────────────────
@@ -193,18 +170,20 @@ const { auth, adminOnly } = require('./middleware/auth');
 
 // GET estado actual de WhatsApp (conectado / desconectado / tiene QR listo)
 app.get('/api/whatsapp/status', auth, adminOnly, (req, res) => {
-  const { connected } = getWhatsAppStatus();
+  const { connected, initiated } = getWhatsAppStatus();
   const hasQR = !!getCurrentQR();
-  res.json({ connected, hasQR, initiated: whatsappInitiated });
+  res.json({ connected, hasQR, initiated });
 });
 
 // POST iniciar WhatsApp bajo demanda — genera el proceso y el QR
 // Solo admin puede disparar esto. Evita que actores externos inicien sesiones.
+// Si no se escanea el QR dentro del timeout (ver whatsapp.js), se apaga solo
+// y hay que volver a llamar a este endpoint para reintentar.
 app.post('/api/whatsapp/initiate', auth, adminOnly, (req, res) => {
-  if (whatsappInitiated) {
+  const { initiated } = getWhatsAppStatus();
+  if (initiated) {
     return res.json({ ok: true, alreadyInitiated: true });
   }
-  whatsappInitiated = true;
   initWhatsApp();
   const backendUrl = (process.env.BACKEND_URL || `http://localhost:${process.env.PORT || 5000}`);
   res.json({ ok: true, qrViewUrl: `${backendUrl}/api/whatsapp/qr-view` });

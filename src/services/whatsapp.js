@@ -5,9 +5,31 @@ const Config = require('../models/Config');
 let client = null;
 let isReady = false;
 let currentQR = null;
+let initiated = false; // true entre que se aprieta "iniciar" y que se conecta o se apaga por timeout
+
+// Tiempo máximo esperando que escaneen el QR antes de apagar Chromium/Puppeteer
+// solo. Configurable por env por si en algún momento hace falta más margen.
+const QR_TIMEOUT_MS = Number(process.env.WHATSAPP_QR_TIMEOUT_MS) || 3 * 60 * 1000; // 3 min
+let qrTimeoutHandle = null;
 
 function getCurrentQR() { return currentQR; }
-function getWhatsAppStatus() { return { connected: isReady }; }
+function getWhatsAppStatus() { return { connected: isReady, initiated }; }
+
+// Apaga el cliente de Puppeteer y resetea el estado para que haya que
+// volver a apretar el botón de "iniciar" desde el panel.
+async function shutdownWhatsApp(reason) {
+  clearTimeout(qrTimeoutHandle);
+  qrTimeoutHandle = null;
+  currentQR = null;
+  isReady = false;
+  initiated = false;
+  const oldClient = client;
+  client = null;
+  if (oldClient) {
+    console.log(`🔌 Apagando WhatsApp (${reason})...`);
+    try { await oldClient.destroy(); } catch (e) { console.warn('⚠️ Error destruyendo cliente WhatsApp:', e.message); }
+  }
+}
 
 function normalizePhone(phoneNumber) {
   let clean = phoneNumber.replace(/\D/g, '');
@@ -19,6 +41,9 @@ function normalizePhone(phoneNumber) {
 }
 
 function initWhatsApp() {
+  if (initiated) return; // ya hay una instancia corriendo, no duplicar
+  initiated = true;
+
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
     puppeteer: {
@@ -28,16 +53,38 @@ function initWhatsApp() {
     }
   });
 
+  // FIX gasto de memoria: si nadie escanea el QR, Chromium quedaba corriendo
+  // para siempre. A los QR_TIMEOUT_MS lo apagamos solo y hay que volver a
+  // apretar el botón de "iniciar" en el panel.
+  qrTimeoutHandle = setTimeout(() => {
+    if (!isReady) shutdownWhatsApp(`QR no escaneado dentro de los ${Math.round(QR_TIMEOUT_MS / 60000)} min`);
+  }, QR_TIMEOUT_MS);
+
   client.on('qr', (qr) => {
     currentQR = qr;
     console.log('\n📱 QR generado — escanealo en /api/whatsapp/qr-view\n');
     qrcode.generate(qr, { small: true });
   });
 
-  client.on('ready', () => { isReady = true; currentQR = null; console.log('✅ WhatsApp conectado y listo'); });
-  client.on('disconnected', (reason) => { isReady = false; console.log('⚠️ WhatsApp desconectado:', reason); setTimeout(initWhatsApp, 5000); });
-  client.on('auth_failure', () => { isReady = false; console.log('❌ Error de autenticación WhatsApp'); });
-  client.initialize().catch(err => console.error('❌ Error iniciando WhatsApp:', err.message));
+  client.on('ready', () => {
+    isReady = true;
+    currentQR = null;
+    clearTimeout(qrTimeoutHandle); // ya conectó, se cancela el apagado automático
+    qrTimeoutHandle = null;
+    console.log('✅ WhatsApp conectado y listo');
+  });
+
+  // FIX: antes esto reintentaba initWhatsApp() solo cada 5s de forma infinita,
+  // lo que podía quedar respawneando Chromium en loop. Ahora simplemente se
+  // apaga y hay que volver a apretar el botón — consistente con el uso manual
+  // en cada deploy que ya usás.
+  client.on('disconnected', (reason) => { shutdownWhatsApp(`desconectado: ${reason}`); });
+  client.on('auth_failure', () => { shutdownWhatsApp('fallo de autenticación'); });
+
+  client.initialize().catch(err => {
+    console.error('❌ Error iniciando WhatsApp:', err.message);
+    shutdownWhatsApp('error al inicializar');
+  });
 }
 
 // ⚠️ initWhatsApp() ya NO se llama automáticamente.
@@ -141,7 +188,7 @@ async function sendOrderCancelled(phoneNumber, clientName, publicCode, orderNumb
   return sendMessage(phoneNumber, message);
 }
 
-module.exports = { initWhatsApp, sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
+module.exports = { initWhatsApp, shutdownWhatsApp, sendMessage, sendOrderReceived, sendOrderCancelled, sendOrderConfirmation, sendOrderReady, sendReviewRequest, getWhatsAppStatus, getCurrentQR };
 
 
 // ── Mensaje 5: Solicitud de reseña (post-entrega) ─────────────────────────────

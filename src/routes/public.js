@@ -435,9 +435,12 @@ router.post('/order', async (req, res) => {
     // ── Validar cupón ──────────────────────────────────────────────────────────
     let couponDoc = null;
     let discountPercent = 0;
+    let discountMode = 'percent';
+    let fixedAmount = 0;
     let discountType = 'order';
     let discountAmount = 0;
     let applicableProductId = null;
+    let variantQuantity = 1;
     // Trazabilidad: si el cliente mandó un couponCode pero terminó sin aplicarse,
     // acá queda por qué — para que no se pierda en silencio (ver Order.couponAttempted).
     let couponRejectionReason = null;
@@ -475,12 +478,15 @@ router.post('/order', async (req, res) => {
 
       if (couponDoc) {
         discountPercent = couponDoc.discountForUser;
+        discountMode = couponDoc.discountMode || 'percent';
+        fixedAmount = couponDoc.fixedAmount || 0;
         if (couponDoc.applicableProduct) {
           discountType = 'product';
           applicableProductId = couponDoc.applicableProduct.toString();
         }
         if (couponDoc.applicableVariant) {
           discountType = 'variant';
+          variantQuantity = couponDoc.variantQuantity || 1;
         }
       }
     }
@@ -567,23 +573,41 @@ router.post('/order', async (req, res) => {
     }
 
     // Calcular discountAmount
-    if (discountType === 'product' && applicableProductId && discountPercent > 0) {
+    if (discountType === 'product' && applicableProductId && (discountPercent > 0 || (discountMode === 'fixed' && fixedAmount > 0))) {
       // Solo aplica a los ítems del producto específico
       const applicableItems = orderItems.filter(i => i.product.toString() === applicableProductId);
       const applicableSubtotal = applicableItems.reduce((sum, item) => {
         const addsCost = (item.additionals || []).reduce((s, a) => s + a.unitPrice * (a.quantity || 1), 0);
         return sum + (item.unitPrice * item.quantity) + addsCost;
       }, 0);
-      discountAmount = Math.round(applicableSubtotal * discountPercent / 100);
-    } else if (discountType === 'variant' && couponDoc?.applicableVariant && discountPercent > 0) {
-      // Cupón de premio Prode: aplica a UNA sola unidad de la variante configurada (ej: "doble")
+      discountAmount = discountMode === 'fixed'
+        ? Math.min(fixedAmount, applicableSubtotal) // topeado: nunca deja ese producto en negativo
+        : Math.round(applicableSubtotal * discountPercent / 100);
+    } else if (discountType === 'variant' && couponDoc?.applicableVariant && (discountPercent > 0 || (discountMode === 'fixed' && fixedAmount > 0))) {
+      // Cupón restringido a variante (ej: "doble", cualquier sabor) — se puede
+      // combinar con applicableProductId (ej: "solo Doble Janz") o no (cualquier
+      // producto de esa variante). Descuenta solo `variantQuantity` unidades: se
+      // eligen siempre las más baratas primero para proteger el margen, y el
+      // descuento se calcula SOLO sobre el precio de la hamburguesa — nunca
+      // sobre los adicionales que el cliente le haya agregado a esa unidad.
       const variantLower = couponDoc.applicableVariant.toLowerCase();
-      const matching = orderItems.filter(i => (i.variant || '').toLowerCase() === variantLower);
-      if (matching.length > 0) {
-        // Tomar el de menor precio (protege margen)
-        const cheapest = matching.reduce((min, i) => i.unitPrice < min.unitPrice ? i : min, matching[0]);
-        discountAmount = Math.round(cheapest.unitPrice * discountPercent / 100);
-      }
+      let matching = orderItems.filter(i => (i.variant || '').toLowerCase() === variantLower);
+      if (applicableProductId) matching = matching.filter(i => i.product.toString() === applicableProductId);
+
+      // Expandir por cantidad: cada unidad del ítem entra por separado al pool
+      const units = [];
+      matching.forEach(i => { for (let k = 0; k < i.quantity; k++) units.push(i.unitPrice); });
+      units.sort((a, b) => a - b); // más baratas primero
+
+      const selected = units.slice(0, variantQuantity);
+      const selectedSubtotal = selected.reduce((s, p) => s + p, 0);
+      discountAmount = discountMode === 'fixed'
+        ? Math.min(fixedAmount, selectedSubtotal)
+        : Math.round(selectedSubtotal * discountPercent / 100);
+    } else if (discountMode === 'fixed' && fixedAmount > 0) {
+      // Monto fijo sobre todo el pedido — topeado al subtotal (si el cupón vale
+      // más que el pedido, se paga $0, nunca queda un total negativo)
+      discountAmount = Math.min(fixedAmount, subtotalBruto);
     } else if (discountPercent > 0) {
       discountAmount = Math.round(subtotalBruto * discountPercent / 100);
     }

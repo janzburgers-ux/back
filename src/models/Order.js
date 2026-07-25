@@ -24,9 +24,6 @@ const clientSchema = new mongoose.Schema({
   isTestClient: { type: Boolean, default: false },
   // Difusión masiva: si true, este cliente no recibe mensajes de broadcast
   broadcastOptOut: { type: Boolean, default: false },
-  // Prode Mundial
-  prodeRegisteredAt:    { type: Date, default: null },
-  prodeGuestCouponCode: { type: String, default: null, trim: true },
 }, { timestamps: true });
 
 // FIX rendimiento: whatsapp es la clave de búsqueda en cada pedido, PIN y notificación
@@ -129,7 +126,7 @@ const orderSchema = new mongoose.Schema({
 // crece el historial.
 orderSchema.index({ status: 1, createdAt: -1 });
 orderSchema.index({ createdAt: -1 });
-// FIX rendimiento: índices para countDeliveredInPeriod (ranking Prode) y analytics
+// FIX rendimiento: índices para countDeliveredInPeriod y analytics
 orderSchema.index({ client: 1, status: 1, deliveredAt: -1 });
 orderSchema.index({ deliveredAt: -1 });
 

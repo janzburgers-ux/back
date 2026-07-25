@@ -8,7 +8,6 @@ const { deductStockForOrder, returnStockForOrder, calcPackagingCost, autoUpdateP
 const { estimateWaitTime, getCurrentLoad, formatTimeAR } = require('../services/kitchen-capacity');
 const { sendOrderReceived, sendOrderConfirmation, sendOrderReady, sendOrderCancelled, sendReviewRequest } = require('../services/whatsapp');
 const { addPointsForOrder, getReferralConfig, registerReferralUse, validateReferralUse, isFraudAttempt } = require('../services/loyalty');
-const { processProdeCategoryOnDelivery } = require('../services/prode.service');
 // FIX timezone: usar la utilidad centralizada
 const { nowAR } = require('../utils/arDate');
 
@@ -180,9 +179,12 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
     // no le corresponde a ese cliente (ownerOnly, maxUses, ya usado, etc.)
     let couponDoc = null;
     let discountPercent = 0;
+    let discountMode = 'percent';
+    let fixedAmount = 0;
     let discountType = 'order';
     let discountAmount = 0;
     let applicableProductId = null;
+    let variantQuantity = 1;
     let couponRejectionReason = null;
 
     if (couponCode) {
@@ -199,9 +201,15 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
       }
       if (couponDoc) {
         discountPercent = couponDoc.discountForUser;
+        discountMode = couponDoc.discountMode || 'percent';
+        fixedAmount = couponDoc.fixedAmount || 0;
         if (couponDoc.applicableProduct) {
           discountType = 'product';
           applicableProductId = couponDoc.applicableProduct.toString();
+        }
+        if (couponDoc.applicableVariant) {
+          discountType = 'variant';
+          variantQuantity = couponDoc.variantQuantity || 1;
         }
       }
     }
@@ -254,13 +262,31 @@ router.post('/admin-create', auth, adminOnly, async (req, res) => {
       return sum + (item.unitPrice * item.quantity) + addsCost;
     }, 0);
 
-    if (discountType === 'product' && applicableProductId && discountPercent > 0) {
+    if (discountType === 'product' && applicableProductId && (discountPercent > 0 || (discountMode === 'fixed' && fixedAmount > 0))) {
       const applicableItems = orderItems.filter(i => i.product.toString() === applicableProductId);
       const appSubtotal = applicableItems.reduce((sum, item) => {
         const addsCost = (item.additionals || []).reduce((s, a) => s + a.unitPrice * (a.quantity || 1), 0);
         return sum + (item.unitPrice * item.quantity) + addsCost;
       }, 0);
-      discountAmount = Math.round(appSubtotal * discountPercent / 100);
+      discountAmount = discountMode === 'fixed'
+        ? Math.min(fixedAmount, appSubtotal)
+        : Math.round(appSubtotal * discountPercent / 100);
+    } else if (discountType === 'variant' && couponDoc?.applicableVariant && (discountPercent > 0 || (discountMode === 'fixed' && fixedAmount > 0))) {
+      // Igual que en public.js: solo `variantQuantity` unidades (las más baratas
+      // primero), y solo sobre el precio de la hamburguesa, nunca adicionales.
+      const variantLower = couponDoc.applicableVariant.toLowerCase();
+      let matching = orderItems.filter(i => (i.variant || '').toLowerCase() === variantLower);
+      if (applicableProductId) matching = matching.filter(i => i.product.toString() === applicableProductId);
+      const units = [];
+      matching.forEach(i => { for (let k = 0; k < i.quantity; k++) units.push(i.unitPrice); });
+      units.sort((a, b) => a - b);
+      const selected = units.slice(0, variantQuantity);
+      const selectedSubtotal = selected.reduce((s, p) => s + p, 0);
+      discountAmount = discountMode === 'fixed'
+        ? Math.min(fixedAmount, selectedSubtotal)
+        : Math.round(selectedSubtotal * discountPercent / 100);
+    } else if (discountMode === 'fixed' && fixedAmount > 0) {
+      discountAmount = Math.min(fixedAmount, subtotalBruto);
     } else if (discountPercent > 0) {
       discountAmount = Math.round(subtotalBruto * discountPercent / 100);
     }
@@ -597,9 +623,6 @@ router.put('/:id/status', auth, kitchenOrAdmin, async (req, res) => {
       await Client.findByIdAndUpdate(order.client._id, { $inc: { totalSpent: order.total } });
       addPointsForOrder(order.client._id, order.total)
         .catch(e => console.error('Error puntos fidelización:', e.message));
-
-      processProdeCategoryOnDelivery(order.client._id, order._id)
-        .catch(e => console.error('Prode category error:', e.message));
 
       // ── Validar uso de cupón de referido → acumula recompensa al dueño ────
       // Solo se acumula cuando el pedido es ENTREGADO (no al confirmar)

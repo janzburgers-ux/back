@@ -110,16 +110,20 @@ router.post('/validate', async (req, res) => {
     const response = {
       valid: true,
       code: coupon.code,
+      discountMode: coupon.discountMode || 'percent',
       discountPercent: coupon.discountForUser,
+      fixedAmount: coupon.fixedAmount || null,
       ownerName: coupon.ownerName,
-      message: `¡Cupón válido! Tenés ${coupon.discountForUser}% de descuento 🎉`
+      message: coupon.discountMode === 'fixed'
+        ? `¡Cupón válido! Tenés $${Number(coupon.fixedAmount).toLocaleString('es-AR')} de descuento 🎉`
+        : `¡Cupón válido! Tenés ${coupon.discountForUser}% de descuento 🎉`
     };
 
     // Tope dinámico por ticket promedio del dueño:
     // Solo se expone en cupones NO referidos (ej: cupón de recompensa del referente).
     // El cupón que comparte el referente con sus amigos no tiene tope visible —
     // el nuevo cliente recibe el descuento completo sin restricciones de monto.
-    if (coupon.type !== 'referral' && coupon.ownerAvgTicket > 0) {
+    if (coupon.discountMode !== 'fixed' && coupon.type !== 'referral' && coupon.ownerAvgTicket > 0) {
       response.maxDiscountAmount = Math.round(coupon.ownerAvgTicket * coupon.discountForUser / 100);
       response.message += ` (tope: $${response.maxDiscountAmount.toLocaleString('es-AR')})`;
     }
@@ -132,7 +136,22 @@ router.post('/validate', async (req, res) => {
         variant: coupon.applicableProduct.variant
       };
       response.applicableProductName = coupon.applicableProductName || `${coupon.applicableProduct.name} ${coupon.applicableProduct.variant}`;
-      response.message = `¡Cupón válido! ${coupon.discountForUser}% OFF en ${response.applicableProductName} 🎉`;
+      response.message = coupon.discountMode === 'fixed'
+        ? `¡Cupón válido! $${Number(coupon.fixedAmount).toLocaleString('es-AR')} OFF en ${response.applicableProductName} 🎉`
+        : `¡Cupón válido! ${coupon.discountForUser}% OFF en ${response.applicableProductName} 🎉`;
+    }
+
+    // Cupón restringido a variante (ej: "doble", cualquier sabor) + cantidad de
+    // unidades que se benefician. Se puede combinar con applicableProduct de arriba
+    // (ej: "solo Doble Janz") o ir solo (cualquier producto de esa variante).
+    if (coupon.applicableVariant) {
+      response.applicableVariant = coupon.applicableVariant;
+      response.variantQuantity = coupon.variantQuantity || 1;
+      const qtyLabel = (coupon.variantQuantity || 1) > 1 ? `${coupon.variantQuantity} ${coupon.applicableVariant}s` : `1 ${coupon.applicableVariant}`;
+      const scopeLabel = coupon.applicableProduct ? response.applicableProductName : `cualquier ${coupon.applicableVariant}`;
+      response.message = coupon.discountMode === 'fixed'
+        ? `¡Cupón válido! $${Number(coupon.fixedAmount).toLocaleString('es-AR')} OFF en ${qtyLabel} (${scopeLabel}) 🎉`
+        : `¡Cupón válido! ${coupon.discountForUser}% OFF en ${qtyLabel} (${scopeLabel}) 🎉`;
     }
 
     res.json(response);
@@ -168,8 +187,16 @@ router.post('/', auth, adminOnly, async (req, res) => {
 // POST crear cupón admin (uso ilimitado)
 router.post('/admin', auth, adminOnly, async (req, res) => {
   try {
-    const { code, discountForUser, label, applicableProduct, applicableProductName, expiresAt } = req.body;
+    const { code, discountForUser, discountMode, fixedAmount, label, applicableProduct, applicableProductName, applicableVariant, variantQuantity, expiresAt } = req.body;
     if (!code) return res.status(400).json({ message: 'Código requerido' });
+
+    const mode = discountMode === 'fixed' ? 'fixed' : 'percent';
+    if (mode === 'fixed' && !(Number(fixedAmount) > 0)) {
+      return res.status(400).json({ message: 'Ingresá un monto fijo válido' });
+    }
+    if (applicableVariant && !(Number(variantQuantity) > 0)) {
+      return res.status(400).json({ message: 'Ingresá una cantidad válida para la variante' });
+    }
 
     let adminClient = await Client.findOne({ name: { $regex: /admin/i } });
     if (!adminClient) {
@@ -183,12 +210,16 @@ router.post('/admin', auth, adminOnly, async (req, res) => {
       code: code.toUpperCase(),
       owner: adminClient._id,
       ownerName: label || 'Admin',
-      discountForUser: discountForUser || 0,
+      discountMode: mode,
+      discountForUser: mode === 'percent' ? (discountForUser || 0) : 0,
+      fixedAmount: mode === 'fixed' ? Number(fixedAmount) : null,
       rewardPerUse: 0,
       unlimited: true,
       type: applicableProduct ? 'product' : 'admin',
       applicableProduct: applicableProduct || null,
       applicableProductName: applicableProductName || null,
+      applicableVariant: applicableVariant || null,
+      variantQuantity: applicableVariant ? Number(variantQuantity) : 1,
       expiresAt: expiresAt || null
     });
     await coupon.save();
@@ -199,8 +230,16 @@ router.post('/admin', auth, adminOnly, async (req, res) => {
 // POST crear cupón de uso único
 router.post('/single-use', auth, adminOnly, async (req, res) => {
   try {
-    const { code, discountForUser, label, applicableProduct, applicableProductName, expiresAt } = req.body;
+    const { code, discountForUser, discountMode, fixedAmount, label, applicableProduct, applicableProductName, applicableVariant, variantQuantity, expiresAt } = req.body;
     if (!code) return res.status(400).json({ message: 'Código requerido' });
+
+    const mode = discountMode === 'fixed' ? 'fixed' : 'percent';
+    if (mode === 'fixed' && !(Number(fixedAmount) > 0)) {
+      return res.status(400).json({ message: 'Ingresá un monto fijo válido' });
+    }
+    if (applicableVariant && !(Number(variantQuantity) > 0)) {
+      return res.status(400).json({ message: 'Ingresá una cantidad válida para la variante' });
+    }
 
     let adminClient = await Client.findOne({ name: { $regex: /admin/i } });
     if (!adminClient) {
@@ -214,7 +253,9 @@ router.post('/single-use', auth, adminOnly, async (req, res) => {
       code: code.toUpperCase(),
       owner: adminClient._id,
       ownerName: label || 'Promo',
-      discountForUser: discountForUser || 10,
+      discountMode: mode,
+      discountForUser: mode === 'percent' ? (discountForUser || 10) : 0,
+      fixedAmount: mode === 'fixed' ? Number(fixedAmount) : null,
       rewardPerUse: 0,
       unlimited: false,
       singleUse: true,
@@ -222,6 +263,8 @@ router.post('/single-use', auth, adminOnly, async (req, res) => {
       type: applicableProduct ? 'product' : 'admin',
       applicableProduct: applicableProduct || null,
       applicableProductName: applicableProductName || null,
+      applicableVariant: applicableVariant || null,
+      variantQuantity: applicableVariant ? Number(variantQuantity) : 1,
       expiresAt: expiresAt || null
     });
     await coupon.save();

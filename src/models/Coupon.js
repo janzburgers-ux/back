@@ -9,14 +9,27 @@ const couponSchema = new mongoose.Schema({
   // 'referral' | 'admin' | 'loyalty' | 'product' | 'prode'
   type: { type: String, enum: ['referral', 'admin', 'loyalty', 'product', 'reactivation', 'birthday', 'apology', 'prode'], default: 'referral' },
   // Restringe el cupón a una variante específica (ej: "doble"), sin importar el producto elegido.
+  // Se puede combinar con applicableProduct (ej: "solo Doble Janz") o dejar solo,
+  // sin producto, para que aplique a "cualquier doble" del menú.
   applicableVariant: { type: String, default: null },
+  // Cuántas unidades de esa variante reciben el descuento (si el cliente pide más
+  // cantidad de la que cubre el cupón, el resto se cobra a precio normal). Se eligen
+  // siempre las unidades más baratas primero, para proteger el margen.
+  variantQuantity: { type: Number, default: 1 },
   // Cantidad máxima de usos globales (distinto de singleUse: singleUse = 1 uso; maxUses = N usos).
   maxUses: { type: Number, default: null },
   // Restringe el uso del cupón a que el WhatsApp del pedido coincida con el del owner (premios Prode).
   ownerOnly: { type: Boolean, default: false },
 
   // Descuento para quien usa el cupón
+  // 'percent' = % sobre el subtotal aplicable (discountForUser) | 'fixed' = monto $ fijo (fixedAmount)
+  discountMode: { type: String, enum: ['percent', 'fixed'], default: 'percent' },
   discountForUser: { type: Number, default: 10 },
+  // Monto $ fijo a descontar cuando discountMode === 'fixed'. Se topea al subtotal
+  // aplicable (todo el pedido, o solo el producto si hay applicableProduct) — si el
+  // cupón vale más que ese subtotal, el descuento queda en el subtotal completo (paga $0),
+  // nunca deja el subtotal en negativo.
+  fixedAmount: { type: Number, default: null },
   applicableProduct: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', default: null },
   applicableProductName: { type: String, default: null },
 
